@@ -1,0 +1,17 @@
+node_modules/
+api/node_modules/
+.env
+*.db
+*.db-shm
+*.db-wal
+data/
+nginx/
+litellm/
+docker-compose.yml
+env.example
+server.js
+db.js
+routes/
+.git
+.gitignore
+README.md
