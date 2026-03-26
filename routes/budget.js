@@ -41,3 +41,13 @@ budgetRouter.get('/history', (_req, res) => {
     .all();
   res.json({ history: rows });
 });
+
+budgetRouter.delete('/history', (_req, res) => {
+  const db = getDb();
+  const info = db.prepare('DELETE FROM budget_history').run();
+  db.prepare(
+    "UPDATE budget SET amount = 0, updated_at = ? WHERE id = 'current'",
+  ).run(nowIso());
+  console.log('[BUDGET] Cleared history:', info.changes, 'rows deleted + budget reset to 0');
+  res.json({ ok: true, deleted: info.changes });
+});

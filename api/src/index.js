@@ -1304,13 +1304,14 @@ aiRouter.post('/summarize', async (req, res, next) => {
 
         const tavilyRes = await fetch('https://api.tavily.com/search', {
           method: 'POST',
-          headers: { 'Content-Type': 'application/json' },
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${tavilyKey}`,
+          },
           body: JSON.stringify({
-            api_key: tavilyKey,
             query: searchQuery,
             search_depth: 'advanced',
             max_results: 5,
-            include_answer: true,
           }),
           signal: AbortSignal.timeout(20000),
         });
@@ -1429,6 +1430,60 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
 // POST /api/v1/ai/categorize
 const AICategorizeSchema = z.object({
   description: z.string().min(2).max(500),
+});
+
+aiRouter.post('/search', async (req, res, next) => {
+  try {
+    const { query } = req.body || {};
+    if (!query || String(query).trim().length < 2) {
+      return res.status(400).json({ error: 'query is required (min 2 chars)' });
+    }
+
+    const apiKey = process.env.TAVILY_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'TAVILY_API_KEY not configured' });
+    }
+
+    console.log('[AI] Tavily search →', String(query).trim());
+
+    const tavilyRes = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        query: String(query).trim(),
+        search_depth: 'advanced',
+        include_answer: true,
+        include_raw_content: false,
+        max_results: 5,
+      }),
+      signal: AbortSignal.timeout(20000),
+    });
+
+    if (!tavilyRes.ok) {
+      const errText = await tavilyRes.text();
+      console.warn('[AI] Tavily error:', tavilyRes.status, errText.slice(0, 200));
+      return res.status(tavilyRes.status).json({
+        error: `Tavily API error: ${errText.slice(0, 300)}`,
+      });
+    }
+
+    const data = await tavilyRes.json();
+    res.json({
+      answer: data.answer || '',
+      query: data.query || query,
+      results: (data.results || []).map((r) => ({
+        title: r.title || '',
+        url: r.url || '',
+        content: r.content || '',
+        score: r.score || 0,
+      })),
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
 aiRouter.post('/categorize', async (req, res, next) => {
@@ -1897,6 +1952,17 @@ expensesRouter.post('/', async (req, res, next) => {
   }
 });
 
+// DELETE all expenses (easter egg clear)
+expensesRouter.delete('/', async (_req, res, next) => {
+  try {
+    const result = await pool.query('DELETE FROM expenses');
+    console.log('[EXPENSES] Cleared all:', result.rowCount, 'rows deleted');
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
 // DELETE expense
 expensesRouter.delete('/:id', async (req, res, next) => {
   try {
@@ -1952,6 +2018,17 @@ budgetRouter.post('/', async (req, res, next) => {
 
     console.log('[BUDGET] Upserted:', id, amount);
     res.json({ ok: true, id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE all budget history (easter egg clear)
+budgetRouter.delete('/history', async (_req, res, next) => {
+  try {
+    const result = await pool.query('DELETE FROM budget_entries');
+    console.log('[BUDGET] Cleared history:', result.rowCount, 'rows deleted');
+    res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
   }

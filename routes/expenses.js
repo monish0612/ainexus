@@ -147,6 +147,13 @@ expensesRouter.put('/:id', (req, res) => {
   res.json({ expense: rowToExpense(row) });
 });
 
+expensesRouter.delete('/', (_req, res) => {
+  const db = getDb();
+  const info = db.prepare('DELETE FROM expenses').run();
+  console.log('[EXPENSES] Cleared all:', info.changes, 'rows deleted');
+  res.json({ ok: true, deleted: info.changes });
+});
+
 expensesRouter.delete('/:id', (req, res) => {
   const db = getDb();
   const { id } = req.params;

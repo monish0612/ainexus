@@ -15,6 +15,8 @@ services:
       - LITELLM_VIRTUAL_KEY=${LITELLM_VIRTUAL_KEY}
       - JWT_SECRET=${JWT_SECRET}
       - CORS_ORIGIN=*
+      - TAVILY_API_KEY=${TAVILY_API_KEY}
+      - ZYTE_API_KEY=${ZYTE_API_KEY}
     depends_on:
       postgres:
         condition: service_healthy

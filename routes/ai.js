@@ -1,4 +1,5 @@
 import { Router } from 'express';
+import fetch from 'node-fetch';
 import { callLiteLLM } from '../litellm.js';
 
 export const aiRouter = Router();
@@ -228,6 +229,56 @@ aiRouter.post('/correct', async (req, res) => {
       corrected: raw.trim(),
       corrections: [],
       raw,
+    });
+  } catch (e) {
+    res.status(502).json({ error: String(e.message || e) });
+  }
+});
+
+aiRouter.post('/search', async (req, res) => {
+  try {
+    const { query } = req.body || {};
+    if (!query || String(query).trim().length < 2) {
+      return res.status(400).json({ error: 'query is required (min 2 chars)' });
+    }
+
+    const apiKey = process.env.TAVILY_API_KEY;
+    if (!apiKey) {
+      return res.status(503).json({ error: 'TAVILY_API_KEY not configured' });
+    }
+
+    const response = await fetch('https://api.tavily.com/search', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${apiKey}`,
+      },
+      body: JSON.stringify({
+        query: String(query).trim(),
+        search_depth: 'advanced',
+        include_answer: true,
+        include_raw_content: false,
+        max_results: 5,
+      }),
+    });
+
+    if (!response.ok) {
+      const errText = await response.text();
+      return res.status(response.status).json({
+        error: `Tavily API error: ${errText.slice(0, 300)}`,
+      });
+    }
+
+    const data = await response.json();
+    res.json({
+      answer: data.answer || '',
+      query: data.query || query,
+      results: (data.results || []).map((r) => ({
+        title: r.title || '',
+        url: r.url || '',
+        content: r.content || '',
+        score: r.score || 0,
+      })),
     });
   } catch (e) {
     res.status(502).json({ error: String(e.message || e) });
