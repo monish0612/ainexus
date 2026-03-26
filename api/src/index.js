@@ -280,6 +280,14 @@ function validate(schema, data) {
 }
 
 const AI_REPHRASE_PLATFORM_META = {
+  casual: {
+    guidance: 'casual everyday conversational tone',
+    charLimit: null,
+  },
+  sarcastic: {
+    guidance: 'sarcastic witty tone with dry humor',
+    charLimit: null,
+  },
   'email-long': {
     guidance: 'formal long-form email with greeting, body, and sign-off',
     charLimit: null,
@@ -1002,7 +1010,7 @@ aiRouter.post('/rephrase', async (req, res, next) => {
     const val = validate(AIRephraseSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
-    const platformId = normalizeRephrasePlatformId(val.data.platform) || 'slack';
+    const platformId = normalizeRephrasePlatformId(val.data.platform) || 'casual';
     const systemPrompt = buildRephraseSystemPrompt(platformId);
 
     const result = await callLiteLLM({

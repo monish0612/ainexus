@@ -6,6 +6,27 @@
 // ── Rephrase ─────────────────────────────────────────────────────────────────
 
 const REPHRASE_PLATFORMS = {
+  casual: {
+    label: 'Casual',
+    charLimit: null,
+    prompt: [
+      'Rephrase the user\'s text in a CASUAL, everyday conversational tone.',
+      'Tone: relaxed, warm, natural — like talking to a friend or close colleague.',
+      'Use contractions, simple words, short sentences. Light emoji optional where it feels natural.',
+      'Keep it genuine and human. NOT formal, NOT corporate.',
+    ].join(' '),
+  },
+  sarcastic: {
+    label: 'Sarcastic',
+    charLimit: null,
+    prompt: [
+      'Rephrase the user\'s text with a SARCASTIC, witty tone.',
+      'Tone: dry humor, ironic, biting wit — think of a sarcastic friend who says things with a smirk.',
+      'Use exaggeration, mock praise, rhetorical questions, eye-roll energy.',
+      'Be clever, not mean-spirited. The sarcasm should be entertaining and sharp.',
+      'Optional: add a sarcastic hashtag or emoji (🙄, 😏, 🤡) if it fits.',
+    ].join(' '),
+  },
   slack: {
     label: 'Slack',
     charLimit: 200,
@@ -104,22 +125,29 @@ const REPHRASE_PLATFORMS = {
 };
 
 function buildRephraseSystemPrompt(platformId) {
-  const spec = REPHRASE_PLATFORMS[platformId] || REPHRASE_PLATFORMS.slack;
+  const spec = REPHRASE_PLATFORMS[platformId] || REPHRASE_PLATFORMS.casual;
   const lines = [
-    'You are an expert communication rephraser who adapts text perfectly to different platforms and tones.',
-    'Your goal is to make the text sound like it was NATURALLY written by someone on that platform.',
+    'You are an expert communication rephraser who adapts text to different platforms and tones.',
     '',
+    'ABSOLUTE RULE — REPHRASE, NEVER REINTERPRET:',
+    '- The user will give you a piece of text. Your job is to rephrase THAT EXACT TEXT in the specified tone/style.',
+    '- Do NOT analyze the intent behind the text. Do NOT summarize it. Do NOT rewrite it into something different.',
+    '- Keep the SAME message, meaning, and sentiment — only change HOW it is said (word choice, tone, style).',
+    '- If the user says something sarcastic, keep the sarcasm but adapt the delivery for the platform.',
+    '- If the user says something emotional or opinionated, keep that emotion — just restyle the words.',
+    '- Think of it like translating between tones: same content, different voice.',
+    '',
+    `PLATFORM/TONE: ${spec.label}`,
     spec.prompt,
     '',
     spec.charLimit
       ? `IMPORTANT: Hard character limit of ${spec.charLimit} characters. Do NOT exceed it.`
       : '',
     '',
-    'CRITICAL RULES:',
-    '- Preserve the original intent and key information.',
-    '- Match the tone EXACTLY to what\'s described above. If it says casual, be genuinely casual — not formal with a smiley.',
-    '- Output ONLY the rephrased text — nothing else.',
-    '- Do NOT wrap in quotes. Do NOT add explanations.',
+    'OUTPUT RULES:',
+    '- Output ONLY the rephrased version of the user\'s text — nothing else.',
+    '- Do NOT wrap in quotes. Do NOT add explanations, commentary, or meta-text.',
+    '- Do NOT add phrases like "Here\'s the rephrased version" or "Sure!".',
     '',
     'Return valid JSON only:',
     `{ "platform": "${platformId}", "rephrasedText": "your rephrased text here" }`,
