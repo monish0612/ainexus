@@ -11,10 +11,10 @@
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-const GROUNDING_MODELS = [
-  'gemini-2.0-flash',
-  'gemini-2.5-flash',
-];
+const GROUNDING_MODELS = (process.env.GROUNDING_MODELS || 'gemini-3.1-flash-lite-preview')
+  .split(',')
+  .map(m => m.trim())
+  .filter(Boolean);
 
 const DEFAULTS = {
   temperature: 1.0,
