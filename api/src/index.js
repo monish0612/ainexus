@@ -18,6 +18,11 @@ const {
   SMART_PARSE_SYSTEM_PROMPT,
   CATEGORIZE_SYSTEM_PROMPT,
 } = require('./prompts');
+const {
+  groundedSearch,
+  groundedExtract,
+  isGroundingAvailable,
+} = require('./google-grounding');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -1300,48 +1305,81 @@ aiRouter.post('/summarize', async (req, res, next) => {
       }
     }
 
-    // ── Stage 4: Tavily research fallback ─────────────────────────────────
+    // ── Stage 4: Parallel fallback (Tavily + Gemini Grounding race) ──────
     const stillBlocked = content.length < 500;
-    const tavilyKey = process.env.TAVILY_API_KEY;
-    if (stillBlocked && tavilyKey) {
-      try {
-        console.log('[SUMMARIZE] Stage 4: Tavily research fallback...');
-        const searchQuery = title
-          ? `Detailed information about: ${title}`
-          : `Full content and details from: ${url}`;
+    if (stillBlocked) {
+      console.log('[SUMMARIZE] Stage 4: Parallel research fallback...');
+      const searchQuery = title
+        ? `Detailed information about: ${title}`
+        : `Full content and details from: ${url}`;
 
-        const tavilyRes = await fetch('https://api.tavily.com/search', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${tavilyKey}`,
-          },
-          body: JSON.stringify({
-            query: searchQuery,
-            search_depth: 'advanced',
-            max_results: 5,
-          }),
-          signal: AbortSignal.timeout(20000),
-        });
+      const runners = [];
 
-        if (tavilyRes.ok) {
-          const tavilyData = await tavilyRes.json();
-          const snippets = (tavilyData?.results || [])
-            .map(r => r.content || '').filter(Boolean).join('\n\n');
-          const answer = tavilyData?.answer || '';
+      // 4a: Tavily
+      const tavilyKey = process.env.TAVILY_API_KEY;
+      if (tavilyKey) {
+        runners.push(
+          (async () => {
+            try {
+              const tavilyRes = await fetch('https://api.tavily.com/search', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/json',
+                  'Authorization': `Bearer ${tavilyKey}`,
+                },
+                body: JSON.stringify({
+                  query: searchQuery,
+                  search_depth: 'advanced',
+                  max_results: 5,
+                }),
+                signal: AbortSignal.timeout(20000),
+              });
 
-          if (snippets.length > 200 || answer.length > 100) {
-            content = answer
-              ? `Research Summary:\n${answer}\n\nDetailed Sources:\n${snippets}`
-              : snippets;
-            extractionMethod = 'tavily-search';
-            console.log('[SUMMARIZE] Tavily gathered', content.length, 'chars');
-          }
-        } else {
-          console.warn('[SUMMARIZE] Tavily status:', tavilyRes.status);
+              if (!tavilyRes.ok) return { text: '', method: 'tavily-search' };
+
+              const tavilyData = await tavilyRes.json();
+              const snippets = (tavilyData?.results || [])
+                .map(r => r.content || '').filter(Boolean).join('\n\n');
+              const answer = tavilyData?.answer || '';
+              const combined = answer
+                ? `Research Summary:\n${answer}\n\nDetailed Sources:\n${snippets}`
+                : snippets;
+
+              return { text: combined, method: 'tavily-search' };
+            } catch (e) {
+              console.warn('[SUMMARIZE] Tavily error:', e.message?.slice(0, 100));
+              return { text: '', method: 'tavily-search' };
+            }
+          })(),
+        );
+      }
+
+      // 4b: Gemini Google Search Grounding
+      if (isGroundingAvailable()) {
+        runners.push(
+          (async () => {
+            try {
+              const gr = await groundedExtract(url, title, { timeoutMs: 25000 });
+              return { text: gr.content, method: gr.extractionMethod };
+            } catch (e) {
+              console.warn('[SUMMARIZE] Grounding error:', e.message?.slice(0, 100));
+              return { text: '', method: 'gemini-grounding' };
+            }
+          })(),
+        );
+      }
+
+      if (runners.length > 0) {
+        const results = await Promise.all(runners);
+        const best = results
+          .filter(r => r.text.length > 200)
+          .sort((a, b) => b.text.length - a.text.length)[0];
+
+        if (best) {
+          content = best.text.slice(0, 12000);
+          extractionMethod = best.method;
+          console.log(`[SUMMARIZE] Best fallback: ${best.method} (${content.length} chars)`);
         }
-      } catch (tavilyErr) {
-        console.warn('[SUMMARIZE] Tavily error:', tavilyErr.message?.slice(0, 100));
       }
     }
 
@@ -1490,6 +1528,40 @@ aiRouter.post('/search', async (req, res, next) => {
       })),
     });
   } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/ai/grounded-search  (Gemini + Google Search)
+aiRouter.post('/grounded-search', async (req, res, next) => {
+  try {
+    const { query, model } = req.body || {};
+    if (!query || String(query).trim().length < 2) {
+      return res.status(400).json({ error: 'query is required (min 2 chars)' });
+    }
+
+    if (!isGroundingAvailable()) {
+      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured for grounding' });
+    }
+
+    const result = await groundedSearch(String(query).trim(), { model });
+
+    res.json({
+      answer: result.text,
+      query: String(query).trim(),
+      model: result.model,
+      searchQueries: result.searchQueries,
+      sources: result.sources,
+      citations: result.citations,
+      usage: result.usage,
+    });
+  } catch (err) {
+    if (err.name === 'GroundingError') {
+      return res.status(err.status || 500).json({
+        error: err.message,
+        code: err.code,
+      });
+    }
     next(err);
   }
 });
