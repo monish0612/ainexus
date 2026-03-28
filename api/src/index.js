@@ -1567,6 +1567,69 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
   }
 });
 
+// POST /api/v1/ai/deep-research  (Gemini 3.1 Pro + Google Search — thorough URL analysis)
+aiRouter.post('/deep-research', async (req, res, next) => {
+  try {
+    const { url, question, history } = req.body || {};
+
+    if (!url || String(url).trim().length < 5) {
+      return res.status(400).json({ error: 'url is required' });
+    }
+
+    if (!isGroundingAvailable()) {
+      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+    }
+
+    const safeUrl = String(url).slice(0, 500);
+    const safeQuestion = question ? String(question).trim() : '';
+
+    const systemInstruction =
+      `You are an expert deep research analyst with access to Google Search. ` +
+      `The user has provided a URL: ${safeUrl}\n\n` +
+      `IMPORTANT: Use Google Search to find and read the ORIGINAL page at that URL plus any related articles, sources, and references. ` +
+      `Provide an extremely thorough, well-structured analysis. Use markdown formatting with headers, bullet points, bold, and tables where appropriate.\n\n` +
+      `If this is the first message (no conversation history), perform a DEEP RESEARCH analysis:\n` +
+      `1. **Overview** — What is this page about?\n` +
+      `2. **Key Findings** — Main points, data, arguments\n` +
+      `3. **Context & Background** — Related information from other sources\n` +
+      `4. **Critical Analysis** — Strengths, weaknesses, biases\n` +
+      `5. **Related Sources** — Other articles/papers on the topic\n\n` +
+      `If this is a follow-up question, answer it using the original URL content and any new web search results. ` +
+      `Maintain conversation continuity.`;
+
+    const turns = [];
+    if (Array.isArray(history)) {
+      for (const h of history) {
+        if (h && h.role && h.text) {
+          turns.push({ role: String(h.role), text: String(h.text).slice(0, 4000) });
+        }
+      }
+    }
+    turns.push({
+      role: 'user',
+      text: safeQuestion || `Perform a deep research analysis of: ${safeUrl}`,
+    });
+
+    const result = await groundedConverse(turns, systemInstruction, {
+      timeoutMs: 120000,
+      maxTokens: 8192,
+      temperature: 0.5,
+    });
+
+    res.json({
+      answer: result.text,
+      model: result.model,
+      sources: result.sources,
+      searchQueries: result.searchQueries || [],
+    });
+  } catch (err) {
+    if (err.name === 'GroundingError') {
+      return res.status(err.status || 500).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+});
+
 // POST /api/v1/ai/article-followup  (Gemini 3.1 Pro + Google Search — multi-turn)
 aiRouter.post('/article-followup', async (req, res, next) => {
   try {
