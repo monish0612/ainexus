@@ -21,6 +21,7 @@ const {
 const {
   groundedSearch,
   groundedExtract,
+  groundedConverse,
   isGroundingAvailable,
 } = require('./google-grounding');
 
@@ -1566,6 +1567,61 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
   }
 });
 
+// POST /api/v1/ai/article-followup  (Gemini 3.1 Pro + Google Search — multi-turn)
+aiRouter.post('/article-followup', async (req, res, next) => {
+  try {
+    const { articleUrl, articleTitle, question, history } = req.body || {};
+
+    if (!question || String(question).trim().length < 2) {
+      return res.status(400).json({ error: 'question is required (min 2 chars)' });
+    }
+
+    if (!isGroundingAvailable()) {
+      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+    }
+
+    const safeTitle = String(articleTitle || 'this article').slice(0, 200);
+    const safeUrl = String(articleUrl || '').slice(0, 500);
+
+    const systemInstruction =
+      `You are an expert news analyst and research assistant. ` +
+      `The user is reading an article titled "${safeTitle}"` +
+      (safeUrl ? ` (source: ${safeUrl}).` : '.') +
+      `\n\nIMPORTANT: Use the Google Search tool to find the ORIGINAL source article and any related real-time information. ` +
+      `Do NOT rely on any pre-summarized version — always base your answers on the actual source content and live web data. ` +
+      `Provide comprehensive, accurate, well-structured answers. Cite sources when possible. ` +
+      `If the user asks a follow-up, use the conversation context to maintain continuity.`;
+
+    const turns = [];
+    if (Array.isArray(history)) {
+      for (const h of history) {
+        if (h && h.role && h.text) {
+          turns.push({ role: String(h.role), text: String(h.text).slice(0, 4000) });
+        }
+      }
+    }
+    turns.push({ role: 'user', text: String(question).trim() });
+
+    const result = await groundedConverse(turns, systemInstruction, {
+      timeoutMs: 90000,
+      maxTokens: 8192,
+      temperature: 0.7,
+    });
+
+    res.json({
+      answer: result.text,
+      model: result.model,
+      sources: result.sources,
+      searchQueries: result.searchQueries || [],
+    });
+  } catch (err) {
+    if (err.name === 'GroundingError') {
+      return res.status(err.status || 500).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+});
+
 aiRouter.post('/categorize', async (req, res, next) => {
   try {
     const val = validate(AICategorizeSchema, req.body);
@@ -1976,6 +2032,76 @@ savedWordsRouter.delete('/:id', async (req, res, next) => {
 app.use('/api/v1/saved-words', savedWordsRouter);
 
 // ═══════════════════════════════════════════════════════════════
+//  ARTICLE CHAT MESSAGES
+// ═══════════════════════════════════════════════════════════════
+
+const articleChatsRouter = express.Router();
+
+// GET /api/v1/article-chats/:articleId — get all messages for an article
+articleChatsRouter.get('/:articleId', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const { rows } = await pool.query(
+      'SELECT * FROM article_chat_messages WHERE article_id = $1 ORDER BY created_at ASC',
+      [articleId],
+    );
+    res.json(rows);
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/article-chats/:articleId — upsert a message
+articleChatsRouter.post('/:articleId', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const { id, role, text, model, sourcesJson, createdAt } = req.body;
+    if (!id || !role) {
+      return res.status(400).json({ error: 'id and role are required' });
+    }
+
+    await pool.query(
+      `INSERT INTO article_chat_messages (id, article_id, role, text, model, sources_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         text = EXCLUDED.text,
+         model = EXCLUDED.model,
+         sources_json = EXCLUDED.sources_json`,
+      [
+        id,
+        articleId,
+        role,
+        text || '',
+        model || '',
+        sourcesJson || '[]',
+        createdAt || new Date().toISOString(),
+      ],
+    );
+
+    res.json({ ok: true, id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/article-chats/:articleId — delete all messages for an article
+articleChatsRouter.delete('/:articleId', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const result = await pool.query(
+      'DELETE FROM article_chat_messages WHERE article_id = $1',
+      [articleId],
+    );
+    console.log('[ARTICLE_CHATS] Cleared:', articleId, '| rows:', result.rowCount);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use('/api/v1/article-chats', articleChatsRouter);
+
+// ═══════════════════════════════════════════════════════════════
 //  EXPENSES
 // ═══════════════════════════════════════════════════════════════
 
@@ -2281,6 +2407,17 @@ async function initTables() {
       guid TEXT PRIMARY KEY,
       deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS article_chat_messages (
+      id TEXT PRIMARY KEY,
+      article_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      text TEXT NOT NULL DEFAULT '',
+      model TEXT DEFAULT '',
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_acm_article ON article_chat_messages(article_id);
 
     CREATE TABLE IF NOT EXISTS saved_words (
       id TEXT PRIMARY KEY,

@@ -239,6 +239,67 @@ async function groundedExtract(url, title, options = {}) {
 }
 
 /**
+ * Multi-turn grounded conversation — for article follow-up Q&A.
+ *
+ * @param {Array<{role: string, text: string}>} history - Conversation so far
+ * @param {string} systemInstruction - System prompt with article context
+ * @param {object} [options]
+ * @returns {Promise<{text: string, model: string, sources: Array, searchQueries: Array}>}
+ */
+async function groundedConverse(history, systemInstruction, options = {}) {
+  const modelId = options.model
+    || process.env.GEMINI_PRO_MODEL
+    || 'gemini-3.1-pro-preview';
+  const timeout = options.timeoutMs ?? 60000;
+  const maxTok = options.maxTokens ?? 8192;
+  const temp = options.temperature ?? 0.7;
+
+  const apiKey = getApiKey();
+  const url = `${GEMINI_API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+
+  const contents = history.map(h => ({
+    role: h.role === 'assistant' ? 'model' : 'user',
+    parts: [{ text: h.text }],
+  }));
+
+  const body = {
+    contents,
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: temp, maxOutputTokens: maxTok },
+  };
+
+  if (systemInstruction) {
+    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+
+  const t0 = Date.now();
+  console.log(`[Grounding] Converse (${modelId}) → ${history.length} turns`);
+
+  const response = await fetch(url, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeout),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text();
+    throw new GroundingError(
+      `Gemini ${response.status} [${modelId}]: ${errText.slice(0, 300)}`,
+      response.status >= 500 ? 'SERVER' : 'API',
+      response.status,
+    );
+  }
+
+  const data = await response.json();
+  const result = parseGroundingResponse(data);
+  const elapsed = Date.now() - t0;
+  console.log(`[Grounding] Converse done in ${elapsed}ms — ${result.sources.length} sources`);
+
+  return { ...result, model: modelId };
+}
+
+/**
  * Check if Google Search Grounding is available (key configured).
  */
 function isGroundingAvailable() {
@@ -249,6 +310,7 @@ module.exports = {
   groundedSearch,
   groundedExtract,
   groundedGenerate,
+  groundedConverse,
   isGroundingAvailable,
   GroundingError,
 };

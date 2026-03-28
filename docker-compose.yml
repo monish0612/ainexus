@@ -19,6 +19,7 @@ services:
       - ZYTE_API_KEY=${ZYTE_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - GROUNDING_MODELS=${GROUNDING_MODELS:-gemini-3.1-flash-lite-preview}
+      - GEMINI_PRO_MODEL=${GEMINI_PRO_MODEL:-gemini-3.1-pro-preview}
     depends_on:
       postgres:
         condition: service_healthy
