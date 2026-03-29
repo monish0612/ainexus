@@ -163,7 +163,7 @@ function extractImage(block, html, link) {
     /<enclosure\b[^>]*\surl=["']([^"']+)["'][^>]*>/i,
   ]) {
     const m = block.match(re);
-    if (m?.[1]) return absolutize(m[1].trim(), link);
+    if (m?.[1]) return absolutize(decodeHtmlEntities(m[1].trim()), link);
   }
   const t = extractTag(block, ['image', 'thumbnail']);
   return t ? absolutize(t, link) : '';
@@ -260,7 +260,8 @@ function appendSourceLink(summary, url, source) {
   const srcIcon = url.includes('finshots') ? '📰' : url.includes('zerodha') ? '📈'
     : url.includes('marktechpost') ? '🤖' : url.includes('machinelearningmastery') ? '🧠'
     : url.includes('towardsai') ? '🚀' : url.includes('towardsdatascience') ? '📊'
-    : url.includes('kdnuggets') ? '💎' : url.includes('the-ken') ? '🔍' : '🔗';
+    : url.includes('kdnuggets') ? '💎' : url.includes('the-ken') ? '🔍'
+    : url.includes('venturebeat') ? '⚡' : '🔗';
 
   return `${summary.trim()}\n\n---\n\n## ${srcIcon} Read Original Article\n\n> **Want to dive deeper?** Access the full article with original charts, images, and detailed analysis.\n\n**[📖 Read Full Article on ${srcName} →](${url})**\n`.trim();
 }
@@ -499,10 +500,13 @@ async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
     );
 
     // cleanup old articles — keep saved and read articles
+    const cutoffDate = new Date();
+    cutoffDate.setDate(cutoffDate.getDate() - (settings.article_retention_days || 30));
     await pool.query(
       `DELETE FROM news_articles
-       WHERE published_at < NOW() - INTERVAL '${settings.article_retention_days} days'
+       WHERE published_at < $1
          AND saved = FALSE AND read = FALSE`,
+      [cutoffDate.toISOString()],
     );
 
     // mark latest unread article as featured

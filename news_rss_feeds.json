@@ -121,6 +121,16 @@
       "enabled": true,
       "prompt_key": "tech_summary_prompt",
       "description": "Data science, AI, and analytics resources and tutorials"
+    },
+    {
+      "id": "venturebeat",
+      "name": "VentureBeat",
+      "url": "https://venturebeat.com/feed",
+      "category": "technology",
+      "app_category": "AI News",
+      "enabled": true,
+      "prompt_key": "tech_summary_prompt",
+      "description": "Transformative AI and enterprise technology coverage"
     }
   ],
   "settings": {

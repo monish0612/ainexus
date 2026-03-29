@@ -248,7 +248,7 @@ function extractImageUrl(block, htmlContent, link) {
   for (const pattern of mediaAttrPatterns) {
     const match = block.match(pattern);
     if (match?.[1]) {
-      return absolutizeUrl(match[1].trim(), link);
+      return absolutizeUrl(decodeHtmlEntities(match[1].trim()), link);
     }
   }
 
