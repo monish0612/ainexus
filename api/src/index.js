@@ -1567,6 +1567,53 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
   }
 });
 
+// ── Gemini response cache — survives client disconnects AND server restarts ───
+// When the user minimizes the app, Android kills the TCP socket, but the Gemini
+// call continues on the backend. Completed results are persisted in Postgres so
+// the client's retry (even hours later) gets an instant cache hit.
+//
+// Architecture:
+//   • Postgres `ai_response_cache` table — persistent, survives restarts (24h TTL)
+//   • In-memory Map — only for in-flight promise deduplication (ephemeral)
+const _inflight = new Map();
+
+setInterval(async () => {
+  try {
+    const { rowCount } = await pool.query(
+      `DELETE FROM ai_response_cache WHERE created_at < NOW() - INTERVAL '24 hours'`,
+    );
+    if (rowCount > 0) console.log(`[Cache] Cleaned ${rowCount} expired entries`);
+  } catch { /* ignore cleanup errors */ }
+  const now = Date.now();
+  for (const [k, v] of _inflight) {
+    if (!v.pending || now - v.ts > 5 * 60 * 1000) _inflight.delete(k);
+  }
+}, 10 * 60 * 1000).unref(); // every 10 minutes
+
+async function _getFromDbCache(key) {
+  try {
+    const { rows } = await pool.query(
+      `SELECT result_json FROM ai_response_cache
+       WHERE cache_key = $1 AND created_at > NOW() - INTERVAL '24 hours'`,
+      [key],
+    );
+    return rows[0]?.result_json ?? null;
+  } catch { return null; }
+}
+
+async function _putToDbCache(key, result) {
+  try {
+    await pool.query(
+      `INSERT INTO ai_response_cache (cache_key, result_json)
+       VALUES ($1, $2)
+       ON CONFLICT (cache_key) DO UPDATE SET result_json = $2, created_at = NOW()`,
+      [key, JSON.stringify(result)],
+    );
+  } catch (e) {
+    console.warn('[Cache] DB write failed:', e.message?.slice(0, 120));
+  }
+}
+
 // POST /api/v1/ai/deep-research  (Gemini 3.1 Pro + Google Search — thorough URL analysis)
 aiRouter.post('/deep-research', async (req, res, next) => {
   try {
@@ -1582,6 +1629,22 @@ aiRouter.post('/deep-research', async (req, res, next) => {
 
     const safeUrl = String(url).slice(0, 500);
     const safeQuestion = question ? String(question).trim() : '';
+    const histLen = Array.isArray(history) ? history.length : 0;
+    const cacheKey = `dr::${safeUrl}::${(safeQuestion || 'init').slice(0, 200)}::${histLen}`;
+
+    // 1) Check Postgres (persists across restarts, 24h TTL)
+    const dbCached = await _getFromDbCache(cacheKey);
+    if (dbCached) {
+      console.log('[DeepResearch] DB cache hit — returning instantly');
+      return res.json(dbCached);
+    }
+
+    // 2) Check in-flight promise (same request from a prior disconnected client)
+    const flight = _inflight.get(cacheKey);
+    if (flight?.pending) {
+      console.log('[DeepResearch] Awaiting in-flight request from prior connection');
+      try { return res.json(await flight.pending); } catch { /* fall through */ }
+    }
 
     const systemInstruction =
       `You are an expert deep research analyst with access to Google Search. ` +
@@ -1610,18 +1673,32 @@ aiRouter.post('/deep-research', async (req, res, next) => {
       text: safeQuestion || `Perform a deep research analysis of: ${safeUrl}`,
     });
 
-    const result = await groundedConverse(turns, systemInstruction, {
-      timeoutMs: 120000,
-      maxTokens: 8192,
-      temperature: 0.5,
-    });
+    const apiPromise = (async () => {
+      try {
+        const result = await groundedConverse(turns, systemInstruction, {
+          timeoutMs: 120000,
+          maxTokens: 8192,
+          temperature: 0.5,
+        });
+        const payload = {
+          answer: result.text,
+          model: result.model,
+          sources: result.sources,
+          searchQueries: result.searchQueries || [],
+        };
+        await _putToDbCache(cacheKey, payload);
+        _inflight.delete(cacheKey);
+        return payload;
+      } catch (err) {
+        _inflight.delete(cacheKey);
+        throw err;
+      }
+    })();
 
-    res.json({
-      answer: result.text,
-      model: result.model,
-      sources: result.sources,
-      searchQueries: result.searchQueries || [],
-    });
+    _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
+
+    const response = await apiPromise;
+    if (!res.headersSent) res.json(response);
   } catch (err) {
     if (err.name === 'GroundingError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
@@ -1645,6 +1722,23 @@ aiRouter.post('/article-followup', async (req, res, next) => {
 
     const safeTitle = String(articleTitle || 'this article').slice(0, 200);
     const safeUrl = String(articleUrl || '').slice(0, 500);
+    const trimmedQ = String(question).trim();
+    const histLen = Array.isArray(history) ? history.length : 0;
+    const cacheKey = `fu::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}`;
+
+    // 1) Check Postgres (persists across restarts, 24h TTL)
+    const dbCached = await _getFromDbCache(cacheKey);
+    if (dbCached) {
+      console.log('[FollowUp] DB cache hit — returning instantly');
+      return res.json(dbCached);
+    }
+
+    // 2) Check in-flight promise (same request from a prior disconnected client)
+    const flight = _inflight.get(cacheKey);
+    if (flight?.pending) {
+      console.log('[FollowUp] Awaiting in-flight request from prior connection');
+      try { return res.json(await flight.pending); } catch { /* fall through */ }
+    }
 
     const systemInstruction =
       `You are an expert news analyst and research assistant. ` +
@@ -1663,20 +1757,34 @@ aiRouter.post('/article-followup', async (req, res, next) => {
         }
       }
     }
-    turns.push({ role: 'user', text: String(question).trim() });
+    turns.push({ role: 'user', text: trimmedQ });
 
-    const result = await groundedConverse(turns, systemInstruction, {
-      timeoutMs: 90000,
-      maxTokens: 8192,
-      temperature: 0.7,
-    });
+    const apiPromise = (async () => {
+      try {
+        const result = await groundedConverse(turns, systemInstruction, {
+          timeoutMs: 90000,
+          maxTokens: 8192,
+          temperature: 0.7,
+        });
+        const payload = {
+          answer: result.text,
+          model: result.model,
+          sources: result.sources,
+          searchQueries: result.searchQueries || [],
+        };
+        await _putToDbCache(cacheKey, payload);
+        _inflight.delete(cacheKey);
+        return payload;
+      } catch (err) {
+        _inflight.delete(cacheKey);
+        throw err;
+      }
+    })();
 
-    res.json({
-      answer: result.text,
-      model: result.model,
-      sources: result.sources,
-      searchQueries: result.searchQueries || [],
-    });
+    _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
+
+    const response = await apiPromise;
+    if (!res.headersSent) res.json(response);
   } catch (err) {
     if (err.name === 'GroundingError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
@@ -2519,6 +2627,13 @@ async function initTables() {
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     );
+
+    CREATE TABLE IF NOT EXISTS ai_response_cache (
+      cache_key TEXT PRIMARY KEY,
+      result_json JSONB NOT NULL,
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
+    CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_response_cache (created_at);
 
   `);
 
