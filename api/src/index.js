@@ -1567,6 +1567,91 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
   }
 });
 
+// POST /api/v1/ai/search-followup  (Gemini 3.1 Pro + Google Search — follow-up on a search result)
+aiRouter.post('/search-followup', async (req, res, next) => {
+  try {
+    const { query, initialAnswer, question, history } = req.body || {};
+
+    if (!question || String(question).trim().length < 2) {
+      return res.status(400).json({ error: 'question is required (min 2 chars)' });
+    }
+
+    if (!isGroundingAvailable()) {
+      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+    }
+
+    const safeQuery = String(query || '').slice(0, 500);
+    const trimmedQ = String(question).trim();
+    const histLen = Array.isArray(history) ? history.length : 0;
+    const cacheKey = `sf::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}`;
+
+    const dbCached = await _getFromDbCache(cacheKey);
+    if (dbCached) {
+      console.log('[SearchFollowUp] DB cache hit — returning instantly');
+      return res.json(dbCached);
+    }
+
+    const flight = _inflight.get(cacheKey);
+    if (flight?.pending) {
+      console.log('[SearchFollowUp] Awaiting in-flight request from prior connection');
+      try { return res.json(await flight.pending); } catch { /* fall through */ }
+    }
+
+    const answerSnippet = String(initialAnswer || '').slice(0, 1500);
+    const systemInstruction =
+      `You are a knowledgeable research assistant with access to Google Search. ` +
+      `The user previously searched for "${safeQuery}"` +
+      (answerSnippet
+        ? ` and received this initial answer:\n\n---\n${answerSnippet}\n---\n\n`
+        : '. ') +
+      `Answer follow-up questions using Google Search for the latest real-time information. ` +
+      `Provide comprehensive, well-structured answers with markdown formatting. ` +
+      `Cite sources when possible. Maintain conversation continuity across follow-ups.`;
+
+    const turns = [];
+    if (Array.isArray(history)) {
+      for (const h of history) {
+        if (h && h.role && h.text) {
+          turns.push({ role: String(h.role), text: String(h.text).slice(0, 4000) });
+        }
+      }
+    }
+    turns.push({ role: 'user', text: trimmedQ });
+
+    const apiPromise = (async () => {
+      try {
+        const result = await groundedConverse(turns, systemInstruction, {
+          timeoutMs: 90000,
+          maxTokens: 8192,
+          temperature: 0.7,
+        });
+        const payload = {
+          answer: result.text,
+          model: result.model,
+          sources: result.sources,
+          searchQueries: result.searchQueries || [],
+        };
+        await _putToDbCache(cacheKey, payload);
+        _inflight.delete(cacheKey);
+        return payload;
+      } catch (err) {
+        _inflight.delete(cacheKey);
+        throw err;
+      }
+    })();
+
+    _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
+
+    const response = await apiPromise;
+    if (!res.headersSent) res.json(response);
+  } catch (err) {
+    if (err.name === 'GroundingError') {
+      return res.status(err.status || 500).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+});
+
 // ── Gemini response cache — survives client disconnects AND server restarts ───
 // When the user minimizes the app, Android kills the TCP socket, but the Gemini
 // call continues on the backend. Completed results are persisted in Postgres so
