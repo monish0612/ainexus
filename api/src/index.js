@@ -1570,7 +1570,7 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
 // POST /api/v1/ai/search-followup  (Gemini 3.1 Pro + Google Search — follow-up on a search result)
 aiRouter.post('/search-followup', async (req, res, next) => {
   try {
-    const { query, initialAnswer, question, history } = req.body || {};
+    const { query, initialAnswer, question, history, model } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -1583,7 +1583,8 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     const safeQuery = String(query || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
-    const cacheKey = `sf::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}`;
+    const modelTag = model ? String(model) : 'default';
+    const cacheKey = `sf::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
 
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
@@ -1618,13 +1619,12 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     }
     turns.push({ role: 'user', text: trimmedQ });
 
+    const converseOpts = { timeoutMs: 90000, maxTokens: 8192, temperature: 0.7 };
+    if (model) converseOpts.model = String(model);
+
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, {
-          timeoutMs: 90000,
-          maxTokens: 8192,
-          temperature: 0.7,
-        });
+        const result = await groundedConverse(turns, systemInstruction, converseOpts);
         const payload = {
           answer: result.text,
           model: result.model,
