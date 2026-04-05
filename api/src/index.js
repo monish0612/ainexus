@@ -1917,6 +1917,63 @@ aiRouter.post('/categorize', async (req, res, next) => {
   }
 });
 
+// POST /api/v1/ai/summarize-history — condensed summary of conversation history
+aiRouter.post('/summarize-history', async (req, res, next) => {
+  try {
+    const { messages, model, articleContext } = req.body || {};
+
+    if (!Array.isArray(messages) || messages.length < 2) {
+      return res.status(400).json({ error: 'messages array required (min 2 entries)' });
+    }
+
+    const liteLLMMessages = [
+      {
+        role: 'system',
+        content:
+          'You are a conversation summarizer. ' +
+          'Given a conversation history between a user and an AI assistant, ' +
+          'produce a concise but comprehensive summary that captures ALL key topics discussed, ' +
+          'questions asked, answers given, and important details/facts mentioned. ' +
+          'The summary will be used as context for future conversations, so preserve: ' +
+          '(1) specific facts and data points, (2) user preferences expressed, ' +
+          '(3) conclusions reached, (4) any follow-up topics mentioned. ' +
+          (articleContext ? `The conversation is about: "${String(articleContext).slice(0, 300)}". ` : '') +
+          'Return ONLY the summary, no preamble or labels.',
+      },
+    ];
+
+    const conversationText = messages
+      .filter((m) => m && m.role && m.text)
+      .map((m) => `${String(m.role).toUpperCase()}: ${String(m.text).slice(0, 3000)}`)
+      .join('\n\n');
+
+    liteLLMMessages.push({
+      role: 'user',
+      content: `Summarize the following conversation:\n\n${conversationText}`,
+    });
+
+    const targetModel = model || 'gemini/gemini-2.0-flash-lite';
+    console.log(`[SummarizeHistory] ${messages.length} msgs, model=${targetModel}, ctx="${(articleContext || '').slice(0, 50)}"`);
+
+    const result = await callLiteLLM({
+      model: targetModel,
+      messages: liteLLMMessages,
+      maxTokens: 1024,
+      temperature: 0.3,
+    });
+
+    console.log(`[SummarizeHistory] Done — ${result.content.length} chars`);
+    res.json({
+      summary: result.content,
+      model: result.model_used,
+      usage: result.usage,
+    });
+  } catch (err) {
+    console.error('[SummarizeHistory] Failed:', err.message);
+    next(err);
+  }
+});
+
 app.use('/api/v1/ai', aiRouter);
 
 // ═══════════════════════════════════════════════════════════════
@@ -2355,6 +2412,74 @@ articleChatsRouter.delete('/:articleId', async (req, res, next) => {
   }
 });
 
+// GET /api/v1/article-chats/:articleId/summary — get conversation summary
+articleChatsRouter.get('/:articleId/summary', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const { rows } = await pool.query(
+      'SELECT summary_text, pairs_covered, updated_at FROM article_chat_summaries WHERE article_id = $1',
+      [articleId],
+    );
+    if (rows.length === 0) {
+      return res.json({});
+    }
+    res.json({
+      summaryText: rows[0].summary_text,
+      pairsCovered: rows[0].pairs_covered,
+      updatedAt: rows[0].updated_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/v1/article-chats/:articleId/summary — upsert conversation summary
+articleChatsRouter.put('/:articleId/summary', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const { summaryText, pairsCovered, updatedAt } = req.body || {};
+
+    if (!summaryText || typeof pairsCovered !== 'number') {
+      return res.status(400).json({ error: 'summaryText and pairsCovered are required' });
+    }
+
+    await pool.query(
+      `INSERT INTO article_chat_summaries (article_id, summary_text, pairs_covered, updated_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (article_id) DO UPDATE SET
+         summary_text = EXCLUDED.summary_text,
+         pairs_covered = EXCLUDED.pairs_covered,
+         updated_at = EXCLUDED.updated_at`,
+      [
+        articleId,
+        summaryText,
+        pairsCovered,
+        updatedAt || new Date().toISOString(),
+      ],
+    );
+
+    console.log(`[ARTICLE_SUMMARY] Upserted: ${articleId} (${pairsCovered} pairs)`);
+    res.json({ ok: true, articleId, pairsCovered });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/article-chats/:articleId/summary — delete conversation summary
+articleChatsRouter.delete('/:articleId/summary', async (req, res, next) => {
+  try {
+    const { articleId } = req.params;
+    const result = await pool.query(
+      'DELETE FROM article_chat_summaries WHERE article_id = $1',
+      [articleId],
+    );
+    console.log('[ARTICLE_SUMMARY] Deleted:', articleId, '| rows:', result.rowCount);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/api/v1/article-chats', articleChatsRouter);
 
 // ═══════════════════════════════════════════════════════════════
@@ -2674,6 +2799,13 @@ async function initTables() {
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     );
     CREATE INDEX IF NOT EXISTS idx_acm_article ON article_chat_messages(article_id);
+
+    CREATE TABLE IF NOT EXISTS article_chat_summaries (
+      article_id TEXT PRIMARY KEY,
+      summary_text TEXT NOT NULL,
+      pairs_covered INTEGER NOT NULL DEFAULT 0,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    );
 
     CREATE TABLE IF NOT EXISTS saved_words (
       id TEXT PRIMARY KEY,
