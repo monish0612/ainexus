@@ -1920,7 +1920,7 @@ aiRouter.post('/categorize', async (req, res, next) => {
 // POST /api/v1/ai/summarize-history — condensed summary of conversation history
 aiRouter.post('/summarize-history', async (req, res, next) => {
   try {
-    const { messages, model, articleContext } = req.body || {};
+    const { messages, articleContext } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length < 2) {
       return res.status(400).json({ error: 'messages array required (min 2 entries)' });
@@ -1952,11 +1952,9 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
       content: `Summarize the following conversation:\n\n${conversationText}`,
     });
 
-    const targetModel = model || 'gemini/gemini-2.0-flash-lite';
-    console.log(`[SummarizeHistory] ${messages.length} msgs, model=${targetModel}, ctx="${(articleContext || '').slice(0, 50)}"`);
+    console.log(`[SummarizeHistory] ${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}"`);
 
     const result = await callLiteLLM({
-      model: targetModel,
       messages: liteLLMMessages,
       maxTokens: 1024,
       temperature: 0.3,
