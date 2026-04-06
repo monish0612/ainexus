@@ -1,7 +1,9 @@
 import fetch from 'node-fetch';
 
 function liteLLMBaseUrl() {
-  return (process.env.LITELLM_URL || 'http://72.60.219.97:4000').replace(/\/$/, '');
+  const url = process.env.LITELLM_URL;
+  if (!url) throw new Error('LITELLM_URL env var not set');
+  return url.replace(/\/$/, '');
 }
 
 function litellmHeaders() {
@@ -11,17 +13,32 @@ function litellmHeaders() {
   return h;
 }
 
+function _getModelPriority() {
+  const raw = process.env._LITELLM_MODEL_PRIORITY;
+  if (raw) {
+    try { return JSON.parse(raw); } catch { /* ignore */ }
+  }
+  return [];
+}
+
 /**
  * @param {string} [model]
  * @param {Array<{role: string, content: string}>} messages
  * @param {Record<string, unknown>} [options]
  */
 export async function callLiteLLM(model, messages, options = {}) {
+  const priority = _getModelPriority();
+  const resolvedModel = model || (priority.length > 0 ? priority[0] : null);
+
+  if (!resolvedModel) {
+    throw new Error('No LiteLLM model available — set _LITELLM_MODEL_PRIORITY or pass model explicitly');
+  }
+
   const response = await fetch(`${liteLLMBaseUrl()}/v1/chat/completions`, {
     method: 'POST',
     headers: litellmHeaders(),
     body: JSON.stringify({
-      model: model || 'gpt-4o-mini',
+      model: resolvedModel,
       messages,
       ...options,
     }),

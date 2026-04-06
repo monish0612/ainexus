@@ -23,7 +23,10 @@ const {
   groundedExtract,
   groundedConverse,
   isGroundingAvailable,
+  resolveGroundingMode,
+  getGroundingConfig,
 } = require('./google-grounding');
+const { tg } = require('./telegram');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -72,8 +75,102 @@ function authenticate(req, res, next) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  LITELLM HELPER
+//  LITELLM — FULLY DYNAMIC MODEL DISCOVERY + SMART ROUTING
+//
+//  Zero hardcoded model names. All models are discovered at
+//  runtime from LiteLLM's /v1/models endpoint.
+//
+//  Priority: non-Groq models first (sorted by version desc),
+//  Groq/* models always last. Re-discovers every 5 minutes.
 // ═══════════════════════════════════════════════════════════════
+
+let modelPriorityList = [];
+let _discoveryAttempts = 0;
+const _REDISCOVERY_MS = 5 * 60 * 1000;
+const _MAX_DISCOVERY_RETRIES = 5;
+const _CALL_TIMEOUT_MS = 30_000;
+const _MAX_RETRIES_PER_MODEL = 2;
+const _MAX_RETRIES_LAST_MODEL = 3;
+
+function _extractVersion(modelId) {
+  const match = modelId.match(/(\d+(?:\.\d+)?)/);
+  return match ? parseFloat(match[1]) : 0;
+}
+
+function _isGroqModel(id) {
+  const lower = id.toLowerCase();
+  return lower.startsWith('groq/') || lower.includes('llama');
+}
+
+function _isRetryableError(msg) {
+  return /429|500|502|503|504|timeout|ETIMEDOUT|ECONNRESET|socket hang up/i.test(msg);
+}
+
+function _sortModelPriority(models) {
+  const preferred = models.filter(m => !_isGroqModel(m));
+  const groq = models.filter(m => _isGroqModel(m));
+  preferred.sort((a, b) => _extractVersion(b) - _extractVersion(a));
+  groq.sort((a, b) => _extractVersion(b) - _extractVersion(a));
+  return [...preferred, ...groq];
+}
+
+// ── GET helper ─────────────────────────────────────────────────
+
+async function getLiteLLM(path) {
+  const response = await fetch(process.env.LITELLM_URL + path, {
+    headers: { 'Authorization': 'Bearer ' + process.env.LITELLM_VIRTUAL_KEY },
+    signal: AbortSignal.timeout(10_000),
+  });
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`LiteLLM GET ${response.status}: ${text.slice(0, 300)}`);
+  }
+  return response.json();
+}
+
+// ── Discovery ──────────────────────────────────────────────────
+
+async function discoverLiteLLMModels() {
+  try {
+    const data = await getLiteLLM('/v1/models');
+    const models = (data?.data || []).map(m => m.id).filter(Boolean);
+
+    if (models.length === 0) {
+      const msg = 'No models returned from /v1/models — check LiteLLM config';
+      console.warn(`[LiteLLM] ${msg}`);
+      tg.w('LiteLLM', msg);
+      return;
+    }
+
+    modelPriorityList = _sortModelPriority(models);
+    process.env._LITELLM_MODEL_PRIORITY = JSON.stringify(modelPriorityList);
+    _discoveryAttempts = 0;
+
+    const primary = modelPriorityList[0];
+    const fallbacks = modelPriorityList.slice(1);
+    const summary = `${models.length} models — Primary: ${primary}` +
+      (fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : '');
+
+    console.log(`[LiteLLM] Discovered ${summary}`);
+    tg.i('LiteLLM', `Discovered ${summary}`);
+  } catch (e) {
+    _discoveryAttempts++;
+    const msg = `Discovery failed (attempt ${_discoveryAttempts}/${_MAX_DISCOVERY_RETRIES}): ${e.message}`;
+    console.warn(`[LiteLLM] ${msg}`);
+
+    if (_discoveryAttempts >= _MAX_DISCOVERY_RETRIES) {
+      tg.e('LiteLLM', msg, e);
+    } else {
+      tg.w('LiteLLM', msg, e);
+      const delay = Math.min(1000 * Math.pow(2, _discoveryAttempts), 30_000);
+      setTimeout(discoverLiteLLMModels, delay);
+    }
+  }
+}
+
+setInterval(discoverLiteLLMModels, _REDISCOVERY_MS).unref();
+
+// ── Single completion call ─────────────────────────────────────
 
 async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
   const response = await fetch(process.env.LITELLM_URL + '/v1/chat/completions', {
@@ -88,11 +185,14 @@ async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
       max_tokens: maxTokens,
       temperature,
     }),
+    signal: AbortSignal.timeout(_CALL_TIMEOUT_MS),
   });
 
   if (!response.ok) {
     const text = await response.text();
-    throw new Error(`LiteLLM ${response.status} [${model}]: ${text.slice(0, 300)}`);
+    const err = new Error(`LiteLLM ${response.status} [${model}]: ${text.slice(0, 300)}`);
+    err.status = response.status;
+    throw err;
   }
 
   const data = await response.json();
@@ -103,83 +203,57 @@ async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
   };
 }
 
-async function callLiteLLM({
-  messages,
-  model,
-  temperature = 0.7,
-  maxTokens = 2048,
-}) {
-  const modelsToTry = model
-    ? [model]
-    : modelPriorityList.length > 0
-      ? [...modelPriorityList]
-      : ['gemini/gemini-2.0-flash'];
+// ── Smart caller with retry + fallback ─────────────────────────
 
+async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048 }) {
+  if (modelPriorityList.length === 0 && !model) {
+    await discoverLiteLLMModels();
+    if (modelPriorityList.length === 0) {
+      const err = new Error('No LiteLLM models available — /v1/models returned empty');
+      tg.e('LiteLLM', err.message);
+      throw err;
+    }
+  }
+
+  const modelsToTry = model ? [model] : [...modelPriorityList];
   let lastError;
-  for (const m of modelsToTry) {
-    try {
-      return await _callLiteLLMOnce(m, messages, { temperature, maxTokens });
-    } catch (e) {
-      lastError = e;
-      if (modelsToTry.length > 1) {
-        console.warn(`[LLM] ${m} failed, trying next fallback... (${e.message.slice(0, 120)})`);
+
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const m = modelsToTry[i];
+    const isLast = i === modelsToTry.length - 1;
+    const maxRetries = isLast ? _MAX_RETRIES_LAST_MODEL : _MAX_RETRIES_PER_MODEL;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delay = Math.min(500 * Math.pow(2, attempt), 4000);
+          await new Promise(r => setTimeout(r, delay));
+        }
+        const result = await _callLiteLLMOnce(m, messages, { temperature, maxTokens });
+        if (i > 0) {
+          tg.w('LiteLLM', `Fallback to ${m} succeeded (primary ${modelsToTry[0]} was down)`);
+        }
+        return result;
+      } catch (e) {
+        lastError = e;
+        const retryable = _isRetryableError(e.message);
+
+        if (!retryable || attempt >= maxRetries - 1) {
+          if (modelsToTry.length > 1) {
+            console.warn(`[LLM] ${m} exhausted after ${attempt + 1} attempts: ${e.message.slice(0, 120)}`);
+          }
+          break;
+        }
+        console.warn(`[LLM] ${m} retry ${attempt + 1}/${maxRetries}: ${e.message.slice(0, 80)}`);
       }
     }
   }
+
+  tg.e('LiteLLM', `All ${modelsToTry.length} models exhausted: ${modelsToTry.join(', ')}`, lastError);
   throw lastError;
 }
 
-async function getLiteLLM(path) {
-  const response = await fetch(process.env.LITELLM_URL + path, {
-    headers: {
-      'Authorization': 'Bearer ' + process.env.LITELLM_VIRTUAL_KEY,
-    },
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`LiteLLM GET ${response.status}: ${text}`);
-  }
-  return response.json();
-}
-
-// ═══════════════════════════════════════════════════════════════
-//  LITELLM MODEL AUTO-DETECTION (priority + fallback)
-// ═══════════════════════════════════════════════════════════════
-
-let modelPriorityList = [];
-
-function extractVersion(modelId) {
-  const match = modelId.match(/(\d+(?:\.\d+)?)/);
-  return match ? parseFloat(match[1]) : 0;
-}
-
-async function discoverLiteLLMModels() {
-  try {
-    const data = await getLiteLLM('/v1/models');
-    const models = (data?.data || []).map((m) => m.id).filter(Boolean);
-    if (models.length === 0) {
-      console.warn('[LiteLLM] No models found on server');
-      return;
-    }
-
-    console.log(`[LiteLLM] Available models: ${models.join(', ')}`);
-
-    const geminiModels = models.filter((m) => m.toLowerCase().includes('gemini'));
-    const nonGemini = models.filter((m) => !m.toLowerCase().includes('gemini'));
-
-    // Sort Gemini by version descending (3.1 > 3.0 > 2.0)
-    geminiModels.sort((a, b) => extractVersion(b) - extractVersion(a));
-
-    modelPriorityList = [...geminiModels, ...nonGemini];
-
-    process.env._LITELLM_MODEL_PRIORITY = JSON.stringify(modelPriorityList);
-
-    console.log(`[LiteLLM] Priority order: ${modelPriorityList.join(' → ')}`);
-    console.log(`[LiteLLM] Primary: ${modelPriorityList[0]}${modelPriorityList.length > 1 ? ` | Fallback: ${modelPriorityList.slice(1).join(', ')}` : ''}`);
-  } catch (e) {
-    console.warn('[LiteLLM] Could not auto-detect models:', e.message);
-  }
-}
+// ── Public accessors ───────────────────────────────────────────
 
 function getPrimaryModel() {
   return modelPriorityList[0] || null;
@@ -187,6 +261,66 @@ function getPrimaryModel() {
 
 function getFallbackModels() {
   return modelPriorityList.slice(1);
+}
+
+function getModelPriorityList() {
+  return [...modelPriorityList];
+}
+
+// ── LLM error notifier for grounding outages ─────────────────
+// When Gemini grounding is completely down (all models × retries
+// exhausted), use Llama/Groq via LiteLLM to generate a friendly
+// error message for the user. Does NOT answer the question —
+// just explains the outage.
+
+const _HARDCODED_ERROR_MSG =
+  '⚠️ **Temporarily Unavailable**\n\n' +
+  'I apologize, but the AI service (Google Gemini) is currently experiencing issues ' +
+  'and I\'m unable to process your request right now.\n\n' +
+  'Please try again in a moment — this is usually resolved quickly.';
+
+async function _notifyGroundingError(groundingError) {
+  const errMsg = groundingError instanceof Error
+    ? groundingError.message
+    : String(groundingError);
+
+  try {
+    const result = await callLiteLLM({
+      messages: [
+        {
+          role: 'system',
+          content:
+            'You are Nexus AI assistant. The primary AI model (Google Gemini) is temporarily down. '
+            + 'Write a brief, empathetic 2-3 sentence message to the user: '
+            + '(1) Acknowledge the issue, (2) include the short technical reason, '
+            + '(3) suggest trying again in a moment. Use markdown. Do NOT answer any question.',
+        },
+        {
+          role: 'user',
+          content: `Gemini API error: ${errMsg.slice(0, 400)}`,
+        },
+      ],
+      maxTokens: 250,
+      temperature: 0.2,
+    });
+
+    tg.i('LLM/error-notify', `✓ model=${result.model_used} — delivered Gemini outage notice`);
+    return {
+      text: result.content,
+      model: `${result.model_used} (error-notice)`,
+      sources: [],
+      searchQueries: [],
+      fallback: true,
+    };
+  } catch {
+    return {
+      text: _HARDCODED_ERROR_MSG,
+      model: 'error-fallback',
+      sources: [],
+      searchQueries: [],
+      fallback: true,
+    };
+  }
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -1012,12 +1146,14 @@ app.use('/api/v1/news', newsRouter);
 const aiRouter = express.Router();
 
 aiRouter.post('/rephrase', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AIRephraseSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const platformId = normalizeRephrasePlatformId(val.data.platform) || 'casual';
     const systemPrompt = buildRephraseSystemPrompt(platformId);
+    tg.d('AI/rephrase', `platform=${platformId}, textLen=${(val.data.text || '').length}`);
 
     const result = await callLiteLLM({
       model: val.data.model || undefined,
@@ -1034,6 +1170,7 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
     );
 
+    tg.i('AI/rephrase', `✓ model=${result.model_used} ${Date.now() - _t0}ms, platform=${platformId}`);
     res.json({
       platform: platformId,
       rephrasedText: rephrasedText || val.data.text,
@@ -1041,14 +1178,17 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('AI/rephrase', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 aiRouter.post('/correct', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AICorrectSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
+    tg.d('AI/correct', `textLen=${(val.data.text || '').length}`);
 
     const result = await callLiteLLM({
       model: val.data.model || undefined,
@@ -1113,6 +1253,7 @@ aiRouter.post('/correct', async (req, res, next) => {
 
     console.log('[COACH] Final variations count:', variations.length);
 
+    tg.i('AI/correct', `✓ model=${result.model_used} ${Date.now() - _t0}ms, variations=${variations.length}`);
     res.json({
       correctedText: correctedText || val.data.text,
       explanation,
@@ -1121,14 +1262,17 @@ aiRouter.post('/correct', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('AI/correct', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 aiRouter.post('/define', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AIDefineSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
+    tg.d('AI/define', `word="${val.data.word}"`);
 
     const systemPrompt = buildDictionarySystemPrompt(val.data.word);
 
@@ -1170,6 +1314,7 @@ aiRouter.post('/define', async (req, res, next) => {
 
     console.log('[DICT] usageGuide length:', usageGuide.length, '| first 80:', usageGuide.slice(0, 80));
 
+    tg.i('AI/define', `✓ model=${result.model_used} ${Date.now() - _t0}ms, word="${word}"`);
     res.json({
       word,
       pronunciation,
@@ -1181,6 +1326,7 @@ aiRouter.post('/define', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('AI/define', `Failed word="${val?.data?.word}" ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -1214,12 +1360,15 @@ function extractTitleFromHtml(html) {
 }
 
 aiRouter.post('/summarize', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AISummarizeSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const url = val.data.url;
     console.log('[SUMMARIZE] Starting for URL:', url);
+    tg.d('AI/summarize', `url="${url.slice(0, 80)}"`);
+
 
     let content = '';
     let title = '';
@@ -1412,6 +1561,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
     const keyPoints = (Array.isArray(rawKeyPoints) ? rawKeyPoints : [])
       .map(p => asString(p)).filter(Boolean);
 
+    tg.i('AI/summarize', `✓ model=${llmResult.model_used} ${Date.now() - _t0}ms, method=${extractionMethod}, url="${url.slice(0, 60)}"`);
     res.json({
       title: asString(parsed?.title || title || ''),
       summary: summary || 'Summary could not be generated.',
@@ -1425,6 +1575,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
       usage: llmResult.usage,
     });
   } catch (err) {
+    tg.e('AI/summarize', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -1435,12 +1586,14 @@ const AISmartParseSchema = z.object({
 });
 
 aiRouter.post('/smart-parse', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AISmartParseSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const { text } = val.data;
     console.log('[AI] smart-parse →', text);
+    tg.d('AI/smart-parse', `text="${text.slice(0, 60)}"`);
 
     const result = await callLiteLLM({
       messages: [
@@ -1460,6 +1613,7 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
       return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
     }
 
+    tg.i('AI/smart-parse', `✓ model=${result.model_used} ${Date.now() - _t0}ms, category=${parsed.category || 'Others'}`);
     res.json({
       amount: typeof parsed.amount === 'number' ? parsed.amount : parseFloat(parsed.amount) || 0,
       description: parsed.description || text,
@@ -1470,6 +1624,7 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('AI/smart-parse', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -1480,6 +1635,7 @@ const AICategorizeSchema = z.object({
 });
 
 aiRouter.post('/search', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const { query } = req.body || {};
     if (!query || String(query).trim().length < 2) {
@@ -1492,6 +1648,7 @@ aiRouter.post('/search', async (req, res, next) => {
     }
 
     console.log('[AI] Tavily search →', String(query).trim());
+    tg.d('AI/search', `model=tavily q="${String(query).trim().slice(0, 80)}"`);
 
     const tavilyRes = await fetch('https://api.tavily.com/search', {
       method: 'POST',
@@ -1518,6 +1675,7 @@ aiRouter.post('/search', async (req, res, next) => {
     }
 
     const data = await tavilyRes.json();
+    tg.i('AI/search', `✓ model=tavily ${Date.now() - _t0}ms, results=${(data.results || []).length}`);
     res.json({
       answer: data.answer || '',
       query: data.query || query,
@@ -1529,12 +1687,14 @@ aiRouter.post('/search', async (req, res, next) => {
       })),
     });
   } catch (err) {
+    tg.e('AI/search', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 // POST /api/v1/ai/grounded-search  (Gemini + Google Search)
 aiRouter.post('/grounded-search', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const { query, model } = req.body || {};
     if (!query || String(query).trim().length < 2) {
@@ -1544,33 +1704,48 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
     if (!isGroundingAvailable()) {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured for grounding' });
     }
+    const trimmedQ = String(query).trim();
+    tg.d('AI/grounded-search', `model=${model || 'default'} q="${trimmedQ.slice(0, 80)}"`);
 
-    const result = await groundedSearch(String(query).trim(), { model });
+    let result;
+    try {
+      result = await groundedSearch(trimmedQ, { model });
+    } catch (groundingErr) {
+      tg.w('AI/grounded-search', `Grounding exhausted, notifying user via LLM`, groundingErr);
+      result = await _notifyGroundingError(groundingErr);
+    }
 
+    if (!result.fallback) {
+      tg.i('AI/grounded-search', `✓ model=${result.model} ${Date.now() - _t0}ms, ${result.sources.length} sources`);
+    }
     res.json({
       answer: result.text,
-      query: String(query).trim(),
+      query: trimmedQ,
       model: result.model,
-      searchQueries: result.searchQueries,
-      sources: result.sources,
-      citations: result.citations,
+      searchQueries: result.searchQueries || [],
+      sources: result.sources || [],
+      citations: result.citations || [],
       usage: result.usage,
+      fallback: result.fallback || false,
     });
   } catch (err) {
     if (err.name === 'GroundingError') {
+      tg.e('AI/grounded-search', `Failed ${Date.now() - _t0}ms [${err.code}]`, err);
       return res.status(err.status || 500).json({
         error: err.message,
         code: err.code,
       });
     }
+    tg.e('AI/grounded-search', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
-// POST /api/v1/ai/search-followup  (Gemini 3.1 Pro + Google Search — follow-up on a search result)
+// POST /api/v1/ai/search-followup  (Gemini + Google Search — follow-up on a search result)
 aiRouter.post('/search-followup', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
-    const { query, initialAnswer, question, history, model } = req.body || {};
+    const { query, initialAnswer, question, history, model, mode, deepModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -1580,15 +1755,18 @@ aiRouter.post('/search-followup', async (req, res, next) => {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
     }
 
+    const resolvedModel = model ? String(model) : resolveGroundingMode(mode, deepModel);
     const safeQuery = String(query || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
-    const modelTag = model ? String(model) : 'default';
+    const modelTag = resolvedModel || mode || 'default';
     const cacheKey = `sf::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
+    tg.d('AI/search-followup', `model=${modelTag} mode=${mode || 'deep'} deepModel=${deepModel || 'none'} hist=${histLen}`);
 
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
       console.log('[SearchFollowUp] DB cache hit — returning instantly');
+      tg.d('AI/search-followup', `Cache hit model=${dbCached.model || modelTag} ${Date.now() - _t0}ms`);
       return res.json(dbCached);
     }
 
@@ -1620,7 +1798,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     turns.push({ role: 'user', text: trimmedQ });
 
     const converseOpts = { timeoutMs: 90000, maxTokens: 8192, temperature: 0.7 };
-    if (model) converseOpts.model = String(model);
+    if (resolvedModel) converseOpts.model = resolvedModel;
 
     const apiPromise = (async () => {
       try {
@@ -1634,17 +1812,23 @@ aiRouter.post('/search-followup', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (err) {
+      } catch (groundingErr) {
         _inflight.delete(cacheKey);
-        throw err;
+        tg.w('AI/search-followup', `Grounding exhausted, notifying user via LLM model=${modelTag}`, groundingErr);
+        const fb = await _notifyGroundingError(groundingErr);
+        return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
 
     _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
 
     const response = await apiPromise;
+    if (!response.fallback) {
+      tg.i('AI/search-followup', `✓ model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+    }
     if (!res.headersSent) res.json(response);
   } catch (err) {
+    tg.e('AI/search-followup', `Failed model=${modelTag} ${Date.now() - _t0}ms`, err);
     if (err.name === 'GroundingError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
@@ -1701,8 +1885,9 @@ async function _putToDbCache(key, result) {
 
 // POST /api/v1/ai/deep-research  (Gemini 3.1 Pro + Google Search — thorough URL analysis)
 aiRouter.post('/deep-research', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
-    const { url, question, history } = req.body || {};
+    const { url, question, history, deepModel } = req.body || {};
 
     if (!url || String(url).trim().length < 5) {
       return res.status(400).json({ error: 'url is required' });
@@ -1716,6 +1901,7 @@ aiRouter.post('/deep-research', async (req, res, next) => {
     const safeQuestion = question ? String(question).trim() : '';
     const histLen = Array.isArray(history) ? history.length : 0;
     const cacheKey = `dr::${safeUrl}::${(safeQuestion || 'init').slice(0, 200)}::${histLen}`;
+    tg.d('AI/deep-research', `deepModel=${deepModel || 'server-default'} hist=${histLen} url="${safeUrl.slice(0, 60)}"`);
 
     // 1) Check Postgres (persists across restarts, 24h TTL)
     const dbCached = await _getFromDbCache(cacheKey);
@@ -1758,13 +1944,11 @@ aiRouter.post('/deep-research', async (req, res, next) => {
       text: safeQuestion || `Perform a deep research analysis of: ${safeUrl}`,
     });
 
+    const deepOpts = { model: deepModel || undefined, timeoutMs: 120000, maxTokens: 8192, temperature: 0.5 };
+
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, {
-          timeoutMs: 120000,
-          maxTokens: 8192,
-          temperature: 0.5,
-        });
+        const result = await groundedConverse(turns, systemInstruction, deepOpts);
         const payload = {
           answer: result.text,
           model: result.model,
@@ -1774,17 +1958,23 @@ aiRouter.post('/deep-research', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (err) {
+      } catch (groundingErr) {
         _inflight.delete(cacheKey);
-        throw err;
+        tg.w('AI/deep-research', `Grounding exhausted, notifying user via LLM deepModel=${deepModel || 'default'}`, groundingErr);
+        const fb = await _notifyGroundingError(groundingErr);
+        return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
 
     _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
 
     const response = await apiPromise;
+    if (!response.fallback) {
+      tg.i('AI/deep-research', `✓ model=${response.model || deepModel || 'default'} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+    }
     if (!res.headersSent) res.json(response);
   } catch (err) {
+    tg.e('AI/deep-research', `Failed deepModel=${deepModel || 'default'} ${Date.now() - _t0}ms`, err);
     if (err.name === 'GroundingError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
@@ -1792,10 +1982,11 @@ aiRouter.post('/deep-research', async (req, res, next) => {
   }
 });
 
-// POST /api/v1/ai/article-followup  (Gemini 3.1 Pro + Google Search — multi-turn)
+// POST /api/v1/ai/article-followup  (Gemini + Google Search — multi-turn)
 aiRouter.post('/article-followup', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
-    const { articleUrl, articleTitle, question, history } = req.body || {};
+    const { articleUrl, articleTitle, question, history, model, mode, deepModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -1805,11 +1996,14 @@ aiRouter.post('/article-followup', async (req, res, next) => {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
     }
 
+    const resolvedModel = model ? String(model) : resolveGroundingMode(mode, deepModel);
     const safeTitle = String(articleTitle || 'this article').slice(0, 200);
     const safeUrl = String(articleUrl || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
-    const cacheKey = `fu::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}`;
+    const modelTag = resolvedModel || mode || 'default';
+    const cacheKey = `fu::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
+    tg.d('AI/article-followup', `model=${modelTag} mode=${mode || 'deep'} deepModel=${deepModel || 'none'} hist=${histLen}`);
 
     // 1) Check Postgres (persists across restarts, 24h TTL)
     const dbCached = await _getFromDbCache(cacheKey);
@@ -1844,13 +2038,12 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     }
     turns.push({ role: 'user', text: trimmedQ });
 
+    const converseOpts = { timeoutMs: 90000, maxTokens: 8192, temperature: 0.7 };
+    if (resolvedModel) converseOpts.model = resolvedModel;
+
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, {
-          timeoutMs: 90000,
-          maxTokens: 8192,
-          temperature: 0.7,
-        });
+        const result = await groundedConverse(turns, systemInstruction, converseOpts);
         const payload = {
           answer: result.text,
           model: result.model,
@@ -1860,17 +2053,23 @@ aiRouter.post('/article-followup', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (err) {
+      } catch (groundingErr) {
         _inflight.delete(cacheKey);
-        throw err;
+        tg.w('AI/article-followup', `Grounding exhausted, notifying user via LLM model=${modelTag}`, groundingErr);
+        const fb = await _notifyGroundingError(groundingErr);
+        return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
 
     _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
 
     const response = await apiPromise;
+    if (!response.fallback) {
+      tg.i('AI/article-followup', `✓ model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+    }
     if (!res.headersSent) res.json(response);
   } catch (err) {
+    tg.e('AI/article-followup', `Failed model=${modelTag} ${Date.now() - _t0}ms`, err);
     if (err.name === 'GroundingError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
@@ -1879,12 +2078,14 @@ aiRouter.post('/article-followup', async (req, res, next) => {
 });
 
 aiRouter.post('/categorize', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const val = validate(AICategorizeSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const { description } = val.data;
     console.log('[AI] categorize →', description);
+    tg.d('AI/categorize', `desc="${description.slice(0, 60)}"`);
 
     const result = await callLiteLLM({
       messages: [
@@ -1904,6 +2105,7 @@ aiRouter.post('/categorize', async (req, res, next) => {
       return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
     }
 
+    tg.i('AI/categorize', `✓ model=${result.model_used} ${Date.now() - _t0}ms, category=${parsed.category || 'Others'}`);
     res.json({
       category: parsed.category || 'Others',
       confidence: parsed.confidence || 'matched',
@@ -1913,12 +2115,14 @@ aiRouter.post('/categorize', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('AI/categorize', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 // POST /api/v1/ai/summarize-history — condensed summary of conversation history
 aiRouter.post('/summarize-history', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const { messages, articleContext } = req.body || {};
 
@@ -1953,6 +2157,7 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
     });
 
     console.log(`[SummarizeHistory] ${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}"`);
+    tg.d('AI/summarize-history', `${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}"`);
 
     const result = await callLiteLLM({
       messages: liteLLMMessages,
@@ -1961,6 +2166,7 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
     });
 
     console.log(`[SummarizeHistory] Done — ${result.content.length} chars`);
+    tg.i('AI/summarize-history', `✓ model=${result.model_used} ${Date.now() - _t0}ms, ${result.content.length} chars`);
     res.json({
       summary: result.content,
       model: result.model_used,
@@ -1968,6 +2174,7 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
     });
   } catch (err) {
     console.error('[SummarizeHistory] Failed:', err.message);
+    tg.e('AI/summarize-history', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -1990,6 +2197,18 @@ llmRouter.get('/health', async (_req, res, next) => {
   }
 });
 
+llmRouter.get('/config', async (_req, res) => {
+  const grounding = getGroundingConfig();
+  res.json({
+    litellm: {
+      primary: getPrimaryModel(),
+      fallbacks: getFallbackModels(),
+      all: getModelPriorityList(),
+    },
+    grounding,
+  });
+});
+
 llmRouter.get('/models', async (_req, res, next) => {
   try {
     const data = await getLiteLLM('/v1/models');
@@ -2000,11 +2219,13 @@ llmRouter.get('/models', async (_req, res, next) => {
 });
 
 llmRouter.post('/complete', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const v = validate(LLMCompleteSchema, req.body);
     if (!v.ok) return res.status(400).json({ error: v.error });
 
     const { messages, model, max_tokens, temperature } = v.data;
+    tg.d('LLM/complete', `model=${model || 'auto'} msgs=${messages.length}`);
 
     const result = await callLiteLLM({
       messages,
@@ -2013,22 +2234,26 @@ llmRouter.post('/complete', async (req, res, next) => {
       temperature: temperature ?? 0.7,
     });
 
+    tg.i('LLM/complete', `✓ model=${result.model_used} ${Date.now() - _t0}ms`);
     res.json({
       content: result.content,
       model: result.model_used,
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('LLM/complete', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 llmRouter.post('/summarize', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const v = validate(LLMSummarizeSchema, req.body);
     if (!v.ok) return res.status(400).json({ error: v.error });
 
     const { text, max_length, model } = v.data;
+    tg.d('LLM/summarize', `model=${model || 'auto'} textLen=${(text || '').length}`);
 
     const result = await callLiteLLM({
       model: model || undefined,
@@ -2043,22 +2268,26 @@ llmRouter.post('/summarize', async (req, res, next) => {
       temperature: 0.3,
     });
 
+    tg.i('LLM/summarize', `✓ model=${result.model_used} ${Date.now() - _t0}ms`);
     res.json({
       summary: result.content,
       model: result.model_used,
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('LLM/summarize', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
 
 llmRouter.post('/correct', async (req, res, next) => {
+  const _t0 = Date.now();
   try {
     const v = validate(LLMCorrectSchema, req.body);
     if (!v.ok) return res.status(400).json({ error: v.error });
 
     const { text, tone, platform, platforms, model } = v.data;
+    tg.d('LLM/correct', `model=${model || 'auto'} tone=${tone || 'default'} textLen=${(text || '').length}`);
     const targetPlatforms = platforms || (platform ? [platform] : []);
 
     const systemPrompt = [
@@ -2114,6 +2343,7 @@ llmRouter.post('/correct', async (req, res, next) => {
       ],
     );
 
+    tg.i('LLM/correct', `✓ model=${result.model_used} ${Date.now() - _t0}ms, tone=${tone || 'default'}`);
     res.json({
       corrected: parsed.corrected_text || result.content,
       corrected_text: parsed.corrected_text || result.content,
@@ -2124,6 +2354,7 @@ llmRouter.post('/correct', async (req, res, next) => {
       usage: result.usage,
     });
   } catch (err) {
+    tg.e('LLM/correct', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -2916,12 +3147,20 @@ async function initTables() {
     startScheduler(pool);
   } catch (err) {
     console.error('[INIT] Startup error:', err.message);
+    tg.e('Startup', 'Init failed', err);
   }
 
   app.listen(PORT, () => {
+    const primary = getPrimaryModel();
+    const fallbacks = getFallbackModels();
+    const grounding = getGroundingConfig();
+
     console.log(`Nexus AI API running on port ${PORT}`);
     console.log(`LiteLLM: ${process.env.LITELLM_URL}`);
-    console.log(`Model: ${getPrimaryModel() || 'none detected'}${getFallbackModels().length > 0 ? ` (fallback: ${getFallbackModels().join(', ')})` : ''}`);
+    console.log(`LiteLLM Primary: ${primary || 'none detected'}${fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : ''}`);
+    console.log(`Grounding Lite: ${grounding.liteModel || 'none'} | Pro: ${grounding.proModel || 'none'}`);
     console.log(`Database: ${process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')}`);
+
+    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'}`);
   });
 })();

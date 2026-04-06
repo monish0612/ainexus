@@ -1,6 +1,7 @@
 const { createHash } = require('crypto');
 const fs = require('fs');
 const path = require('path');
+const { tg } = require('./telegram');
 
 const CONFIG_PATH = fs.existsSync(path.resolve(__dirname, '../../news_rss_feeds.json'))
   ? path.resolve(__dirname, '../../news_rss_feeds.json')
@@ -282,7 +283,7 @@ function fallbackSummary(title, content, url, source) {
 
 let _modelPriorityCache = null;
 
-function getModelPriority() {
+function _getModelPriority() {
   if (_modelPriorityCache) return _modelPriorityCache;
   const raw = process.env._LITELLM_MODEL_PRIORITY;
   if (raw) {
@@ -291,8 +292,14 @@ function getModelPriority() {
   return null;
 }
 
+function _isRetryable(msg) {
+  return /429|500|502|503|504|timeout|ETIMEDOUT|ECONNRESET/i.test(msg);
+}
+
 async function _callLiteLLMOnce(model, messages, opts) {
-  const baseUrl = (process.env.LITELLM_URL || 'http://72.60.219.97:4000').replace(/\/$/, '');
+  const baseUrl = String(process.env.LITELLM_URL || '').replace(/\/$/, '');
+  if (!baseUrl) throw new Error('LITELLM_URL env var not set');
+
   const key = process.env.LITELLM_VIRTUAL_KEY || process.env.LITELLM_API_KEY;
   const headers = { 'Content-Type': 'application/json' };
   if (key) headers.Authorization = `Bearer ${key.trim()}`;
@@ -301,6 +308,7 @@ async function _callLiteLLMOnce(model, messages, opts) {
     method: 'POST',
     headers,
     body: JSON.stringify({ model, messages, ...opts }),
+    signal: AbortSignal.timeout(30_000),
   });
 
   const text = await res.text();
@@ -311,29 +319,54 @@ async function _callLiteLLMOnce(model, messages, opts) {
 }
 
 async function callLiteLLM(model, messages, opts = {}) {
-  const priority = getModelPriority();
+  const t0 = Date.now();
+  const priority = _getModelPriority();
   const modelsToTry = model
     ? [model]
     : priority && priority.length > 0
       ? [...priority]
-      : ['gemini/gemini-2.0-flash'];
+      : [];
+
+  if (modelsToTry.length === 0) {
+    tg.e('NEWS-LLM', 'No models available — _LITELLM_MODEL_PRIORITY empty');
+    throw new Error('No LiteLLM models available — _LITELLM_MODEL_PRIORITY is empty');
+  }
+
+  tg.d('NEWS-LLM', `Calling models=[${modelsToTry.join(',')}]`);
 
   let lastError;
-  for (const m of modelsToTry) {
-    try {
-      return await _callLiteLLMOnce(m, messages, opts);
-    } catch (e) {
-      lastError = e;
-      if (modelsToTry.length > 1) {
-        console.warn(`[NEWS-LLM] ${m} failed, trying fallback... (${e.message.slice(0, 100)})`);
+  for (let i = 0; i < modelsToTry.length; i++) {
+    const m = modelsToTry[i];
+    const maxRetries = i === modelsToTry.length - 1 ? 3 : 2;
+
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      try {
+        if (attempt > 0) {
+          tg.w('NEWS-LLM', `Retry ${attempt + 1}/${maxRetries} model=${m}`);
+          await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+        }
+        const result = await _callLiteLLMOnce(m, messages, opts);
+        tg.i('NEWS-LLM', `✓ model=${m} ${Date.now() - t0}ms`);
+        return result;
+      } catch (e) {
+        lastError = e;
+        if (!_isRetryable(e.message) || attempt >= maxRetries - 1) {
+          if (modelsToTry.length > 1) {
+            console.warn(`[NEWS-LLM] ${m} exhausted (${attempt + 1} attempts): ${e.message.slice(0, 100)}`);
+            tg.w('NEWS-LLM', `${m} exhausted after ${attempt + 1} attempts`, e);
+          }
+          break;
+        }
       }
     }
   }
+  console.error(`[NEWS-LLM] All models exhausted: ${modelsToTry.join(', ')}`);
+  tg.e('NEWS-LLM', `All models exhausted: ${modelsToTry.join(', ')} ${Date.now() - t0}ms`, lastError);
   throw lastError;
 }
 
 function preferredModel() {
-  const priority = getModelPriority();
+  const priority = _getModelPriority();
   return priority?.[0] || null;
 }
 
@@ -365,20 +398,32 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
     return (await callLiteLLM(preferredModel(), msgs, { temperature: 0.35, max_tokens: maxTok })).trim();
   };
 
+  const t0 = Date.now();
+  const modelName = preferredModel() || 'auto';
+  tg.d('NEWS/summary', `model=${modelName} title="${title.slice(0, 60)}"`);
+
   if (settings.enable_image_analysis && imageUrl) {
     try {
       const s = await tryGen(true);
-      if (s && s.length >= 50) return s;
+      if (s && s.length >= 50) {
+        tg.i('NEWS/summary', `✓ model=${modelName} ${Date.now() - t0}ms (img) "${title.slice(0, 40)}"`);
+        return s;
+      }
     } catch (e) {
       console.warn(`[NEWS] Image summary retry for "${title}":`, e.message);
+      tg.w('NEWS/summary', `Image fallback model=${modelName} "${title.slice(0, 40)}"`, e);
     }
   }
 
   try {
     const s = await tryGen(false);
+    if (s && s.length >= 50) {
+      tg.i('NEWS/summary', `✓ model=${modelName} ${Date.now() - t0}ms (text) "${title.slice(0, 40)}"`);
+    }
     return s && s.length >= 50 ? s : null;
   } catch (e) {
     console.error(`[NEWS] Summary failed for "${title}":`, e.message);
+    tg.e('NEWS/summary', `Failed model=${modelName} ${Date.now() - t0}ms "${title.slice(0, 40)}"`, e);
     return null;
   }
 }
@@ -531,9 +576,11 @@ async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
     lastSyncError = null;
     lastSyncResult = { success: true, reason, syncedAt: lastSyncAt, totalNew: total, feeds: counts };
     console.log(`[NEWS] Sync done (${reason}): ${total} new articles [IST date: ${todayIST()}]`);
+    if (total > 0) tg.i('NEWS/sync', `✓ ${reason}: ${total} new articles across ${feeds.length} feeds`);
     return lastSyncResult;
   })().catch((e) => {
     lastSyncError = e.message;
+    tg.e('NEWS/sync', `Sync failed (${reason})`, e);
     throw e;
   });
 

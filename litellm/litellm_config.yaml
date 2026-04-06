@@ -5,47 +5,19 @@
 # ═══════════════════════════════════════════════════════
 
 model_list:
-  # ── PRIMARY: GPT-4o-mini (fast + cheap, default for most tasks) ──
-  - model_name: "gpt-4o-mini"
+  # ── PRIMARY: Gemini 3.1 Flash Lite (fast + multimodal, preferred) ──
+  - model_name: "gemini/gemini-3.1-flash-lite-preview"
     litellm_params:
-      model: "openai/gpt-4o-mini"
-      api_key: "os.environ/OPENAI_API_KEY"
+      model: "gemini/gemini-3.1-flash-lite-preview"
+      api_key: "os.environ/GOOGLE_API_KEY"
       max_tokens: 4096
       temperature: 0.7
 
-  # ── POWER: GPT-4o (complex reasoning) ──
-  - model_name: "gpt-4o"
+  # ── FALLBACK: Groq Llama 3.3 (ultra-low latency, last resort) ──
+  - model_name: "groq/llama-3.3-70b-versatile"
     litellm_params:
-      model: "openai/gpt-4o"
-      api_key: "os.environ/OPENAI_API_KEY"
-      max_tokens: 4096
-
-  # ── FALLBACK: Claude Sonnet (best for conversation + analysis) ──
-  - model_name: "claude-sonnet"
-    litellm_params:
-      model: "anthropic/claude-sonnet-4-20250514"
-      api_key: "os.environ/ANTHROPIC_API_KEY"
-      max_tokens: 4096
-
-  # ── FAST: Groq Llama (ultra-low latency inference) ──
-  - model_name: "groq-llama"
-    litellm_params:
-      model: "groq/llama-3.1-70b-versatile"
+      model: "groq/llama-3.3-70b-versatile"
       api_key: "os.environ/GROQ_API_KEY"
-      max_tokens: 4096
-
-  # ── BUDGET: DeepSeek (cheapest option) ──
-  - model_name: "deepseek"
-    litellm_params:
-      model: "deepseek/deepseek-chat"
-      api_key: "os.environ/DEEPSEEK_API_KEY"
-      max_tokens: 4096
-
-  # ── Google Gemini Flash (fast + multimodal) ──
-  - model_name: "gemini-flash"
-    litellm_params:
-      model: "gemini/gemini-2.0-flash"
-      api_key: "os.environ/GOOGLE_API_KEY"
       max_tokens: 4096
 
 # ── ROUTER: Auto-failover + latency routing ─────────
@@ -56,11 +28,8 @@ router_settings:
   allowed_fails: 2
   cooldown_time: 30
   fallbacks:
-    - "gpt-4o-mini": ["groq-llama", "claude-sonnet", "deepseek"]
-    - "gpt-4o": ["claude-sonnet", "gpt-4o-mini"]
-    - "claude-sonnet": ["gpt-4o", "gpt-4o-mini"]
-    - "groq-llama": ["gpt-4o-mini", "deepseek"]
-    - "deepseek": ["gpt-4o-mini", "groq-llama"]
+    - "gemini/gemini-3.1-flash-lite-preview": ["groq/llama-3.3-70b-versatile"]
+    - "groq/llama-3.3-70b-versatile": ["gemini/gemini-3.1-flash-lite-preview"]
 
 # ── CACHING + SETTINGS ──────────────────────────────
 litellm_settings:

@@ -366,7 +366,6 @@ function fillPromptTemplate(template, title, content) {
 function preferredSummaryModel() {
   return (
     process.env.NEWS_SUMMARY_MODEL ||
-    process.env.OPENAI_MODEL ||
     process.env.LITELLM_MODEL ||
     null
   );

@@ -41,11 +41,8 @@ services:
       - DATABASE_URL=postgresql://ainexus:${DB_PASSWORD}@postgres:5432/ainexus
       - REDIS_HOST=redis
       - REDIS_PORT=6379
-      - OPENAI_API_KEY=${OPENAI_API_KEY}
-      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY}
-      - GROQ_API_KEY=${GROQ_API_KEY}
-      - DEEPSEEK_API_KEY=${DEEPSEEK_API_KEY}
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
+      - GROQ_API_KEY=${GROQ_API_KEY}
     command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
