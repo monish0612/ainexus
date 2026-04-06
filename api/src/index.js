@@ -373,8 +373,9 @@ const LLMCorrectSchema = z.object({
 });
 
 const AIRephraseSchema = z.object({
-  text: z.string().min(1).max(2000),
+  text: z.string().min(1).max(5000),
   platform: z.string().min(1),
+  intent: z.string().max(500).optional(),
   model: z.string().optional(),
 });
 
@@ -420,6 +421,10 @@ function validate(schema, data) {
 }
 
 const AI_REPHRASE_PLATFORM_META = {
+  own: {
+    guidance: 'user-defined custom rephrase instruction',
+    charLimit: null,
+  },
   casual: {
     guidance: 'casual everyday conversational tone',
     charLimit: null,
@@ -1152,8 +1157,9 @@ aiRouter.post('/rephrase', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const platformId = normalizeRephrasePlatformId(val.data.platform) || 'casual';
-    const systemPrompt = buildRephraseSystemPrompt(platformId);
-    tg.d('AI/rephrase', `platform=${platformId}, textLen=${(val.data.text || '').length}`);
+    const intent = asString(val.data.intent || '').trim();
+    const systemPrompt = buildRephraseSystemPrompt(platformId, intent);
+    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${(val.data.text || '').length}`);
 
     const result = await callLiteLLM({
       model: val.data.model || undefined,

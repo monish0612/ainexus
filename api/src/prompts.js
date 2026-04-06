@@ -124,7 +124,10 @@ const REPHRASE_PLATFORMS = {
   },
 };
 
-function buildRephraseSystemPrompt(platformId) {
+function buildRephraseSystemPrompt(platformId, intent) {
+  if (platformId === 'own') {
+    return buildOwnRephraseSystemPrompt(intent || '');
+  }
   const spec = REPHRASE_PLATFORMS[platformId] || REPHRASE_PLATFORMS.casual;
   const lines = [
     'You are an expert communication rephraser who adapts text to different platforms and tones.',
@@ -154,6 +157,36 @@ function buildRephraseSystemPrompt(platformId) {
     'Return JSON only. No markdown fences.',
   ];
   return lines.filter(Boolean).join('\n');
+}
+
+function buildOwnRephraseSystemPrompt(intent) {
+  const hasIntent = intent && intent.trim().length > 0;
+  const intentInstruction = hasIntent
+    ? `The user wants the text rephrased to: "${intent.trim()}". Follow this instruction precisely — adapt the tone, style, verbosity, and word choice to match what the user asked for.`
+    : 'The user wants a general rephrase for clarity, naturalness, and improved communication. Make it well-written, clear, and natural-sounding.';
+
+  return [
+    'You are an expert communication rephraser who adapts text based on the user\'s specific instruction.',
+    '',
+    'ABSOLUTE RULE — REPHRASE, NEVER REINTERPRET:',
+    '- The user will give you a piece of text. Your ONLY job is to rephrase it according to their instruction.',
+    '- Do NOT analyze the intent behind the text. Do NOT summarize it. Do NOT rewrite it into something different.',
+    '- Keep the SAME core message, meaning, and sentiment — only change HOW it is said.',
+    '- If the user says something sarcastic, keep the sarcasm but adapt the delivery per the instruction.',
+    '- If the user says something emotional, keep that emotion — just restyle per the instruction.',
+    '',
+    'USER INSTRUCTION:',
+    intentInstruction,
+    '',
+    'OUTPUT RULES:',
+    '- Output ONLY the rephrased version of the user\'s text — nothing else.',
+    '- Do NOT wrap in quotes. Do NOT add explanations, commentary, or meta-text.',
+    '- Do NOT add phrases like "Here\'s the rephrased version" or "Sure!".',
+    '',
+    'Return valid JSON only:',
+    '{ "platform": "own", "rephrasedText": "your rephrased text here" }',
+    'Return JSON only. No markdown fences.',
+  ].join('\n');
 }
 
 // ── Coach ────────────────────────────────────────────────────────────────────
