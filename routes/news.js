@@ -2,6 +2,7 @@ import { Router } from 'express';
 
 import { getDb, nowIso } from '../db.js';
 import { getNewsSyncState, syncNewsFeeds } from '../news_feed_service.js';
+import { manualXFeedSync, getXFeedStatus } from '../x_feed/index.js';
 
 export const newsRouter = Router();
 
@@ -80,6 +81,28 @@ newsRouter.post('/refresh', async (_req, res, next) => {
     next(error);
   }
 });
+
+// ── X Feed (Twitter) Digest — must be before /:id routes ───────────
+
+newsRouter.post('/x-feed/sync', async (_req, res, next) => {
+  try {
+    const result = await manualXFeedSync();
+    const rows = getAllArticles();
+    res.json({
+      xFeedSync: result,
+      articles: rows.map((row) => mapArticleRow(row)),
+      sync: getNewsSyncState(),
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
+newsRouter.get('/x-feed/status', (_req, res) => {
+  res.json(getXFeedStatus());
+});
+
+// ── Article CRUD (parameterized routes last) ───────────────────────
 
 newsRouter.get('/:id', (req, res) => {
   const db = getDb();

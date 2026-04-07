@@ -1781,31 +1781,86 @@ aiRouter.post('/search', async (req, res, next) => {
   }
 });
 
-// POST /api/v1/ai/grounded-search  (Gemini + Google Search)
+// POST /api/v1/ai/grounded-search  (Gemini + Google Search  OR  xGrok + web_search)
+// Production-grade: primary provider → cross-provider fallback → LLM error notice.
+// Both xgrokSearch and groundedSearch have internal retries (3× with backoff).
 aiRouter.post('/grounded-search', async (req, res, next) => {
   const _t0 = Date.now();
+  let providerTag = 'gemini';
   try {
-    const { query, model } = req.body || {};
+    const { query, model, provider, xgrokModel } = req.body || {};
     if (!query || String(query).trim().length < 2) {
       return res.status(400).json({ error: 'query is required (min 2 chars)' });
     }
 
-    if (!isGroundingAvailable()) {
-      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured for grounding' });
-    }
+    const wantXGrok = provider === 'xgrok';
+    const useXGrok = wantXGrok && isXGrokAvailable();
     const trimmedQ = String(query).trim();
-    tg.d('AI/grounded-search', `model=${model || 'default'} q="${trimmedQ.slice(0, 80)}"`);
+    providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const hasGemini = isGroundingAvailable();
+    const hasXGrok = isXGrokAvailable();
+
+    tg.d('AI/grounded-search', `provider=${providerTag} model=${model || xgrokModel || 'default'} q="${trimmedQ.slice(0, 80)}" gemini=${hasGemini} xgrok=${hasXGrok}`);
+
+    if (!useXGrok && !hasGemini) {
+      tg.e('AI/grounded-search', `No provider available: gemini=${hasGemini} xgrok=${hasXGrok}`);
+      return res.status(503).json({ error: 'No search provider configured' });
+    }
 
     let result;
+    let usedProvider = providerTag;
+
+    // ── Primary provider attempt ──────────────────────────────────────
     try {
-      result = await groundedSearch(trimmedQ, { model });
-    } catch (groundingErr) {
-      tg.w('AI/grounded-search', `Grounding exhausted, notifying user via LLM`, groundingErr);
-      result = await _notifyGroundingError(groundingErr);
+      if (useXGrok) {
+        const xModel = xgrokModel || process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+        result = await xgrokSearch(trimmedQ, { model: xModel });
+        if (result.sources) {
+          result.sources = result.sources.map((s, i) => ({ index: i, title: s.title || '', url: s.url || '' }));
+        }
+      } else {
+        result = await groundedSearch(trimmedQ, { model });
+      }
+    } catch (primaryErr) {
+      const elapsed = Date.now() - _t0;
+      tg.w('AI/grounded-search', `Primary ${providerTag} failed ${elapsed}ms, attempting cross-provider fallback`, primaryErr);
+
+      // ── Cross-provider fallback ───────────────────────────────────
+      const canFallbackToGemini = useXGrok && hasGemini;
+      const canFallbackToXGrok = !useXGrok && hasXGrok;
+
+      if (canFallbackToGemini) {
+        try {
+          result = await groundedSearch(trimmedQ, { model });
+          usedProvider = 'gemini (fallback)';
+          tg.i('AI/grounded-search', `Cross-fallback xgrok→gemini succeeded ${Date.now() - _t0}ms`);
+        } catch (fallbackErr) {
+          tg.w('AI/grounded-search', `Cross-fallback gemini also failed`, fallbackErr);
+        }
+      } else if (canFallbackToXGrok) {
+        try {
+          const xModel = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+          result = await xgrokSearch(trimmedQ, { model: xModel });
+          if (result.sources) {
+            result.sources = result.sources.map((s, i) => ({ index: i, title: s.title || '', url: s.url || '' }));
+          }
+          usedProvider = 'xgrok (fallback)';
+          tg.i('AI/grounded-search', `Cross-fallback gemini→xgrok succeeded ${Date.now() - _t0}ms`);
+        } catch (fallbackErr) {
+          tg.w('AI/grounded-search', `Cross-fallback xgrok also failed`, fallbackErr);
+        }
+      }
+
+      // ── All providers exhausted → graceful LLM error notice ────────
+      if (!result) {
+        tg.e('AI/grounded-search', `All providers exhausted ${Date.now() - _t0}ms, falling back to LLM error notice`);
+        result = await _notifyGroundingError(primaryErr);
+      }
     }
 
+    const elapsed = Date.now() - _t0;
     if (!result.fallback) {
-      tg.i('AI/grounded-search', `✓ model=${result.model} ${Date.now() - _t0}ms, ${result.sources.length} sources`);
+      tg.i('AI/grounded-search', `✓ provider=${usedProvider} model=${result.model} ${elapsed}ms, ${(result.sources || []).length} sources`);
     }
     res.json({
       answer: result.text,
@@ -1818,14 +1873,15 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
       fallback: result.fallback || false,
     });
   } catch (err) {
-    if (err.name === 'GroundingError') {
-      tg.e('AI/grounded-search', `Failed ${Date.now() - _t0}ms [${err.code}]`, err);
+    const elapsed = Date.now() - _t0;
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
+      tg.e('AI/grounded-search', `FATAL provider=${providerTag} ${elapsed}ms [${err.code}]`, err);
       return res.status(err.status || 500).json({
         error: err.message,
         code: err.code,
       });
     }
-    tg.e('AI/grounded-search', `Failed ${Date.now() - _t0}ms`, err);
+    tg.e('AI/grounded-search', `FATAL provider=${providerTag} ${elapsed}ms`, err);
     next(err);
   }
 });

@@ -9,11 +9,13 @@ import { newsRouter } from './routes/news.js';
 import { cloudRouter } from './routes/cloud.js';
 import { syncRouter } from './routes/sync.js';
 import { startNewsSyncScheduler } from './news_feed_service.js';
+import { startXFeedScheduler } from './x_feed/index.js';
 
 const PORT = Number(process.env.PORT) || 3000;
 
 initDatabase();
 startNewsSyncScheduler();
+startXFeedScheduler();
 
 const app = express();
 

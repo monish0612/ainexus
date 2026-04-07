@@ -7,10 +7,10 @@
     "dev": "node --watch server.js"
   },
   "dependencies": {
-    "express": "^4.21.0",
+    "better-sqlite3": "^12.8.0",
     "cors": "^2.8.5",
-    "better-sqlite3": "^11.6.0",
-    "uuid": "^10.0.0",
-    "node-fetch": "^3.3.2"
+    "express": "^4.21.0",
+    "node-fetch": "^3.3.2",
+    "uuid": "^10.0.0"
   }
 }

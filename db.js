@@ -146,6 +146,15 @@ function runMigrations(database) {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS x_feed_sync_state (
+      handle TEXT PRIMARY KEY,
+      last_window_end TEXT NOT NULL,
+      last_sync_at TEXT NOT NULL,
+      total_articles INTEGER NOT NULL DEFAULT 0,
+      total_posts_processed INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    );
+
     CREATE INDEX IF NOT EXISTS idx_expenses_category ON expenses(category);
     CREATE INDEX IF NOT EXISTS idx_expenses_bank ON expenses(bank);
     CREATE INDEX IF NOT EXISTS idx_expenses_date ON expenses(date);
