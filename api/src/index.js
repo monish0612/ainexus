@@ -26,6 +26,22 @@ const {
   resolveGroundingMode,
   getGroundingConfig,
 } = require('./google-grounding');
+const {
+  xgrokSearch,
+  xgrokConverse,
+  xgrokComplete,
+  isXGrokAvailable,
+  resolveXGrokModel,
+  getXGrokConfig,
+} = require('./xgrok');
+const {
+  register: registerProvider,
+  complete: llmProviderComplete,
+  completeWithFallback: llmProviderCompleteWithFallback,
+  list: listProviders,
+  has: hasProvider,
+  getHealth: getProviderHealth,
+} = require('./llm-providers');
 const { tg } = require('./telegram');
 
 const app = express();
@@ -990,6 +1006,61 @@ app.use('/api/v1/finance', financeRouter);
 
 const { syncNewsFeeds, getSyncState, startScheduler } = require('./news-service');
 
+/**
+ * Shared provider resolver with in-memory TTL cache.
+ * Reads the DB setting once per cache window (30s), validates the provider
+ * is registered and healthy, and returns the complete function or null.
+ */
+const _providerCache = { value: null, expiresAt: 0 };
+const _PROVIDER_CACHE_TTL_MS = 30_000;
+
+async function _resolveNewsProvider() {
+  const now = Date.now();
+
+  // Return cached value if still fresh
+  if (_providerCache.expiresAt > now) {
+    return _providerCache.value;
+  }
+
+  try {
+    const { rows } = await pool.query(
+      "SELECT value FROM app_settings WHERE key = 'news_summarize_provider'",
+    );
+    const name = rows[0]?.value || 'litellm';
+
+    if (name === 'litellm') {
+      _providerCache.value = null;
+      _providerCache.expiresAt = now + _PROVIDER_CACHE_TTL_MS;
+      return null;
+    }
+
+    // Validate that the requested provider is registered and available
+    if (!hasProvider(name)) {
+      console.warn(`[Providers] Requested provider "${name}" is unavailable — falling back to litellm`);
+      tg.w('Providers', `"${name}" unavailable (circuit open or missing key?) — litellm fallback`);
+      _providerCache.value = null;
+      _providerCache.expiresAt = now + 10_000; // shorter TTL for errors
+      return null;
+    }
+
+    const resolver = { name, complete: (msgs, opts) => llmProviderComplete(name, msgs, opts) };
+    _providerCache.value = resolver;
+    _providerCache.expiresAt = now + _PROVIDER_CACHE_TTL_MS;
+    return resolver;
+  } catch (e) {
+    console.warn('[Providers] Failed to read news_summarize_provider:', e.message?.slice(0, 100));
+    tg.w('Providers', 'DB read failed for news_summarize_provider — litellm fallback', e);
+    _providerCache.value = null;
+    _providerCache.expiresAt = now + 10_000;
+    return null;
+  }
+}
+
+/** Bust the cache when settings change (called from PUT endpoint). */
+function _invalidateProviderCache() {
+  _providerCache.expiresAt = 0;
+}
+
 function mapArticleRow(row) {
   let meta = {};
   try { meta = row.content_json ? JSON.parse(row.content_json) : {}; } catch {}
@@ -1030,7 +1101,7 @@ newsRouter.get('/', async (_req, res, next) => {
 
 newsRouter.post('/refresh', async (_req, res, next) => {
   try {
-    const result = await syncNewsFeeds(pool, { reason: 'manual' });
+    const result = await syncNewsFeeds(pool, { reason: 'manual', getProviderFn: _resolveNewsProvider });
     const rows = await pool.query(
       `SELECT * FROM news_articles
        ORDER BY is_featured DESC, COALESCE(published_at, created_at) DESC, updated_at DESC`,
@@ -1118,7 +1189,7 @@ newsRouter.post('/force-resync', async (_req, res, next) => {
       ? require('path').resolve(__dirname, '../../news_rss_feeds.json')
       : require('path').resolve(__dirname, '../news_rss_feeds.json');
     const config = JSON.parse(require('fs').readFileSync(feedsPath, 'utf8'));
-    syncNewsFeeds(pool, config).catch((e) => console.error('[NEWS] force-resync error:', e));
+    syncNewsFeeds(pool, { reason: 'force-resync', getProviderFn: _resolveNewsProvider }).catch((e) => console.error('[NEWS] force-resync error:', e));
     res.json({ deleted: del.rowCount, message: 'All non-saved articles removed. Re-fetching with new prompts in background.' });
   } catch (err) {
     next(err);
@@ -1546,18 +1617,30 @@ aiRouter.post('/summarize', async (req, res, next) => {
     }
 
     // ── Stage 5: LLM summarization ────────────────────────────────────────
-    console.log('[SUMMARIZE] Stage 5: LLM →', content.length, 'chars (method:', extractionMethod, ')');
+    const summarizeProvider = req.body.provider;
+    const xgrokSummarizeModel = req.body.xgrokModel;
+    const useXGrokSummarize = summarizeProvider === 'xgrok' && isXGrokAvailable();
+    console.log('[SUMMARIZE] Stage 5: LLM →', content.length, 'chars (method:', extractionMethod, ', provider:', useXGrokSummarize ? 'xgrok' : 'litellm', ')');
 
     const systemPrompt = buildSummarizerSystemPrompt(url);
-    const llmResult = await callLiteLLM({
-      model: val.data.model || undefined,
-      messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: `URL: ${url}\n\nExtracted content:\n${content.slice(0, 10000)}` },
-      ],
-      maxTokens: 3000,
-      temperature: 0.3,
-    });
+    const summarizeMessages = [
+      { role: 'system', content: systemPrompt },
+      { role: 'user', content: `URL: ${url}\n\nExtracted content:\n${content.slice(0, 10000)}` },
+    ];
+
+    const llmResult = useXGrokSummarize
+      ? await xgrokComplete({
+          model: xgrokSummarizeModel || resolveXGrokModel('lite'),
+          messages: summarizeMessages,
+          maxTokens: 3000,
+          temperature: 0.3,
+        })
+      : await callLiteLLM({
+          model: val.data.model || undefined,
+          messages: summarizeMessages,
+          maxTokens: 3000,
+          temperature: 0.3,
+        });
 
     const parsed = parseJsonContent(llmResult.content);
     console.log('[SUMMARIZE] LLM keys:', Object.keys(parsed || {}));
@@ -1750,24 +1833,30 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
 // POST /api/v1/ai/search-followup  (Gemini + Google Search — follow-up on a search result)
 aiRouter.post('/search-followup', async (req, res, next) => {
   const _t0 = Date.now();
+  let modelTag = 'default';
   try {
-    const { query, initialAnswer, question, history, model, mode, deepModel } = req.body || {};
+    const { query, initialAnswer, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
     }
 
-    if (!isGroundingAvailable()) {
+    const useXGrok = provider === 'xgrok' && isXGrokAvailable();
+
+    if (!useXGrok && !isGroundingAvailable()) {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
     }
 
-    const resolvedModel = model ? String(model) : resolveGroundingMode(mode, deepModel);
+    const resolvedModel = useXGrok
+      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel)
+      : (model ? String(model) : resolveGroundingMode(mode, deepModel));
     const safeQuery = String(query || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
-    const modelTag = resolvedModel || mode || 'default';
-    const cacheKey = `sf::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
-    tg.d('AI/search-followup', `model=${modelTag} mode=${mode || 'deep'} deepModel=${deepModel || 'none'} hist=${histLen}`);
+    modelTag = resolvedModel || mode || 'default';
+    const providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const cacheKey = `sf::${providerTag}::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
+    tg.d('AI/search-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen}`);
 
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
@@ -1783,13 +1872,14 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     }
 
     const answerSnippet = String(initialAnswer || '').slice(0, 1500);
+    const searchToolName = useXGrok ? 'web_search' : 'Google Search';
     const systemInstruction =
-      `You are a knowledgeable research assistant with access to Google Search. ` +
+      `You are a knowledgeable research assistant with access to ${searchToolName}. ` +
       `The user previously searched for "${safeQuery}"` +
       (answerSnippet
         ? ` and received this initial answer:\n\n---\n${answerSnippet}\n---\n\n`
         : '. ') +
-      `Answer follow-up questions using Google Search for the latest real-time information. ` +
+      `Answer follow-up questions using ${searchToolName} for the latest real-time information. ` +
       `Provide comprehensive, well-structured answers with markdown formatting. ` +
       `Cite sources when possible. Maintain conversation continuity across follow-ups.`;
 
@@ -1808,20 +1898,22 @@ aiRouter.post('/search-followup', async (req, res, next) => {
 
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, converseOpts);
+        const result = useXGrok
+          ? await xgrokConverse(turns, systemInstruction, converseOpts)
+          : await groundedConverse(turns, systemInstruction, converseOpts);
         const payload = {
           answer: result.text,
           model: result.model,
-          sources: result.sources,
+          sources: result.sources || [],
           searchQueries: result.searchQueries || [],
         };
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (groundingErr) {
+      } catch (converseErr) {
         _inflight.delete(cacheKey);
-        tg.w('AI/search-followup', `Grounding exhausted, notifying user via LLM model=${modelTag}`, groundingErr);
-        const fb = await _notifyGroundingError(groundingErr);
+        tg.w('AI/search-followup', `${providerTag} exhausted, notifying user via LLM model=${modelTag}`, converseErr);
+        const fb = await _notifyGroundingError(converseErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -1830,12 +1922,12 @@ aiRouter.post('/search-followup', async (req, res, next) => {
 
     const response = await apiPromise;
     if (!response.fallback) {
-      tg.i('AI/search-followup', `✓ model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+      tg.i('AI/search-followup', `✓ provider=${providerTag} model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
     }
     if (!res.headersSent) res.json(response);
   } catch (err) {
     tg.e('AI/search-followup', `Failed model=${modelTag} ${Date.now() - _t0}ms`, err);
-    if (err.name === 'GroundingError') {
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
     next(err);
@@ -1889,44 +1981,49 @@ async function _putToDbCache(key, result) {
   }
 }
 
-// POST /api/v1/ai/deep-research  (Gemini 3.1 Pro + Google Search — thorough URL analysis)
+// POST /api/v1/ai/deep-research  (Gemini 3.1 Pro / xGrok + search — thorough URL analysis)
 aiRouter.post('/deep-research', async (req, res, next) => {
   const _t0 = Date.now();
   try {
-    const { url, question, history, deepModel } = req.body || {};
+    const { url, question, history, deepModel, provider, xgrokDeepModel } = req.body || {};
 
     if (!url || String(url).trim().length < 5) {
       return res.status(400).json({ error: 'url is required' });
     }
 
-    if (!isGroundingAvailable()) {
+    const useXGrok = provider === 'xgrok' && isXGrokAvailable();
+
+    if (!useXGrok && !isGroundingAvailable()) {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
     }
 
+    const resolvedModel = useXGrok
+      ? resolveXGrokModel('deep', undefined, xgrokDeepModel)
+      : (deepModel || undefined);
+    const providerTag = useXGrok ? 'xgrok' : 'gemini';
     const safeUrl = String(url).slice(0, 500);
     const safeQuestion = question ? String(question).trim() : '';
     const histLen = Array.isArray(history) ? history.length : 0;
-    const cacheKey = `dr::${safeUrl}::${(safeQuestion || 'init').slice(0, 200)}::${histLen}`;
-    tg.d('AI/deep-research', `deepModel=${deepModel || 'server-default'} hist=${histLen} url="${safeUrl.slice(0, 60)}"`);
+    const cacheKey = `dr::${providerTag}::${safeUrl}::${(safeQuestion || 'init').slice(0, 200)}::${histLen}`;
+    tg.d('AI/deep-research', `provider=${providerTag} model=${resolvedModel || 'default'} hist=${histLen} url="${safeUrl.slice(0, 60)}"`);
 
-    // 1) Check Postgres (persists across restarts, 24h TTL)
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
       console.log('[DeepResearch] DB cache hit — returning instantly');
       return res.json(dbCached);
     }
 
-    // 2) Check in-flight promise (same request from a prior disconnected client)
     const flight = _inflight.get(cacheKey);
     if (flight?.pending) {
       console.log('[DeepResearch] Awaiting in-flight request from prior connection');
       try { return res.json(await flight.pending); } catch { /* fall through */ }
     }
 
+    const searchToolName = useXGrok ? 'web_search' : 'Google Search';
     const systemInstruction =
-      `You are an expert deep research analyst with access to Google Search. ` +
+      `You are an expert deep research analyst with access to ${searchToolName}. ` +
       `The user has provided a URL: ${safeUrl}\n\n` +
-      `IMPORTANT: Use Google Search to find and read the ORIGINAL page at that URL plus any related articles, sources, and references. ` +
+      `IMPORTANT: Use ${searchToolName} to find and read the ORIGINAL page at that URL plus any related articles, sources, and references. ` +
       `Provide an extremely thorough, well-structured analysis. Use markdown formatting with headers, bullet points, bold, and tables where appropriate.\n\n` +
       `If this is the first message (no conversation history), perform a DEEP RESEARCH analysis:\n` +
       `1. **Overview** — What is this page about?\n` +
@@ -1950,24 +2047,26 @@ aiRouter.post('/deep-research', async (req, res, next) => {
       text: safeQuestion || `Perform a deep research analysis of: ${safeUrl}`,
     });
 
-    const deepOpts = { model: deepModel || undefined, timeoutMs: 120000, maxTokens: 8192, temperature: 0.5 };
+    const deepOpts = { model: resolvedModel, timeoutMs: 120000, maxTokens: 8192, temperature: 0.5 };
 
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, deepOpts);
+        const result = useXGrok
+          ? await xgrokConverse(turns, systemInstruction, deepOpts)
+          : await groundedConverse(turns, systemInstruction, deepOpts);
         const payload = {
           answer: result.text,
           model: result.model,
-          sources: result.sources,
+          sources: result.sources || [],
           searchQueries: result.searchQueries || [],
         };
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (groundingErr) {
+      } catch (converseErr) {
         _inflight.delete(cacheKey);
-        tg.w('AI/deep-research', `Grounding exhausted, notifying user via LLM deepModel=${deepModel || 'default'}`, groundingErr);
-        const fb = await _notifyGroundingError(groundingErr);
+        tg.w('AI/deep-research', `${providerTag} exhausted, notifying user via LLM model=${resolvedModel || 'default'}`, converseErr);
+        const fb = await _notifyGroundingError(converseErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -1976,60 +2075,65 @@ aiRouter.post('/deep-research', async (req, res, next) => {
 
     const response = await apiPromise;
     if (!response.fallback) {
-      tg.i('AI/deep-research', `✓ model=${response.model || deepModel || 'default'} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+      tg.i('AI/deep-research', `✓ provider=${providerTag} model=${response.model || resolvedModel || 'default'} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
     }
     if (!res.headersSent) res.json(response);
   } catch (err) {
-    tg.e('AI/deep-research', `Failed deepModel=${deepModel || 'default'} ${Date.now() - _t0}ms`, err);
-    if (err.name === 'GroundingError') {
+    tg.e('AI/deep-research', `Failed ${Date.now() - _t0}ms`, err);
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
     next(err);
   }
 });
 
-// POST /api/v1/ai/article-followup  (Gemini + Google Search — multi-turn)
+// POST /api/v1/ai/article-followup  (Gemini/xGrok + search — multi-turn)
 aiRouter.post('/article-followup', async (req, res, next) => {
   const _t0 = Date.now();
+  let modelTag = 'default';
   try {
-    const { articleUrl, articleTitle, question, history, model, mode, deepModel } = req.body || {};
+    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
     }
 
-    if (!isGroundingAvailable()) {
+    const useXGrok = provider === 'xgrok' && isXGrokAvailable();
+
+    if (!useXGrok && !isGroundingAvailable()) {
       return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
     }
 
-    const resolvedModel = model ? String(model) : resolveGroundingMode(mode, deepModel);
+    const resolvedModel = useXGrok
+      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel)
+      : (model ? String(model) : resolveGroundingMode(mode, deepModel));
     const safeTitle = String(articleTitle || 'this article').slice(0, 200);
     const safeUrl = String(articleUrl || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
-    const modelTag = resolvedModel || mode || 'default';
-    const cacheKey = `fu::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
-    tg.d('AI/article-followup', `model=${modelTag} mode=${mode || 'deep'} deepModel=${deepModel || 'none'} hist=${histLen}`);
+    modelTag = resolvedModel || mode || 'default';
+    const providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const cacheKey = `fu::${providerTag}::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
+    tg.d('AI/article-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen}`);
 
-    // 1) Check Postgres (persists across restarts, 24h TTL)
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
       console.log('[FollowUp] DB cache hit — returning instantly');
       return res.json(dbCached);
     }
 
-    // 2) Check in-flight promise (same request from a prior disconnected client)
     const flight = _inflight.get(cacheKey);
     if (flight?.pending) {
       console.log('[FollowUp] Awaiting in-flight request from prior connection');
       try { return res.json(await flight.pending); } catch { /* fall through */ }
     }
 
+    const searchToolName = useXGrok ? 'web_search' : 'Google Search';
     const systemInstruction =
       `You are an expert news analyst and research assistant. ` +
       `The user is reading an article titled "${safeTitle}"` +
       (safeUrl ? ` (source: ${safeUrl}).` : '.') +
-      `\n\nIMPORTANT: Use the Google Search tool to find the ORIGINAL source article and any related real-time information. ` +
+      `\n\nIMPORTANT: Use the ${searchToolName} tool to find the ORIGINAL source article and any related real-time information. ` +
       `Do NOT rely on any pre-summarized version — always base your answers on the actual source content and live web data. ` +
       `Provide comprehensive, accurate, well-structured answers. Cite sources when possible. ` +
       `If the user asks a follow-up, use the conversation context to maintain continuity.`;
@@ -2049,20 +2153,22 @@ aiRouter.post('/article-followup', async (req, res, next) => {
 
     const apiPromise = (async () => {
       try {
-        const result = await groundedConverse(turns, systemInstruction, converseOpts);
+        const result = useXGrok
+          ? await xgrokConverse(turns, systemInstruction, converseOpts)
+          : await groundedConverse(turns, systemInstruction, converseOpts);
         const payload = {
           answer: result.text,
           model: result.model,
-          sources: result.sources,
+          sources: result.sources || [],
           searchQueries: result.searchQueries || [],
         };
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (groundingErr) {
+      } catch (converseErr) {
         _inflight.delete(cacheKey);
-        tg.w('AI/article-followup', `Grounding exhausted, notifying user via LLM model=${modelTag}`, groundingErr);
-        const fb = await _notifyGroundingError(groundingErr);
+        tg.w('AI/article-followup', `${providerTag} exhausted, notifying user via LLM model=${modelTag}`, converseErr);
+        const fb = await _notifyGroundingError(converseErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -2071,12 +2177,12 @@ aiRouter.post('/article-followup', async (req, res, next) => {
 
     const response = await apiPromise;
     if (!response.fallback) {
-      tg.i('AI/article-followup', `✓ model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+      tg.i('AI/article-followup', `✓ provider=${providerTag} model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
     }
     if (!res.headersSent) res.json(response);
   } catch (err) {
     tg.e('AI/article-followup', `Failed model=${modelTag} ${Date.now() - _t0}ms`, err);
-    if (err.name === 'GroundingError') {
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }
     next(err);
@@ -2205,6 +2311,15 @@ llmRouter.get('/health', async (_req, res, next) => {
 
 llmRouter.get('/config', async (_req, res) => {
   const grounding = getGroundingConfig();
+  const xgrok = getXGrokConfig();
+  const providerHealth = getProviderHealth();
+
+  let newsSummarizeProvider = 'litellm';
+  try {
+    const { rows } = await pool.query("SELECT value FROM app_settings WHERE key = 'news_summarize_provider'");
+    if (rows[0]?.value) newsSummarizeProvider = rows[0].value;
+  } catch {}
+
   res.json({
     litellm: {
       primary: getPrimaryModel(),
@@ -2212,6 +2327,10 @@ llmRouter.get('/config', async (_req, res) => {
       all: getModelPriorityList(),
     },
     grounding,
+    xgrok,
+    providers: listProviders(),
+    providerHealth,
+    newsSummarizeProvider,
   });
 });
 
@@ -2366,6 +2485,86 @@ llmRouter.post('/correct', async (req, res, next) => {
 });
 
 app.use('/api/v1/llm', llmRouter);
+
+// ═══════════════════════════════════════════════════════════════
+//  ROUTES — APP SETTINGS  /api/v1/app-settings
+// ═══════════════════════════════════════════════════════════════
+
+const appSettingsRouter = express.Router();
+
+const ALLOWED_SETTINGS_KEYS = new Set([
+  'news_summarize_provider',
+]);
+
+const SETTINGS_VALUE_VALIDATORS = {
+  news_summarize_provider: (v) => {
+    const allowed = ['litellm', 'xgrok'];
+    if (!allowed.includes(v)) return `Must be one of: ${allowed.join(', ')}`;
+    return null;
+  },
+};
+
+appSettingsRouter.get('/', async (_req, res, next) => {
+  const t0 = Date.now();
+  try {
+    const { rows } = await pool.query('SELECT key, value, updated_at FROM app_settings');
+    const settings = {};
+    for (const r of rows) settings[r.key] = r.value;
+    tg.d('Settings', `GET all → ${rows.length} keys (${Date.now() - t0}ms)`);
+    res.json(settings);
+  } catch (err) {
+    tg.e('Settings', `GET failed (${Date.now() - t0}ms)`, err);
+    next(err);
+  }
+});
+
+appSettingsRouter.put('/', async (req, res, next) => {
+  const t0 = Date.now();
+  try {
+    const { key, value } = req.body;
+    if (!key || typeof key !== 'string' || typeof value !== 'string') {
+      return res.status(400).json({ error: 'key and value (both strings) are required' });
+    }
+    if (!ALLOWED_SETTINGS_KEYS.has(key)) {
+      return res.status(400).json({ error: `Unknown setting key: "${key}". Allowed: ${[...ALLOWED_SETTINGS_KEYS].join(', ')}` });
+    }
+
+    const validator = SETTINGS_VALUE_VALIDATORS[key];
+    if (validator) {
+      const err = validator(value);
+      if (err) return res.status(400).json({ error: `Invalid value for "${key}": ${err}` });
+    }
+
+    // For provider changes, validate the provider is actually available
+    if (key === 'news_summarize_provider' && value !== 'litellm') {
+      if (!hasProvider(value)) {
+        tg.w('Settings', `Attempted to set provider="${value}" but it's unavailable`);
+        return res.status(400).json({
+          error: `Provider "${value}" is not available. Available: ${listProviders().join(', ')}`,
+        });
+      }
+    }
+
+    await pool.query(
+      `INSERT INTO app_settings (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, value],
+    );
+
+    // Bust the in-memory provider cache immediately
+    _invalidateProviderCache();
+
+    console.log(`[Settings] ${key} = ${value} (${Date.now() - t0}ms)`);
+    tg.i('Settings', `✓ ${key} = ${value} (${Date.now() - t0}ms)`);
+    res.json({ ok: true, key, value });
+  } catch (err) {
+    tg.e('Settings', `PUT failed key=${req.body?.key} (${Date.now() - t0}ms)`, err);
+    next(err);
+  }
+});
+
+app.use('/api/v1/app-settings', appSettingsRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — SYNC  /api/v1/sync
@@ -3139,6 +3338,22 @@ async function initTables() {
     console.warn('[DB] Index creation warning:', e.message);
   }
 
+  // ── App-wide settings (key-value store) ──────────────────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `);
+
+  // Seed default: RSS ingestion uses LiteLLM unless overridden
+  await pool.query(`
+    INSERT INTO app_settings (key, value)
+    VALUES ('news_summarize_provider', 'litellm')
+    ON CONFLICT (key) DO NOTHING
+  `);
+
   console.log('[DB] Tables initialized');
 }
 
@@ -3150,7 +3365,44 @@ async function initTables() {
   try {
     await initTables();
     await discoverLiteLLMModels();
-    startScheduler(pool);
+
+    // ── Register LLM providers for plug-and-play news ingestion ──
+    registerProvider('litellm', {
+      complete: async () => null, // sentinel: news-service uses its own built-in callLiteLLM
+      isAvailable: () => true,
+      timeoutMs: 35_000,
+    });
+
+    registerProvider('xgrok', {
+      complete: async (msgs, opts) => {
+        const model = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+        const t0 = Date.now();
+        try {
+          const result = await xgrokComplete({
+            model,
+            messages: msgs,
+            temperature: opts.temperature ?? 0.35,
+            maxTokens: opts.max_tokens ?? 2500,
+            timeoutMs: opts.timeoutMs ?? 50_000,
+          });
+          tg.d('xGrok/provider', `✓ ${model} ${Date.now() - t0}ms tokens=${result.usage?.total_tokens || '?'}`);
+          return result.content;
+        } catch (e) {
+          tg.e('xGrok/provider', `✗ ${model} ${Date.now() - t0}ms: ${e.message?.slice(0, 100)}`);
+          throw e;
+        }
+      },
+      isAvailable: () => isXGrokAvailable(),
+      timeoutMs: 55_000,
+      hasOwnRetry: true, // xgrok.js callXGrok already retries 3x internally
+    });
+
+    const registeredProviders = listProviders();
+    console.log(`[Providers] Registered: ${registeredProviders.join(', ')}`);
+    tg.i('Providers', `Registered: ${registeredProviders.join(', ')}`);
+
+    // ── Start news scheduler with provider resolution ────────────
+    startScheduler(pool, { getProviderFn: _resolveNewsProvider });
   } catch (err) {
     console.error('[INIT] Startup error:', err.message);
     tg.e('Startup', 'Init failed', err);
@@ -3160,13 +3412,15 @@ async function initTables() {
     const primary = getPrimaryModel();
     const fallbacks = getFallbackModels();
     const grounding = getGroundingConfig();
+    const xgrok = getXGrokConfig();
 
     console.log(`Nexus AI API running on port ${PORT}`);
     console.log(`LiteLLM: ${process.env.LITELLM_URL}`);
     console.log(`LiteLLM Primary: ${primary || 'none detected'}${fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : ''}`);
     console.log(`Grounding Lite: ${grounding.liteModel || 'none'} | Pro: ${grounding.proModel || 'none'}`);
+    console.log(`xGrok: ${xgrok.available ? `Lite=${xgrok.liteModel} Deep=${xgrok.deepModel}` : 'not configured'}`);
     console.log(`Database: ${process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')}`);
 
-    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'}`);
+    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available}`);
   });
 })();

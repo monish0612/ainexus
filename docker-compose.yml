@@ -20,6 +20,9 @@ services:
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - GROUNDING_MODELS=${GROUNDING_MODELS:-gemini-3.1-flash-lite-preview}
       - GEMINI_PRO_MODEL=${GEMINI_PRO_MODEL:-gemini-3.1-pro-preview}
+      - XGROK_API_KEY=${XGROK_API_KEY}
+      - XGROK_LITE_MODEL=${XGROK_LITE_MODEL:-grok-4-1-fast-non-reasoning}
+      - XGROK_DEEP_MODEL=${XGROK_DEEP_MODEL:-grok-4-0709}
     depends_on:
       postgres:
         condition: service_healthy

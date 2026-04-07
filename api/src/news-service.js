@@ -374,7 +374,7 @@ function fillTemplate(tpl, title, content) {
   return String(tpl || '').replaceAll('{title}', title).replaceAll('{content}', content);
 }
 
-async function generateSummary({ title, content, imageUrl, promptKey, settings, config }) {
+async function generateSummary({ title, content, imageUrl, promptKey, settings, config, completeFn, fallbackCompleteFn }) {
   if (!content || content.trim().length < 100) return null;
 
   const pcfg = config[promptKey] || config.summary_prompt || {};
@@ -388,47 +388,77 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
     content.slice(0, limit),
   );
 
-  const tryGen = async (useImg) => {
+  const _litellmComplete = (msgs, opts) => callLiteLLM(preferredModel(), msgs, opts);
+  const _primaryComplete = completeFn || _litellmComplete;
+  const _fallbackComplete = fallbackCompleteFn || (completeFn ? _litellmComplete : null);
+
+  const buildMsgs = (useImg) => {
     const msgs = [{ role: 'system', content: sys }];
     if (useImg && settings.enable_image_analysis && imageUrl) {
       msgs.push({ role: 'user', content: [{ type: 'text', text: user }, { type: 'image_url', image_url: { url: imageUrl } }] });
     } else {
       msgs.push({ role: 'user', content: user });
     }
-    return (await callLiteLLM(preferredModel(), msgs, { temperature: 0.35, max_tokens: maxTok })).trim();
+    return msgs;
+  };
+
+  const _tryComplete = async (completor, tag, useImg) => {
+    const msgs = buildMsgs(useImg);
+    const result = await completor(msgs, { temperature: 0.35, max_tokens: maxTok });
+    const text = (typeof result === 'string' ? result : result?.text || result?.content || '').trim();
+    if (!text || text.length < 50) {
+      throw new Error(`${tag} returned insufficient output (${text.length} chars)`);
+    }
+    return text;
   };
 
   const t0 = Date.now();
-  const modelName = preferredModel() || 'auto';
-  tg.d('NEWS/summary', `model=${modelName} title="${title.slice(0, 60)}"`);
+  const providerTag = completeFn ? 'external' : 'litellm';
+  const modelName = completeFn ? providerTag : (preferredModel() || 'auto');
+  tg.d('NEWS/summary', `provider=${providerTag} model=${modelName} title="${title.slice(0, 60)}"`);
 
-  if (settings.enable_image_analysis && imageUrl) {
+  // Strategy 1: Image analysis via LiteLLM (multimodal only — external providers skip this)
+  if (settings.enable_image_analysis && imageUrl && !completeFn) {
     try {
-      const s = await tryGen(true);
-      if (s && s.length >= 50) {
-        tg.i('NEWS/summary', `✓ model=${modelName} ${Date.now() - t0}ms (img) "${title.slice(0, 40)}"`);
-        return s;
-      }
+      const s = await _tryComplete(_primaryComplete, providerTag, true);
+      tg.i('NEWS/summary', `✓ ${providerTag} ${Date.now() - t0}ms (img) "${title.slice(0, 40)}"`);
+      return s;
     } catch (e) {
-      console.warn(`[NEWS] Image summary retry for "${title}":`, e.message);
-      tg.w('NEWS/summary', `Image fallback model=${modelName} "${title.slice(0, 40)}"`, e);
+      console.warn(`[NEWS] Image summary failed for "${title.slice(0, 50)}":`, e.message?.slice(0, 100));
+      tg.w('NEWS/summary', `Image fallback ${providerTag} "${title.slice(0, 40)}"`, e);
     }
   }
 
+  // Strategy 2: Text-only via primary provider
   try {
-    const s = await tryGen(false);
-    if (s && s.length >= 50) {
-      tg.i('NEWS/summary', `✓ model=${modelName} ${Date.now() - t0}ms (text) "${title.slice(0, 40)}"`);
+    const s = await _tryComplete(_primaryComplete, providerTag, false);
+    tg.i('NEWS/summary', `✓ ${providerTag} ${Date.now() - t0}ms (text) "${title.slice(0, 40)}"`);
+    return s;
+  } catch (primaryErr) {
+    const elapsed = Date.now() - t0;
+    console.error(`[NEWS] Primary summary failed for "${title.slice(0, 50)}" (${providerTag}, ${elapsed}ms):`, primaryErr.message?.slice(0, 120));
+    tg.e('NEWS/summary', `Primary FAIL ${providerTag} ${elapsed}ms "${title.slice(0, 40)}"`, primaryErr);
+
+    // Strategy 3: Automatic fallback to LiteLLM if primary was external
+    if (_fallbackComplete) {
+      try {
+        const s = await _tryComplete(_fallbackComplete, 'litellm-fallback', false);
+        const fbElapsed = Date.now() - t0;
+        console.log(`[NEWS] Fallback litellm ✓ for "${title.slice(0, 50)}" (${fbElapsed}ms)`);
+        tg.i('NEWS/summary', `✓ litellm-fallback ${fbElapsed}ms (after ${providerTag} fail) "${title.slice(0, 40)}"`);
+        return s;
+      } catch (fallbackErr) {
+        const fbElapsed = Date.now() - t0;
+        console.error(`[NEWS] Fallback also failed for "${title.slice(0, 50)}" (${fbElapsed}ms):`, fallbackErr.message?.slice(0, 120));
+        tg.e('NEWS/summary', `BOTH providers failed ${fbElapsed}ms "${title.slice(0, 40)}"`, fallbackErr);
+      }
     }
-    return s && s.length >= 50 ? s : null;
-  } catch (e) {
-    console.error(`[NEWS] Summary failed for "${title}":`, e.message);
-    tg.e('NEWS/summary', `Failed model=${modelName} ${Date.now() - t0}ms "${title.slice(0, 40)}"`, e);
+
     return null;
   }
 }
 
-async function processItem({ pool, item, feed, config, settings, summaryLimiter }) {
+async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }) {
   const existing = await pool.query('SELECT id FROM news_articles WHERE guid = $1', [item.guid]);
   if (existing.rows.length > 0) return false;
 
@@ -440,6 +470,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter 
   const source = feed.name || feed.id;
   const contentText = item.text || cleanHtml(item.html || '');
 
+  const t0 = Date.now();
   console.log(`[NEWS] Processing: "${title.slice(0, 60)}" from ${source} (${feed.prompt_key || 'summary_prompt'})`);
 
   let summary = await summaryLimiter(async () => {
@@ -450,6 +481,8 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter 
       promptKey: feed.prompt_key,
       settings,
       config,
+      completeFn,
+      fallbackCompleteFn,
     });
     if (settings.api_delay_seconds > 0) await sleep(settings.api_delay_seconds * 1000);
     return gen;
@@ -488,7 +521,8 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter 
   return true;
 }
 
-async function processFeed({ pool, feed, config, settings, summaryLimiter }) {
+async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }) {
+  const feedT0 = Date.now();
   try {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 15000);
@@ -517,23 +551,58 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter }) {
 
     const results = await Promise.all(
       items.map((item) =>
-        processItem({ pool, item, feed, config, settings, summaryLimiter }).catch((e) => {
-          console.error(`[NEWS] Item failed (${feed.id}):`, e.message);
+        processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }).catch((e) => {
+          console.error(`[NEWS] Item failed (${feed.id}):`, e.message?.slice(0, 120));
+          tg.w('NEWS/item', `Item fail feed=${feed.id} "${item?.title?.slice(0, 40) || '?'}"`, e);
           return false;
         }),
       ),
     );
-    return results.filter(Boolean).length;
+    const processed = results.filter(Boolean).length;
+    if (processed > 0) {
+      tg.d('NEWS/feed', `${feed.id}: ${processed}/${items.length} new (${Date.now() - feedT0}ms)`);
+    }
+    return processed;
   } catch (e) {
-    console.error(`[NEWS] Feed failed (${feed.id}):`, e.message);
+    const elapsed = Date.now() - feedT0;
+    console.error(`[NEWS] Feed failed (${feed.id}, ${elapsed}ms):`, e.message?.slice(0, 120));
+    tg.e('NEWS/feed', `Feed failed: ${feed.id} (${elapsed}ms)`, e);
     return 0;
   }
 }
 
-async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
-  if (activeSyncPromise) return activeSyncPromise;
+async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn } = {}) {
+  if (activeSyncPromise) {
+    tg.d('NEWS/sync', `Sync already in progress — deduplicating (reason=${reason})`);
+    return activeSyncPromise;
+  }
 
   activeSyncPromise = (async () => {
+    const syncT0 = Date.now();
+    tg.d('NEWS/sync', `▶ Starting sync (reason=${reason})`);
+
+    // Resolve the LLM provider once per sync cycle (not per article).
+    let completeFn = null;
+    let fallbackCompleteFn = null;
+    let providerName = 'litellm';
+
+    if (typeof getProviderFn === 'function') {
+      try {
+        const provider = await getProviderFn();
+        if (provider && typeof provider.complete === 'function') {
+          completeFn = provider.complete;
+          providerName = provider.name || 'external';
+          // When using an external provider, litellm is the automatic fallback
+          fallbackCompleteFn = (msgs, opts) => callLiteLLM(preferredModel(), msgs, opts);
+          console.log(`[NEWS] Using LLM provider: ${providerName} (with litellm fallback)`);
+          tg.i('NEWS/sync', `Provider resolved: ${providerName} (litellm fallback ready) for reason=${reason}`);
+        }
+      } catch (e) {
+        console.warn(`[NEWS] getProviderFn failed, falling back to LiteLLM:`, e.message?.slice(0, 100));
+        tg.w('NEWS/sync', 'Provider resolution failed — using LiteLLM fallback', e);
+      }
+    }
+
     const config = loadConfig();
     const settings = getSettings(config);
     const feeds = (config.feeds || []).filter((f) => f.enabled !== false);
@@ -545,7 +614,7 @@ async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
     await Promise.all(
       feeds.map((feed) =>
         feedLimiter(async () => {
-          const n = await processFeed({ pool, feed, config, settings, summaryLimiter });
+          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn });
           counts[feed.id] = n;
           total += n;
         }),
@@ -555,7 +624,7 @@ async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
     // cleanup old articles — keep saved and read articles
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - (settings.article_retention_days || 30));
-    await pool.query(
+    const { rowCount: purged } = await pool.query(
       `DELETE FROM news_articles
        WHERE published_at < $1
          AND saved = FALSE AND read = FALSE`,
@@ -572,15 +641,26 @@ async function syncNewsFeeds(pool, { reason = 'manual' } = {}) {
        )`,
     );
 
+    const syncElapsed = Date.now() - syncT0;
     lastSyncAt = new Date().toISOString();
     lastSyncError = null;
-    lastSyncResult = { success: true, reason, syncedAt: lastSyncAt, totalNew: total, feeds: counts };
-    console.log(`[NEWS] Sync done (${reason}): ${total} new articles [IST date: ${todayIST()}]`);
-    if (total > 0) tg.i('NEWS/sync', `✓ ${reason}: ${total} new articles across ${feeds.length} feeds`);
+    lastSyncResult = {
+      success: true,
+      reason,
+      syncedAt: lastSyncAt,
+      totalNew: total,
+      feeds: counts,
+      provider: providerName,
+      elapsedMs: syncElapsed,
+      purged,
+    };
+    console.log(`[NEWS] Sync done (${reason}): ${total} new, ${purged} purged, provider=${providerName}, ${syncElapsed}ms [IST: ${todayIST()}]`);
+    tg.i('NEWS/sync', `✓ ${reason}: ${total} new, ${purged} purged, provider=${providerName}, ${syncElapsed}ms across ${feeds.length} feeds`);
     return lastSyncResult;
   })().catch((e) => {
     lastSyncError = e.message;
-    tg.e('NEWS/sync', `Sync failed (${reason})`, e);
+    console.error(`[NEWS] Sync FAILED (${reason}):`, e.message?.slice(0, 200));
+    tg.e('NEWS/sync', `Sync FAILED (${reason}): ${e.message?.slice(0, 150)}`, e);
     throw e;
   });
 
@@ -595,16 +675,33 @@ function getSyncState() {
   return { lastSyncAt, lastSyncResult, lastSyncError, inProgress: activeSyncPromise != null };
 }
 
-function startScheduler(pool) {
+function startScheduler(pool, { getProviderFn } = {}) {
   if (schedulerHandle) return;
   const settings = getSettings(loadConfig());
-  const interval = Math.max(5, settings.refresh_interval_minutes) * 60 * 1000;
+  const intervalMinutes = Math.max(5, settings.refresh_interval_minutes);
+  const intervalMs = intervalMinutes * 60 * 1000;
 
-  syncNewsFeeds(pool, { reason: 'startup' }).catch((e) => console.error('[NEWS] Initial sync failed:', e.message));
+  console.log(`[NEWS] Scheduler starting: interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
+  tg.i('NEWS/scheduler', `Starting: interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
 
-  schedulerHandle = setInterval(() => {
-    syncNewsFeeds(pool, { reason: 'scheduled' }).catch((e) => console.error('[NEWS] Scheduled sync failed:', e.message));
-  }, interval);
+  syncNewsFeeds(pool, { reason: 'startup', getProviderFn }).catch((e) => {
+    console.error('[NEWS] Initial sync failed:', e.message?.slice(0, 120));
+    tg.e('NEWS/scheduler', 'Initial startup sync failed', e);
+  });
+
+  let consecutiveFailures = 0;
+  schedulerHandle = setInterval(async () => {
+    try {
+      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn });
+      consecutiveFailures = 0;
+    } catch (e) {
+      consecutiveFailures++;
+      console.error(`[NEWS] Scheduled sync failed (${consecutiveFailures} consecutive):`, e.message?.slice(0, 120));
+      if (consecutiveFailures >= 3) {
+        tg.e('NEWS/scheduler', `${consecutiveFailures} consecutive scheduler failures — investigate`, e);
+      }
+    }
+  }, intervalMs);
 }
 
 module.exports = { syncNewsFeeds, getSyncState, startScheduler };
