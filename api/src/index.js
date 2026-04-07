@@ -1005,6 +1005,7 @@ app.use('/api/v1/finance', financeRouter);
 // ═══════════════════════════════════════════════════════════════
 
 const { syncNewsFeeds, getSyncState, startScheduler } = require('./news-service');
+const { startXFeedScheduler, manualXFeedSync, getXFeedStatus } = require('./x-feed-service');
 
 /**
  * Shared provider resolver with in-memory TTL cache.
@@ -1208,6 +1209,23 @@ newsRouter.delete('/:id', async (req, res, next) => {
     }
     await pool.query('DELETE FROM news_articles WHERE id = $1', [id]);
     res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
+newsRouter.post('/x-feed/sync', async (_req, res, next) => {
+  try {
+    const result = await manualXFeedSync();
+    res.json({ ok: true, result });
+  } catch (err) {
+    next(err);
+  }
+});
+
+newsRouter.get('/x-feed/status', async (_req, res, next) => {
+  try {
+    res.json(getXFeedStatus());
   } catch (err) {
     next(err);
   }
@@ -3459,6 +3477,9 @@ async function initTables() {
 
     // ── Start news scheduler with provider resolution ────────────
     startScheduler(pool, { getProviderFn: _resolveNewsProvider });
+
+    // ── Start X Feed scheduler (9 PM IST daily digest) ──────────
+    await startXFeedScheduler(pool);
   } catch (err) {
     console.error('[INIT] Startup error:', err.message);
     tg.e('Startup', 'Init failed', err);
@@ -3475,8 +3496,10 @@ async function initTables() {
     console.log(`LiteLLM Primary: ${primary || 'none detected'}${fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : ''}`);
     console.log(`Grounding Lite: ${grounding.liteModel || 'none'} | Pro: ${grounding.proModel || 'none'}`);
     console.log(`xGrok: ${xgrok.available ? `Lite=${xgrok.liteModel} Deep=${xgrok.deepModel}` : 'not configured'}`);
+    const xFeedInfo = getXFeedStatus();
+    console.log(`X-Feed: ${xFeedInfo.schedulerActive ? `active (next in ${xFeedInfo.schedule.nextRunHours}h)` : 'disabled'}`);
     console.log(`Database: ${process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')}`);
 
-    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available}`);
+    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available} | X-Feed: ${xFeedInfo.schedulerActive}`);
   });
 })();

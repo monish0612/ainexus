@@ -12,8 +12,7 @@ import {
   tg,
   isXGrokAvailable,
   X_FEED_HANDLES,
-  SCHEDULE_HOUR_IST,
-  SCHEDULE_MINUTE_IST,
+  SCHEDULE_TIMES_IST,
   IST_OFFSET_MS,
 } from './config.js';
 import { getSyncState } from './store.js';
@@ -110,16 +109,20 @@ export function buildWindowLabels(sinceISO, untilISO) {
 export function msUntilNextRun() {
   const now = new Date();
   const istNow = new Date(now.getTime() + IST_OFFSET_MS);
+  let bestMs = Infinity;
 
-  const target = new Date(istNow);
-  target.setUTCHours(SCHEDULE_HOUR_IST, SCHEDULE_MINUTE_IST, 0, 0);
-
-  if (target <= istNow) {
-    target.setUTCDate(target.getUTCDate() + 1);
+  for (const { hour, minute } of SCHEDULE_TIMES_IST) {
+    const target = new Date(istNow);
+    target.setUTCHours(hour, minute, 0, 0);
+    if (target <= istNow) {
+      target.setUTCDate(target.getUTCDate() + 1);
+    }
+    const targetUTC = new Date(target.getTime() - IST_OFFSET_MS);
+    const ms = targetUTC.getTime() - now.getTime();
+    if (ms < bestMs) bestMs = ms;
   }
 
-  const targetUTC = new Date(target.getTime() - IST_OFFSET_MS);
-  return Math.max(0, targetUTC.getTime() - now.getTime());
+  return Math.max(0, bestMs);
 }
 
 function nextRunLabel() {
@@ -165,8 +168,8 @@ export function startScheduler(runDailySyncFn) {
   }
 
   const handles = X_FEED_HANDLES.map((h) => `@${h.handle}`).join(', ');
-  const timeLabel = `${SCHEDULE_HOUR_IST}:${String(SCHEDULE_MINUTE_IST).padStart(2, '0')} IST`;
-  console.log(`[X-FEED] Scheduler starting: handles=[${handles}] time=${timeLabel}`);
+  const timeLabel = SCHEDULE_TIMES_IST.map((t) => `${t.hour}:${String(t.minute).padStart(2, '0')}`).join(' & ') + ' IST';
+  console.log(`[X-FEED] Scheduler starting: handles=[${handles}] times=${timeLabel}`);
   tg.i('X-FEED/sched', `Starting: handles=[${handles}], schedule=${timeLabel}`);
 
   // Check if catch-up is needed on startup:

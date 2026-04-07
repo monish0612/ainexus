@@ -31,7 +31,12 @@ export const X_FEED_HANDLES = [
 
 // ── Schedule ───────────────────────────────────────────────────────────
 
-export const SCHEDULE_HOUR_IST = 21;   // 9 PM
+export const SCHEDULE_TIMES_IST = [
+  { hour: 8, minute: 0 },   // 8 AM IST — morning digest
+  { hour: 21, minute: 0 },  // 9 PM IST — evening digest
+];
+// Legacy single-schedule exports (used by scheduler.js)
+export const SCHEDULE_HOUR_IST = 21;
 export const SCHEDULE_MINUTE_IST = 0;
 export const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000; // UTC+5:30
 

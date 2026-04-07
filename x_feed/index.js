@@ -317,7 +317,7 @@ export function getXFeedStatus() {
     lastRunResult: _lastRunResult,
     handles,
     schedule: {
-      timeIST: `${21}:00`,
+      timesIST: ['8:00', '21:00'],
       nextRunMs: msUntilNextRun(),
       nextRunHours: (msUntilNextRun() / 3600000).toFixed(1),
     },
