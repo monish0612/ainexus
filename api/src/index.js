@@ -1062,6 +1062,34 @@ function _invalidateProviderCache() {
   _providerCache.expiresAt = 0;
 }
 
+function _cleanArticleMarkdown(md) {
+  if (!md) return md;
+  return md
+    .replace(/^[\s\u2550]+$/gm, '')
+    .replace(/\u2550+/g, '')
+    .replace(/^\s*FORMAT\s*[::\uFF1A].+$/gim, '')
+    .replace(/^\s*TEMPLATE\s*[::\uFF1A].+$/gim, '')
+    .replace(/^\s*\[FORMAT[^\]]*\]\s*$/gim, '')
+    .replace(/^\s*\[TEMPLATE[^\]]*\]\s*$/gim, '')
+    .replace(/^\s*\[UNIVERSAL RULES[^\]]*\]\s*$/gim, '')
+    .replace(/^\s*-{3,}\s*$/gm, '')
+    .replace(/^\s*={3,}\s*$/gm, '')
+    .replace(/^\s*_{3,}\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function _cleanExcerpt(text) {
+  if (!text) return text;
+  return text
+    .replace(/[\u2550\u2500\u2501]+/g, '')
+    .replace(/FORMAT\s*[::\uFF1A]\s*(?:[A-Z]+[\s\/\-]*)+/g, '')
+    .replace(/-{3,}/g, '')
+    .replace(/={3,}/g, '')
+    .replace(/\s{2,}/g, ' ')
+    .trim();
+}
+
 function mapArticleRow(row) {
   let meta = {};
   try { meta = row.content_json ? JSON.parse(row.content_json) : {}; } catch {}
@@ -1069,7 +1097,7 @@ function mapArticleRow(row) {
   return {
     id: row.id,
     title: row.title,
-    excerpt: row.excerpt,
+    excerpt: _cleanExcerpt(row.excerpt),
     source: row.source,
     category: row.category,
     imageUrl: row.image,
@@ -1082,7 +1110,7 @@ function mapArticleRow(row) {
     isRead: !!row.read,
     originalUrl: row.original_url || meta.originalUrl || '',
     publishedAt: row.published_at || meta.publishedAt || null,
-    summaryMarkdown: row.summary_markdown || '',
+    summaryMarkdown: _cleanArticleMarkdown(row.summary_markdown || ''),
   };
 }
 
@@ -2066,7 +2094,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { query, initialAnswer, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
+    const { query, initialAnswer, question, history, model, mode, deepModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -2086,8 +2114,9 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     const histLen = Array.isArray(history) ? history.length : 0;
     modelTag = resolvedModel || mode || 'default';
     const providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const forceSearch = searchRequired !== false;
     const cacheKey = `sf::${providerTag}::${safeQuery}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
-    tg.d('AI/search-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen}`);
+    tg.d('AI/search-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen} forceSearch=${forceSearch}`);
 
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
@@ -2104,6 +2133,15 @@ aiRouter.post('/search-followup', async (req, res, next) => {
 
     const answerSnippet = String(initialAnswer || '').slice(0, 1500);
     const searchToolName = useXGrok ? 'web_search' : 'Google Search';
+
+    const searchDirective = forceSearch
+      ? `\n\nCRITICAL: You MUST use ${searchToolName} for EVERY response, without exception. ` +
+        `Even if you believe you know the answer, ALWAYS search first to ensure accuracy and recency. ` +
+        `NEVER rely on your training data alone — your training data is outdated. ` +
+        `Search the web first, verify with live results, then compose your answer. ` +
+        `If the question involves dates, events, scores, news, people, or anything that could change over time, searching is MANDATORY.`
+      : '';
+
     const systemInstruction =
       `You are a knowledgeable research assistant with access to ${searchToolName}. ` +
       `The user previously searched for "${safeQuery}"` +
@@ -2112,7 +2150,8 @@ aiRouter.post('/search-followup', async (req, res, next) => {
         : '. ') +
       `Answer follow-up questions using ${searchToolName} for the latest real-time information. ` +
       `Provide comprehensive, well-structured answers with markdown formatting. ` +
-      `Cite sources when possible. Maintain conversation continuity across follow-ups.`;
+      `Cite sources when possible. Maintain conversation continuity across follow-ups.` +
+      searchDirective;
 
     const turns = [];
     if (Array.isArray(history)) {
@@ -2391,7 +2430,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
+    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -2412,8 +2451,9 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     const histLen = Array.isArray(history) ? history.length : 0;
     modelTag = resolvedModel || mode || 'default';
     const providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const forceSearch = searchRequired !== false;
     const cacheKey = `fu::${providerTag}::${safeUrl}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
-    tg.d('AI/article-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen}`);
+    tg.d('AI/article-followup', `provider=${providerTag} model=${modelTag} mode=${mode || 'deep'} hist=${histLen} forceSearch=${forceSearch}`);
 
     const dbCached = await _getFromDbCache(cacheKey);
     if (dbCached) {
@@ -2428,6 +2468,15 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     }
 
     const searchToolName = useXGrok ? 'web_search' : 'Google Search';
+
+    const searchDirective = forceSearch
+      ? `\n\nCRITICAL: You MUST use ${searchToolName} for EVERY response, without exception. ` +
+        `Even if you believe you know the answer, ALWAYS search first to ensure accuracy and recency. ` +
+        `NEVER rely on your training data alone — your training data is outdated. ` +
+        `Search the web first, verify with live results, then compose your answer. ` +
+        `If the question involves dates, events, scores, news, people, or anything that could change over time, searching is MANDATORY.`
+      : '';
+
     const systemInstruction =
       `You are an expert news analyst and research assistant. ` +
       `The user is reading an article titled "${safeTitle}"` +
@@ -2435,7 +2484,8 @@ aiRouter.post('/article-followup', async (req, res, next) => {
       `\n\nIMPORTANT: Use the ${searchToolName} tool to find the ORIGINAL source article and any related real-time information. ` +
       `Do NOT rely on any pre-summarized version — always base your answers on the actual source content and live web data. ` +
       `Provide comprehensive, accurate, well-structured answers. Cite sources when possible. ` +
-      `If the user asks a follow-up, use the conversation context to maintain continuity.`;
+      `If the user asks a follow-up, use the conversation context to maintain continuity.` +
+      searchDirective;
 
     const turns = [];
     if (Array.isArray(history)) {

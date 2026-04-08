@@ -244,8 +244,28 @@ function stripMd(v = '') {
       .replace(/^\s*>\s?/gm, '')
       .replace(/\|/g, ' ')
       .replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')
-      .replace(/_{1,2}([^_]+)_{1,2}/g, '$1'),
+      .replace(/_{1,2}([^_]+)_{1,2}/g, '$1')
+      .replace(/[\u2550\u2500\u2501\u2503]+/g, ' ')
+      .replace(/^\s*FORMAT\s*[::\uFF1A].+$/gim, '')
+      .replace(/^\s*-{3,}\s*$/gm, ' ')
+      .replace(/^\s*={3,}\s*$/gm, ' '),
   );
+}
+
+function cleanSummaryArtifacts(text) {
+  if (!text) return text;
+  return text
+    .replace(/^[\s\u2550]+$/gm, '')
+    .replace(/\u2550+/g, '')
+    .replace(/^\s*FORMAT\s*[::\uFF1A].+$/gim, '')
+    .replace(/^\s*TEMPLATE\s*[::\uFF1A].+$/gim, '')
+    .replace(/^\s*\[TEMPLATE[^\]]*\]\s*$/gim, '')
+    .replace(/^\s*\[UNIVERSAL RULES\]\s*$/gim, '')
+    .replace(/^\s*-{3,}\s*$/gm, '')
+    .replace(/^\s*={3,}\s*$/gm, '')
+    .replace(/^\s*_{3,}\s*$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
 }
 
 function buildExcerpt(summary, fallback) {
@@ -509,6 +529,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   if (!summary) {
     summary = fallbackSummary(title, contentText, item.link, source);
   } else {
+    summary = cleanSummaryArtifacts(summary);
     summary = appendSourceLink(summary, item.link, source);
   }
 
