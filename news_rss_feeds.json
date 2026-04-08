@@ -70,7 +70,8 @@
       "app_category": "Finance",
       "enabled": true,
       "prompt_key": "summary_prompt",
-      "description": "In-depth business journalism and analysis"
+      "description": "In-depth business journalism and analysis",
+      "deep_extract": true
     },
     {
       "id": "marktechpost",

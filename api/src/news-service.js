@@ -458,7 +458,7 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
   }
 }
 
-async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }) {
+async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }) {
   const existing = await pool.query('SELECT id FROM news_articles WHERE guid = $1', [item.guid]);
   if (existing.rows.length > 0) return false;
 
@@ -468,10 +468,28 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   const title = item.title || 'Untitled';
   const pubDate = parseDate(item.pubRaw);
   const source = feed.name || feed.id;
-  const contentText = item.text || cleanHtml(item.html || '');
+  let contentText = item.text || cleanHtml(item.html || '');
+
+  // Deep extraction for paywalled / subscription-only feeds
+  if (feed.deep_extract && typeof deepExtractFn === 'function' && item.link) {
+    const _dt0 = Date.now();
+    const _logTag = `NEWS/${feed.id}`;
+    try {
+      const extracted = await deepExtractFn(item.link, { logTag: _logTag });
+      if (extracted.content && extracted.content.length > contentText.length && extracted.content.length >= 200) {
+        const rssLen = contentText.length;
+        contentText = extracted.content;
+        tg.i(_logTag, `Deep extract ✓ ${Date.now() - _dt0}ms method=${extracted.extractionMethod} paywall=${extracted.paywallSource} ${contentText.length}ch (RSS had ${rssLen}ch) "${title.slice(0, 50)}"`);
+      } else {
+        tg.d(_logTag, `Deep extract returned ${extracted.content?.length || 0}ch ≤ RSS ${contentText.length}ch — using RSS "${title.slice(0, 40)}"`);
+      }
+    } catch (deepErr) {
+      tg.w(_logTag, `Deep extract FAILED ${Date.now() - _dt0}ms "${title.slice(0, 40)}": ${deepErr.message?.slice(0, 80)} — using RSS content`);
+    }
+  }
 
   const t0 = Date.now();
-  console.log(`[NEWS] Processing: "${title.slice(0, 60)}" from ${source} (${feed.prompt_key || 'summary_prompt'})`);
+  console.log(`[NEWS] Processing: "${title.slice(0, 60)}" from ${source} (${feed.prompt_key || 'summary_prompt'}) content=${contentText.length}ch${feed.deep_extract ? ' [deep]' : ''}`);
 
   let summary = await summaryLimiter(async () => {
     const gen = await generateSummary({
@@ -521,7 +539,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   return true;
 }
 
-async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }) {
+async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }) {
   const feedT0 = Date.now();
   try {
     const controller = new AbortController();
@@ -551,7 +569,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
 
     const results = await Promise.all(
       items.map((item) =>
-        processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn }).catch((e) => {
+        processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }).catch((e) => {
           console.error(`[NEWS] Item failed (${feed.id}):`, e.message?.slice(0, 120));
           tg.w('NEWS/item', `Item fail feed=${feed.id} "${item?.title?.slice(0, 40) || '?'}"`, e);
           return false;
@@ -571,7 +589,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
   }
 }
 
-async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn } = {}) {
+async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtractFn } = {}) {
   if (activeSyncPromise) {
     tg.d('NEWS/sync', `Sync already in progress — deduplicating (reason=${reason})`);
     return activeSyncPromise;
@@ -614,7 +632,7 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn } = {}) {
     await Promise.all(
       feeds.map((feed) =>
         feedLimiter(async () => {
-          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn });
+          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn });
           counts[feed.id] = n;
           total += n;
         }),
@@ -675,7 +693,7 @@ function getSyncState() {
   return { lastSyncAt, lastSyncResult, lastSyncError, inProgress: activeSyncPromise != null };
 }
 
-function startScheduler(pool, { getProviderFn } = {}) {
+function startScheduler(pool, { getProviderFn, deepExtractFn } = {}) {
   if (schedulerHandle) return;
   const settings = getSettings(loadConfig());
   const intervalMinutes = Math.max(5, settings.refresh_interval_minutes);
@@ -684,7 +702,7 @@ function startScheduler(pool, { getProviderFn } = {}) {
   console.log(`[NEWS] Scheduler starting: interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
   tg.i('NEWS/scheduler', `Starting: interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
 
-  syncNewsFeeds(pool, { reason: 'startup', getProviderFn }).catch((e) => {
+  syncNewsFeeds(pool, { reason: 'startup', getProviderFn, deepExtractFn }).catch((e) => {
     console.error('[NEWS] Initial sync failed:', e.message?.slice(0, 120));
     tg.e('NEWS/scheduler', 'Initial startup sync failed', e);
   });
@@ -692,7 +710,7 @@ function startScheduler(pool, { getProviderFn } = {}) {
   let consecutiveFailures = 0;
   schedulerHandle = setInterval(async () => {
     try {
-      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn });
+      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn, deepExtractFn });
       consecutiveFailures = 0;
     } catch (e) {
       consecutiveFailures++;

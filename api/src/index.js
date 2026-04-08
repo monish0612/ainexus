@@ -1102,7 +1102,7 @@ newsRouter.get('/', async (_req, res, next) => {
 
 newsRouter.post('/refresh', async (_req, res, next) => {
   try {
-    const result = await syncNewsFeeds(pool, { reason: 'manual', getProviderFn: _resolveNewsProvider });
+    const result = await syncNewsFeeds(pool, { reason: 'manual', getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent });
     const rows = await pool.query(
       `SELECT * FROM news_articles
        ORDER BY is_featured DESC, COALESCE(published_at, created_at) DESC, updated_at DESC`,
@@ -1190,7 +1190,7 @@ newsRouter.post('/force-resync', async (_req, res, next) => {
       ? require('path').resolve(__dirname, '../../news_rss_feeds.json')
       : require('path').resolve(__dirname, '../news_rss_feeds.json');
     const config = JSON.parse(require('fs').readFileSync(feedsPath, 'utf8'));
-    syncNewsFeeds(pool, { reason: 'force-resync', getProviderFn: _resolveNewsProvider }).catch((e) => console.error('[NEWS] force-resync error:', e));
+    syncNewsFeeds(pool, { reason: 'force-resync', getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent }).catch((e) => console.error('[NEWS] force-resync error:', e));
     res.json({ deleted: del.rowCount, message: 'All non-saved articles removed. Re-fetching with new prompts in background.' });
   } catch (err) {
     next(err);
@@ -1426,20 +1426,34 @@ aiRouter.post('/define', async (req, res, next) => {
   }
 });
 
-// HTML → text helper
+// HTML → text helper (aggressive boilerplate stripping)
 function stripHtmlToText(html) {
   return html
+    // Remove non-content tags entirely
     .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
     .replace(/<style[^>]*>[\s\S]*?<\/style>/gi, '')
+    .replace(/<noscript[^>]*>[\s\S]*?<\/noscript>/gi, '')
     .replace(/<nav[^>]*>[\s\S]*?<\/nav>/gi, '')
     .replace(/<footer[^>]*>[\s\S]*?<\/footer>/gi, '')
     .replace(/<header[^>]*>[\s\S]*?<\/header>/gi, '')
+    .replace(/<aside[^>]*>[\s\S]*?<\/aside>/gi, '')
+    .replace(/<form[^>]*>[\s\S]*?<\/form>/gi, '')
+    .replace(/<iframe[^>]*>[\s\S]*?<\/iframe>/gi, '')
+    .replace(/<svg[^>]*>[\s\S]*?<\/svg>/gi, '')
+    // Strip pricing/subscription sections (class or id hints)
+    .replace(/<(?:div|section|table)[^>]*(?:class|id)=["'][^"']*(?:pricing|plans?|subscription|paywall|cta|sidebar|widget|cookie|banner|popup|modal|newsletter|signup|sign-up|testimonial|review|faq|compare|comparison)[^"']*["'][^>]*>[\s\S]*?<\/(?:div|section|table)>/gi, '')
+    // Strip all remaining tags
     .replace(/<[^>]+>/g, ' ')
     .replace(/&nbsp;/g, ' ')
     .replace(/&amp;/g, '&')
     .replace(/&lt;/g, '<')
     .replace(/&gt;/g, '>')
     .replace(/&#\d+;/g, '')
+    .replace(/&[a-z]+;/gi, ' ')
+    // Post-strip: remove common boilerplate phrases that survive tag removal
+    .replace(/(?:subscribe|sign up|log ?in|create (?:an )?account)[^.]{0,80}(?:\$|USD|INR|EUR|GBP|\/\s*(?:year|month|mo))\b[^.]*\.?/gi, ' ')
+    .replace(/(?:terms\s*(?:&|and)\s*conditions|privacy\s*policy|cookie\s*(?:policy|consent)|all\s*rights?\s*reserved)[^.]*\.?/gi, ' ')
+    .replace(/(?:follow us|download (?:the |our )?app|available on|app store|google play|qr code)[^.]*\.?/gi, ' ')
     .replace(/\s+/g, ' ')
     .trim();
 }
@@ -1454,6 +1468,259 @@ function extractTitleFromHtml(html) {
   return '';
 }
 
+// Paywall detection regex — compiled once at module level for performance
+const _PAYWALL_RX = /subscribe to (?:read|continue|access|unlock)|sign (?:in|up) to (?:read|continue|access|view)|create.*(?:free|an)\s*account|only available to (?:subscribers|members|premium)|sign up for (?:a |your )?free (?:account|trial)|paywall|premium content|login required|subscription required|become a (?:member|subscriber)|unlock (?:this|the|full) (?:story|article|content|piece)|start your (?:free )?trial|already a (?:subscriber|member)\??|you(?:'ve| have) reached (?:your|the) (?:free|limit)|register to (?:read|continue|access)|this (?:content|article|story) is (?:only )?(?:available|accessible) (?:to|for) (?:subscribers|members|premium)|free articles? remaining|reading limit|metered paywall|continue reading for free|get (?:full|unlimited|complete) access/i;
+
+// ═══════════════════════════════════════════════════════════════════════
+//  DEEP CONTENT EXTRACTION — Modular, reusable pipeline (Stages 1–4)
+//
+//  Used by:
+//    1. POST /api/v1/ai/summarize  (URL summarizer screen)
+//    2. RSS feed pipeline           (for feeds with deep_extract: true)
+//
+//  To add a new site: set "deep_extract": true in news_rss_feeds.json
+// ═══════════════════════════════════════════════════════════════════════
+
+async function deepExtractContent(url, { logTag = 'DeepExtract' } = {}) {
+  const _t0 = Date.now();
+  let content = '';
+  let title = '';
+  let extractionMethod = 'none';
+  let _rawHtml = '';
+  let paywallSource = 'none';
+
+  // ── Stage 1: Direct HTTP fetch (free, fast, 1× retry on transient) ──
+  const _s1 = Date.now();
+  const _fetchOnce = () => fetch(url, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+      'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      'Accept-Language': 'en-US,en;q=0.5',
+    },
+    redirect: 'follow',
+    signal: AbortSignal.timeout(12000),
+  });
+
+  for (let _a1 = 0; _a1 < 2; _a1++) {
+    try {
+      if (_a1 > 0) await new Promise(r => setTimeout(r, 1500));
+      const directRes = await _fetchOnce();
+
+      if (directRes.ok) {
+        const html = await directRes.text();
+        _rawHtml = html;
+        title = extractTitleFromHtml(html);
+        const text = stripHtmlToText(html);
+        if (text.length > 500) {
+          content = text.slice(0, 12000);
+          extractionMethod = 'direct-fetch';
+          tg.d(logTag, `Stage1 ✓ direct-fetch ${Date.now() - _s1}ms ${content.length}ch title="${title.slice(0, 50)}"${_a1 ? ' (retry)' : ''}`);
+        } else {
+          tg.d(logTag, `Stage1 content too short ${Date.now() - _s1}ms ${text.length}ch${_a1 ? ' (retry)' : ''}`);
+        }
+        break;
+      } else {
+        tg.d(logTag, `Stage1 HTTP ${directRes.status} ${Date.now() - _s1}ms${_a1 ? ' (retry)' : ''}`);
+        if (directRes.status < 500) break;
+      }
+    } catch (fetchErr) {
+      const transient = /ETIMEDOUT|ECONNRESET|ECONNREFUSED|UND_ERR|socket hang up|abort/i.test(fetchErr.message);
+      tg.d(logTag, `Stage1 error ${Date.now() - _s1}ms: ${fetchErr.message?.slice(0, 80)}${_a1 ? ' (retry)' : ''}`);
+      if (!transient || _a1 >= 1) break;
+    }
+  }
+
+  // ── Stage 2: Paywall / blocked check (two-layer detection) ───────────
+  let paywallDetected = false;
+
+  if (content.length >= 500 && _rawHtml.length > 0) {
+    const _liteText = _rawHtml.slice(0, 60000).replace(/<[^>]+>/g, ' ').replace(/\s+/g, ' ');
+    paywallDetected = _PAYWALL_RX.test(_liteText);
+
+    if (paywallDetected) {
+      paywallSource = 'regex';
+      const _pwMatch = _liteText.match(_PAYWALL_RX);
+      tg.d(logTag, `Stage2a REGEX ✓ "${_pwMatch?.[0]?.slice(0, 60)}" — LLM check skipped`);
+    } else {
+      const _s2 = Date.now();
+      try {
+        const llmCheck = await callLiteLLM({
+          messages: [
+            {
+              role: 'system',
+              content: 'You are a paywall detector. Analyze the text and decide if the full article content is NOT available (truncated, gated, preview-only, subscription required). Reply ONLY: {"paywalled":true} or {"paywalled":false}',
+            },
+            { role: 'user', content: content.slice(0, 1500) },
+          ],
+          temperature: 0,
+          maxTokens: 20,
+        });
+        const llmParsed = parseJsonContent(llmCheck.content);
+        if (llmParsed?.paywalled === true) {
+          paywallDetected = true;
+          paywallSource = 'llm';
+          tg.d(logTag, `Stage2b LLM ✓ paywalled ${Date.now() - _s2}ms model=${llmCheck.model_used}`);
+        } else {
+          tg.d(logTag, `Stage2b LLM ✗ not paywalled ${Date.now() - _s2}ms model=${llmCheck.model_used}`);
+        }
+      } catch (llmErr) {
+        tg.d(logTag, `Stage2b LLM error ${Date.now() - _s2}ms: ${llmErr.message?.slice(0, 80)} — assuming not paywalled`);
+      }
+    }
+  }
+
+  const isBlocked = content.length < 500 || paywallDetected;
+  if (isBlocked) {
+    tg.d(logTag, `Stage2 → BLOCKED (content=${content.length}ch paywall=${paywallSource}) — entering deep extraction`);
+  }
+
+  // ── Stage 3: Zyte headless browser extraction (1× retry on 429/5xx) ──
+  const zyteKey = process.env.ZYTE_API_KEY;
+  if (isBlocked && zyteKey) {
+    const _s3 = Date.now();
+    const _zyteOnce = () => fetch('https://api.zyte.com/v1/extract', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': 'Basic ' + Buffer.from(zyteKey + ':').toString('base64'),
+      },
+      body: JSON.stringify({ url, browserHtml: true, article: true }),
+      signal: AbortSignal.timeout(45000),
+    });
+
+    for (let _a3 = 0; _a3 < 2; _a3++) {
+      try {
+        if (_a3 > 0) await new Promise(r => setTimeout(r, 2000));
+        const zyteRes = await _zyteOnce();
+
+        if (zyteRes.ok) {
+          const zyteData = await zyteRes.json();
+          const articleBody = zyteData?.article?.articleBody || '';
+          const headline = zyteData?.article?.headline || '';
+          const browserHtmlText = zyteData?.browserHtml
+            ? stripHtmlToText(zyteData.browserHtml)
+            : '';
+
+          if (browserHtmlText.length > articleBody.length && browserHtmlText.length > 300) {
+            content = browserHtmlText.slice(0, 12000);
+            if (!title) title = extractTitleFromHtml(zyteData.browserHtml);
+            if (headline) title = headline;
+            extractionMethod = 'zyte-html';
+            tg.d(logTag, `Stage3 ✓ zyte-html ${Date.now() - _s3}ms ${content.length}ch (browser=${browserHtmlText.length} > article=${articleBody.length})${_a3 ? ' (retry)' : ''}`);
+          } else if (articleBody.length > 200) {
+            content = articleBody.slice(0, 12000);
+            title = headline || title;
+            extractionMethod = 'zyte-article';
+            tg.d(logTag, `Stage3 ✓ zyte-article ${Date.now() - _s3}ms ${content.length}ch (article=${articleBody.length} >= browser=${browserHtmlText.length})${_a3 ? ' (retry)' : ''}`);
+          } else {
+            tg.d(logTag, `Stage3 zyte insufficient ${Date.now() - _s3}ms article=${articleBody.length}ch browser=${browserHtmlText.length}ch`);
+          }
+          break;
+        } else {
+          const retryable = zyteRes.status === 429 || zyteRes.status >= 500;
+          tg.w(logTag, `Stage3 Zyte HTTP ${zyteRes.status} ${Date.now() - _s3}ms${_a3 ? ' (retry)' : ''}${retryable && _a3 < 1 ? ' — will retry' : ''}`);
+          if (!retryable || _a3 >= 1) break;
+        }
+      } catch (zyteErr) {
+        tg.w(logTag, `Stage3 Zyte error ${Date.now() - _s3}ms: ${zyteErr.message?.slice(0, 80)}${_a3 ? ' (retry)' : ''}`);
+        if (_a3 >= 1) break;
+      }
+    }
+  }
+
+  // ── Stage 4: Parallel fallback — Tavily ∥ Gemini Grounding ───────────
+  const stillBlocked = content.length < 500 || (paywallDetected && extractionMethod === 'direct-fetch');
+  if (stillBlocked) {
+    const _s4 = Date.now();
+    tg.d(logTag, `Stage4 ▶ parallel research (content=${content.length}ch method=${extractionMethod} paywall=${paywallSource})`);
+    const searchQuery = title
+      ? `Detailed information about: ${title}`
+      : `Full content and details from: ${url}`;
+
+    const runners = [];
+
+    const tavilyKey = process.env.TAVILY_API_KEY;
+    if (tavilyKey) {
+      runners.push(
+        (async () => {
+          const _rt = Date.now();
+          try {
+            const tavilyRes = await fetch('https://api.tavily.com/search', {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${tavilyKey}`,
+              },
+              body: JSON.stringify({
+                query: searchQuery,
+                search_depth: 'advanced',
+                max_results: 5,
+              }),
+              signal: AbortSignal.timeout(20000),
+            });
+
+            if (!tavilyRes.ok) {
+              tg.d(logTag, `Stage4a Tavily HTTP ${tavilyRes.status} ${Date.now() - _rt}ms`);
+              return { text: '', method: 'tavily-search' };
+            }
+
+            const tavilyData = await tavilyRes.json();
+            const snippets = (tavilyData?.results || [])
+              .map(r => r.content || '').filter(Boolean).join('\n\n');
+            const answer = tavilyData?.answer || '';
+            const combined = answer
+              ? `Research Summary:\n${answer}\n\nDetailed Sources:\n${snippets}`
+              : snippets;
+
+            tg.d(logTag, `Stage4a Tavily ✓ ${Date.now() - _rt}ms ${combined.length}ch (${tavilyData?.results?.length || 0} results)`);
+            return { text: combined, method: 'tavily-search' };
+          } catch (e) {
+            tg.d(logTag, `Stage4a Tavily error ${Date.now() - _rt}ms: ${e.message?.slice(0, 60)}`);
+            return { text: '', method: 'tavily-search' };
+          }
+        })(),
+      );
+    }
+
+    if (isGroundingAvailable()) {
+      runners.push(
+        (async () => {
+          const _rg = Date.now();
+          try {
+            const gr = await groundedExtract(url, title, { timeoutMs: 25000 });
+            tg.d(logTag, `Stage4b Grounding ✓ ${Date.now() - _rg}ms ${gr.content.length}ch method=${gr.extractionMethod}`);
+            return { text: gr.content, method: gr.extractionMethod };
+          } catch (e) {
+            tg.d(logTag, `Stage4b Grounding error ${Date.now() - _rg}ms: ${e.message?.slice(0, 60)}`);
+            return { text: '', method: 'gemini-grounding' };
+          }
+        })(),
+      );
+    }
+
+    if (runners.length > 0) {
+      const results = await Promise.all(runners);
+      const best = results
+        .filter(r => r.text.length > 200)
+        .sort((a, b) => b.text.length - a.text.length)[0];
+
+      if (best) {
+        content = best.text.slice(0, 12000);
+        extractionMethod = best.method;
+        tg.d(logTag, `Stage4 ✓ winner=${best.method} ${Date.now() - _s4}ms ${content.length}ch (${runners.length} runners)`);
+      } else {
+        tg.w(logTag, `Stage4 ✗ all ${runners.length} runners <200ch ${Date.now() - _s4}ms`);
+      }
+    } else {
+      tg.w(logTag, `Stage4 ✗ no runners (tavily=${!!tavilyKey} grounding=${isGroundingAvailable()})`);
+    }
+  }
+
+  return { content, title, extractionMethod, paywallSource, elapsedMs: Date.now() - _t0 };
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+
 aiRouter.post('/summarize', async (req, res, next) => {
   const _t0 = Date.now();
   try {
@@ -1461,184 +1728,38 @@ aiRouter.post('/summarize', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const url = val.data.url;
-    console.log('[SUMMARIZE] Starting for URL:', url);
-    tg.d('AI/summarize', `url="${url.slice(0, 80)}"`);
+    const wantXGrok = req.body.provider === 'xgrok';
+    tg.d('AI/summarize', `▶ url="${url.slice(0, 80)}" provider=${req.body.provider || 'litellm'} wantXGrok=${wantXGrok}`);
 
+    // ── Stages 1–4: Deep content extraction ──────────────────────────
+    const extracted = await deepExtractContent(url, { logTag: 'AI/summarize' });
+    const { title, extractionMethod, paywallSource } = extracted;
+    let content = extracted.content;
 
-    let content = '';
-    let title = '';
-    let extractionMethod = 'none';
-
-    // ── Stage 1: Direct HTTP fetch (free, fast) ──────────────────────────
-    try {
-      console.log('[SUMMARIZE] Stage 1: Direct HTTP fetch...');
-      const directRes = await fetch(url, {
-        headers: {
-          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-          'Accept-Language': 'en-US,en;q=0.5',
-        },
-        redirect: 'follow',
-        signal: AbortSignal.timeout(15000),
-      });
-
-      if (directRes.ok) {
-        const html = await directRes.text();
-        title = extractTitleFromHtml(html);
-        const text = stripHtmlToText(html);
-        if (text.length > 500) {
-          content = text.slice(0, 12000);
-          extractionMethod = 'direct-fetch';
-          console.log('[SUMMARIZE] Direct fetch got', content.length, 'chars, title:', title.slice(0, 60));
-        } else {
-          console.log('[SUMMARIZE] Direct fetch got only', text.length, 'chars — too short');
-        }
-      } else {
-        console.warn('[SUMMARIZE] Direct fetch status:', directRes.status);
-      }
-    } catch (fetchErr) {
-      console.warn('[SUMMARIZE] Direct fetch error:', fetchErr.message?.slice(0, 100));
-    }
-
-    // ── Stage 2: Paywall / blocked check ─────────────────────────────────
-    const isBlocked = content.length < 500
-      || /subscribe to (read|continue)|sign in to continue|create.*free.*account|paywall|premium content|login required/i.test(content);
-
-    // ── Stage 3: Zyte browser extraction (for JS-heavy/paywalled sites) ──
-    const zyteKey = process.env.ZYTE_API_KEY;
-    if (isBlocked && zyteKey) {
-      try {
-        console.log('[SUMMARIZE] Stage 3: Trying Zyte browser extraction...');
-        const zyteRes = await fetch('https://api.zyte.com/v1/extract', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': 'Basic ' + Buffer.from(zyteKey + ':').toString('base64'),
-          },
-          body: JSON.stringify({
-            url,
-            browserHtml: true,
-            actions: [{ action: 'scrollPage' }],
-          }),
-          signal: AbortSignal.timeout(30000),
-        });
-
-        if (zyteRes.ok) {
-          const zyteData = await zyteRes.json();
-          const articleBody = zyteData?.article?.articleBody || '';
-          const headline = zyteData?.article?.headline || '';
-
-          if (articleBody.length > 200) {
-            content = articleBody.slice(0, 12000);
-            title = headline || title;
-            extractionMethod = 'zyte-article';
-            console.log('[SUMMARIZE] Zyte article:', content.length, 'chars');
-          } else if (zyteData?.browserHtml) {
-            const text = stripHtmlToText(zyteData.browserHtml);
-            if (text.length > 300) {
-              content = text.slice(0, 12000);
-              if (!title) title = extractTitleFromHtml(zyteData.browserHtml);
-              extractionMethod = 'zyte-html';
-              console.log('[SUMMARIZE] Zyte HTML:', content.length, 'chars');
-            }
-          }
-        } else {
-          console.warn('[SUMMARIZE] Zyte status:', zyteRes.status);
-        }
-      } catch (zyteErr) {
-        console.warn('[SUMMARIZE] Zyte error:', zyteErr.message?.slice(0, 100));
-      }
-    }
-
-    // ── Stage 4: Parallel fallback (Tavily + Gemini Grounding race) ──────
-    const stillBlocked = content.length < 500;
-    if (stillBlocked) {
-      console.log('[SUMMARIZE] Stage 4: Parallel research fallback...');
-      const searchQuery = title
-        ? `Detailed information about: ${title}`
-        : `Full content and details from: ${url}`;
-
-      const runners = [];
-
-      // 4a: Tavily
-      const tavilyKey = process.env.TAVILY_API_KEY;
-      if (tavilyKey) {
-        runners.push(
-          (async () => {
-            try {
-              const tavilyRes = await fetch('https://api.tavily.com/search', {
-                method: 'POST',
-                headers: {
-                  'Content-Type': 'application/json',
-                  'Authorization': `Bearer ${tavilyKey}`,
-                },
-                body: JSON.stringify({
-                  query: searchQuery,
-                  search_depth: 'advanced',
-                  max_results: 5,
-                }),
-                signal: AbortSignal.timeout(20000),
-              });
-
-              if (!tavilyRes.ok) return { text: '', method: 'tavily-search' };
-
-              const tavilyData = await tavilyRes.json();
-              const snippets = (tavilyData?.results || [])
-                .map(r => r.content || '').filter(Boolean).join('\n\n');
-              const answer = tavilyData?.answer || '';
-              const combined = answer
-                ? `Research Summary:\n${answer}\n\nDetailed Sources:\n${snippets}`
-                : snippets;
-
-              return { text: combined, method: 'tavily-search' };
-            } catch (e) {
-              console.warn('[SUMMARIZE] Tavily error:', e.message?.slice(0, 100));
-              return { text: '', method: 'tavily-search' };
-            }
-          })(),
-        );
-      }
-
-      // 4b: Gemini Google Search Grounding
-      if (isGroundingAvailable()) {
-        runners.push(
-          (async () => {
-            try {
-              const gr = await groundedExtract(url, title, { timeoutMs: 25000 });
-              return { text: gr.content, method: gr.extractionMethod };
-            } catch (e) {
-              console.warn('[SUMMARIZE] Grounding error:', e.message?.slice(0, 100));
-              return { text: '', method: 'gemini-grounding' };
-            }
-          })(),
-        );
-      }
-
-      if (runners.length > 0) {
-        const results = await Promise.all(runners);
-        const best = results
-          .filter(r => r.text.length > 200)
-          .sort((a, b) => b.text.length - a.text.length)[0];
-
-        if (best) {
-          content = best.text.slice(0, 12000);
-          extractionMethod = best.method;
-          console.log(`[SUMMARIZE] Best fallback: ${best.method} (${content.length} chars)`);
-        }
-      }
-    }
-
+    // ── Extraction gate ──────────────────────────────────────────────
     if (!content || content.length < 100) {
+      const elapsed = Date.now() - _t0;
+      tg.w('AI/summarize', `✗ EXTRACTION FAILED ${elapsed}ms — ${content.length}ch after all stages, url="${url.slice(0, 60)}"`);
       return res.status(422).json({
         error: 'Could not extract content from this URL. Ensure the link is complete (starts with https://) and the page is publicly accessible.',
       });
     }
 
-    // ── Stage 5: LLM summarization ────────────────────────────────────────
-    const summarizeProvider = req.body.provider;
+    // ── Stage 5: LLM summarization (xGrok primary → LiteLLM fallback) ────
+    //
+    //   Retry stack:
+    //     xgrokComplete → 3× internal retry with exponential backoff (800ms–4s)
+    //     callLiteLLM   → 2× retry/model + 3× for last model, cascading models
+    //
     const xgrokSummarizeModel = req.body.xgrokModel;
-    const useXGrokSummarize = summarizeProvider === 'xgrok' && isXGrokAvailable();
-    console.log('[SUMMARIZE] Stage 5: LLM →', content.length, 'chars (method:', extractionMethod, ', provider:', useXGrokSummarize ? 'xgrok' : 'litellm', ')');
+    const hasXGrok = isXGrokAvailable();
+    const useXGrokSummarize = wantXGrok && hasXGrok;
+
+    if (wantXGrok && !hasXGrok) {
+      tg.w('AI/summarize', `Client requested xGrok but XGROK_API_KEY missing — falling back to LiteLLM`);
+    }
+
+    tg.d('AI/summarize', `Stage5 ▶ provider=${useXGrokSummarize ? 'xgrok' : 'litellm'} model=${xgrokSummarizeModel || 'default'} content=${content.length}ch method=${extractionMethod}`);
 
     const systemPrompt = buildSummarizerSystemPrompt(url);
     const summarizeMessages = [
@@ -1647,43 +1768,61 @@ aiRouter.post('/summarize', async (req, res, next) => {
     ];
 
     let llmResult;
+    let usedProvider = useXGrokSummarize ? 'xgrok' : 'litellm';
+    let didFallback = false;
+
     if (useXGrokSummarize) {
+      const xModel = xgrokSummarizeModel || resolveXGrokModel('lite');
+      const _s5 = Date.now();
       try {
         llmResult = await xgrokComplete({
-          model: xgrokSummarizeModel || resolveXGrokModel('lite'),
+          model: xModel,
           messages: summarizeMessages,
           maxTokens: 3000,
           temperature: 0.3,
         });
+        usedProvider = 'xgrok';
+        tg.i('AI/summarize', `Stage5 ✓ xGrok model=${llmResult.model_used} ${Date.now() - _s5}ms`);
       } catch (xgrokErr) {
-        const xgrokElapsed = Date.now() - _t0;
-        tg.w('AI/summarize', `xGrok FAILED ${xgrokElapsed}ms — falling back to LiteLLM: ${xgrokErr.message?.slice(0, 120)}`);
-        llmResult = await callLiteLLM({
-          model: val.data.model || undefined,
-          messages: summarizeMessages,
-          maxTokens: 3000,
-          temperature: 0.3,
-        });
-        tg.i('AI/summarize', `✓ LiteLLM fallback SUCCEEDED model=${llmResult.model_used} ${Date.now() - _t0}ms`);
+        const xgrokElapsed = Date.now() - _s5;
+        tg.w('AI/summarize', `Stage5 ✗ xGrok FAILED ${xgrokElapsed}ms model=${xModel}: ${xgrokErr.message?.slice(0, 150)} — fallback to LiteLLM`);
+        const _s5b = Date.now();
+        try {
+          llmResult = await callLiteLLM({
+            model: val.data.model || undefined,
+            messages: summarizeMessages,
+            maxTokens: 3000,
+            temperature: 0.3,
+          });
+          usedProvider = 'litellm (fallback)';
+          didFallback = true;
+          tg.i('AI/summarize', `Stage5 ✓ LiteLLM fallback model=${llmResult.model_used} ${Date.now() - _s5b}ms (xGrok failed ${xgrokElapsed}ms)`);
+        } catch (litellmErr) {
+          tg.e('AI/summarize', `Stage5 ✗ ALL EXHAUSTED ${Date.now() - _t0}ms — xGrok ${xgrokElapsed}ms + LiteLLM ${Date.now() - _s5b}ms: ${litellmErr.message?.slice(0, 120)}`);
+          throw litellmErr;
+        }
       }
     } else {
+      const _s5 = Date.now();
       llmResult = await callLiteLLM({
         model: val.data.model || undefined,
         messages: summarizeMessages,
         maxTokens: 3000,
         temperature: 0.3,
       });
+      usedProvider = 'litellm';
+      tg.d('AI/summarize', `Stage5 ✓ LiteLLM model=${llmResult.model_used} ${Date.now() - _s5}ms`);
     }
 
+    // ── Parse & respond ──────────────────────────────────────────────────
     const parsed = parseJsonContent(llmResult.content);
-    console.log('[SUMMARIZE] LLM keys:', Object.keys(parsed || {}));
-
     const summary = asString(parsed?.summary || parsed?.content || '');
     const rawKeyPoints = parsed?.keyPoints || parsed?.key_points || parsed?.highlights || parsed?.takeaways || [];
     const keyPoints = (Array.isArray(rawKeyPoints) ? rawKeyPoints : [])
       .map(p => asString(p)).filter(Boolean);
 
-    tg.i('AI/summarize', `✓ model=${llmResult.model_used} ${Date.now() - _t0}ms, method=${extractionMethod}, url="${url.slice(0, 60)}"`);
+    const elapsed = Date.now() - _t0;
+    tg.i('AI/summarize', `✓ DONE ${elapsed}ms provider=${usedProvider} model=${llmResult.model_used} method=${extractionMethod} paywall=${paywallSource} fallback=${didFallback} content=${content.length}ch summary=${summary.length}ch keys=${keyPoints.length} url="${url.slice(0, 60)}"`);
     res.json({
       title: asString(parsed?.title || title || ''),
       summary: summary || 'Summary could not be generated.',
@@ -1692,12 +1831,15 @@ aiRouter.post('/summarize', async (req, res, next) => {
       readTime: typeof parsed?.readTime === 'number' ? parsed.readTime : (parseInt(parsed?.readTime) || 3),
       source: asString(parsed?.source || ''),
       extractionMethod,
+      paywallSource,
       url,
       model: llmResult.model_used,
+      providerUsed: usedProvider,
+      fallback: didFallback,
       usage: llmResult.usage,
     });
   } catch (err) {
-    tg.e('AI/summarize', `Failed ${Date.now() - _t0}ms`, err);
+    tg.e('AI/summarize', `FATAL ${Date.now() - _t0}ms url="${req.body?.url?.slice(0, 60)}": ${err.message?.slice(0, 200)}`, err);
     next(err);
   }
 });
@@ -3722,7 +3864,7 @@ async function initTables() {
     tg.i('Providers', `Registered: ${registeredProviders.join(', ')}`);
 
     // ── Start news scheduler with provider resolution ────────────
-    startScheduler(pool, { getProviderFn: _resolveNewsProvider });
+    startScheduler(pool, { getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent });
 
     // ── Start X Feed scheduler (9 PM IST daily digest) ──────────
     await startXFeedScheduler(pool);
