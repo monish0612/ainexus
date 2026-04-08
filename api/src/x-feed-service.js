@@ -50,46 +50,6 @@ const VISION_CONCURRENCY = 3;
 const VISION_MAX_RETRIES = 2;
 const VISION_MAX_IMAGES_PER_RUN = 20;
 
-async function _callLiteLLMFallback({ messages, temperature = 0.7, maxTokens = 4096, timeoutMs = 60_000 }) {
-  const baseUrl = String(process.env.LITELLM_URL || '').replace(/\/$/, '');
-  if (!baseUrl) throw new Error('LITELLM_URL not configured — cannot fallback');
-
-  const key = process.env.LITELLM_VIRTUAL_KEY || process.env.LITELLM_API_KEY;
-  const headers = { 'Content-Type': 'application/json' };
-  if (key) headers.Authorization = `Bearer ${key.trim()}`;
-
-  let model = null;
-  try {
-    const raw = process.env._LITELLM_MODEL_PRIORITY;
-    if (raw) {
-      const list = JSON.parse(raw);
-      if (list.length > 0) model = list[0];
-    }
-  } catch {}
-
-  const body = { messages, max_tokens: maxTokens, temperature };
-  if (model) body.model = model;
-
-  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify(body),
-    signal: AbortSignal.timeout(timeoutMs),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`LiteLLM fallback ${response.status}: ${text.slice(0, 300)}`);
-  }
-
-  const data = await response.json();
-  return {
-    content: data.choices?.[0]?.message?.content || '',
-    model_used: data.model || model || 'litellm-fallback',
-    usage: data.usage || null,
-  };
-}
-
 // ── State ───────────────────────────────────────────────────────────────
 
 let _pool = null;
@@ -452,8 +412,8 @@ function buildFetchPrompt(handle, sinceLabel, untilLabel) {
   return { system, user };
 }
 
-async function fetchPostsSince(handle, sinceLabel, untilLabel) {
-  const model = resolveXGrokModel('lite');
+async function fetchPostsSince(handle, sinceLabel, untilLabel, { modelOverride } = {}) {
+  const model = modelOverride || resolveXGrokModel('lite');
   const t0 = Date.now();
   const logLabel = `@${handle} [${sinceLabel} → ${untilLabel}]`;
 
@@ -729,7 +689,9 @@ function extractDigestJSON(text) {
 }
 
 async function generateDigest(handleConfig, fetchResult, dateLong, dateShort, visionResult = null) {
-  const model = resolveXGrokModel('lite');
+  const liteModel = resolveXGrokModel('lite');
+  const thinkingModel = resolveXGrokModel('thinking');
+  const deepModel = resolveXGrokModel('deep');
   const t0 = Date.now();
   const label = `@${handleConfig.handle} ${dateShort}`;
 
@@ -745,24 +707,35 @@ async function generateDigest(handleConfig, fetchResult, dateLong, dateShort, vi
 
   const digestMessages = [{ role: 'system', content: system }, { role: 'user', content: user }];
 
+  // Grok-only tiered fallback: lite → thinking → deep
+  const fallbackChain = [
+    { model: liteModel, tier: 'lite' },
+    ...(thinkingModel !== liteModel ? [{ model: thinkingModel, tier: 'thinking' }] : []),
+    ...(deepModel !== liteModel && deepModel !== thinkingModel ? [{ model: deepModel, tier: 'deep' }] : []),
+  ];
+
   let result;
-  try {
-    result = await withRetry(
-      () => xgrokComplete({ model, messages: digestMessages, temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
-      { maxAttempts: 3, tag: 'X-FEED/summarize', label: `digest ${label}` },
-    );
-  } catch (xgrokErr) {
-    const xgrokElapsed = Date.now() - t0;
-    tg.w('X-FEED/summarize', `xGrok FAILED for ${label} ${xgrokElapsed}ms — falling back to LiteLLM: ${xgrokErr.message?.slice(0, 120)}`);
+  let usedModel = liteModel;
+
+  for (let i = 0; i < fallbackChain.length; i++) {
+    const { model, tier } = fallbackChain[i];
+    const isLast = i === fallbackChain.length - 1;
+
     try {
+      if (i > 0) tg.w('X-FEED/summarize', `Falling back to Grok ${tier} model (${model}) for ${label}`);
       result = await withRetry(
-        () => _callLiteLLMFallback({ messages: digestMessages, temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
-        { maxAttempts: 3, tag: 'X-FEED/summarize', label: `LiteLLM-fallback ${label}` },
+        () => xgrokComplete({ model, messages: digestMessages, temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
+        { maxAttempts: 3, tag: 'X-FEED/summarize', label: `digest-${tier} ${label}` },
       );
-      tg.i('X-FEED/summarize', `✓ LiteLLM fallback SUCCEEDED for ${label} model=${result.model_used} ${Date.now() - t0}ms`);
-    } catch (litellmErr) {
-      tg.e('X-FEED/summarize', `LiteLLM fallback ALSO failed for ${label} ${Date.now() - t0}ms — no digest possible`, litellmErr);
-      return null;
+      usedModel = model;
+      if (i > 0) tg.i('X-FEED/summarize', `✓ Grok ${tier} fallback SUCCEEDED for ${label} (${Date.now() - t0}ms)`);
+      break;
+    } catch (err) {
+      tg.e('X-FEED/summarize', `Grok ${tier} (${model}) FAILED for ${label} (${Date.now() - t0}ms): ${err.message?.slice(0, 200)}`, err);
+      if (isLast) {
+        tg.e('X-FEED/summarize', `All Grok tiers exhausted for ${label} — no digest possible (${Date.now() - t0}ms)`);
+        return null;
+      }
     }
   }
 
@@ -772,7 +745,7 @@ async function generateDigest(handleConfig, fetchResult, dateLong, dateShort, vi
 
   if (parsed) {
     tg.i('X-FEED/summarize', `✓ ${label}: "${parsed.title.slice(0, 50)}" (${elapsed}ms, ${parsed.article.length} chars)`);
-    return { title: parsed.title, excerpt: parsed.excerpt, article: parsed.article, stats: parsed.stats, keyTopics: parsed.keyTopics, model: result.model_used || model, elapsed };
+    return { title: parsed.title, excerpt: parsed.excerpt, article: parsed.article, stats: parsed.stats, keyTopics: parsed.keyTopics, model: result.model_used || usedModel, elapsed };
   }
 
   if (content.length > 200) {
@@ -780,7 +753,7 @@ async function generateDigest(handleConfig, fetchResult, dateLong, dateShort, vi
     return {
       title: `${handleConfig.displayName}: Market Brief — ${dateShort}`,
       excerpt: `Daily market analysis from ${handleConfig.displayName}.`,
-      article: content, stats: [], keyTopics: [], model: result.model_used || model, elapsed,
+      article: content, stats: [], keyTopics: [], model: result.model_used || usedModel, elapsed,
     };
   }
 
@@ -824,11 +797,40 @@ async function processHandle(handleConfig) {
     return { handle, skipped: false, error: `fetch: ${e.message}`, slot };
   }
 
+  // ── Thinking-model retry: when the fast model finds 0 posts, retry with
+  //    the reasoning/thinking model before giving up. This dramatically
+  //    improves reliability because the thinking model constructs better
+  //    x_search queries and is more thorough.
   if (fetchResult.postsFound === 0) {
-    tg.i('X-FEED/run', `No posts from @${handle} [${slot}] in window — window advanced`);
-    try { await updateSyncState(handle, windowEnd, { postsProcessed: 0 }); } catch (dbErr) {
-      tg.e('X-FEED/run', `DB state update failed for @${handle}`, dbErr);
+    const thinkingModel = resolveXGrokModel('thinking');
+    const liteModel = resolveXGrokModel('lite');
+
+    // Only retry if thinking model is actually different from the lite model
+    if (thinkingModel !== liteModel) {
+      tg.w('X-FEED/run', `@${handle} [${slot}] lite model found 0 posts — retrying with thinking model (${thinkingModel})`);
+
+      try {
+        const thinkingResult = await fetchPostsSince(handle, sinceLabel, untilLabel, { modelOverride: thinkingModel });
+
+        if (thinkingResult.postsFound > 0 || thinkingResult.posts.length > 0) {
+          tg.i('X-FEED/run', `✓ @${handle} [${slot}] thinking model found ${thinkingResult.postsFound} posts (lite had 0) — using thinking result`);
+          fetchResult = thinkingResult;
+        } else if (thinkingResult.postsFound === -1 && thinkingResult.rawResponse.length > 50) {
+          tg.w('X-FEED/run', `@${handle} [${slot}] thinking model returned unparsed content (${thinkingResult.rawResponse.length} chars) — using raw fallback`);
+          fetchResult = thinkingResult;
+        } else {
+          tg.i('X-FEED/run', `@${handle} [${slot}] thinking model also found 0 posts — confirmed empty window`);
+        }
+      } catch (thinkErr) {
+        tg.w('X-FEED/run', `@${handle} [${slot}] thinking model retry failed: ${thinkErr.message?.slice(0, 200)} — proceeding with lite result`, thinkErr);
+      }
     }
+  }
+
+  if (fetchResult.postsFound === 0) {
+    // Don't advance the window cursor — posts may exist but search missed them.
+    // The next scheduled run will re-try the same window, preventing data loss.
+    tg.i('X-FEED/run', `No posts from @${handle} [${slot}] in window — window NOT advanced (will retry next run)`);
     return { handle, skipped: true, reason: 'no_posts', slot };
   }
 

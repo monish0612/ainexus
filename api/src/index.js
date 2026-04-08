@@ -1924,7 +1924,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { query, initialAnswer, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel } = req.body || {};
+    const { query, initialAnswer, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -1937,7 +1937,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     }
 
     const resolvedModel = useXGrok
-      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel)
+      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel)
       : (model ? String(model) : resolveGroundingMode(mode, deepModel));
     const safeQuery = String(query || '').slice(0, 500);
     const trimmedQ = String(question).trim();
@@ -2108,7 +2108,7 @@ async function _putToDbCache(key, result) {
 aiRouter.post('/deep-research', async (req, res, next) => {
   const _t0 = Date.now();
   try {
-    const { url, question, history, deepModel, provider, xgrokDeepModel } = req.body || {};
+    const { url, question, history, deepModel, provider, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!url || String(url).trim().length < 5) {
       return res.status(400).json({ error: 'url is required' });
@@ -2121,7 +2121,7 @@ aiRouter.post('/deep-research', async (req, res, next) => {
     }
 
     const resolvedModel = useXGrok
-      ? resolveXGrokModel('deep', undefined, xgrokDeepModel)
+      ? resolveXGrokModel('deep', undefined, xgrokDeepModel, xgrokThinkingModel)
       : (deepModel || undefined);
     const providerTag = useXGrok ? 'xgrok' : 'gemini';
     const safeUrl = String(url).slice(0, 500);
@@ -2249,7 +2249,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel } = req.body || {};
+    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -2262,7 +2262,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     }
 
     const resolvedModel = useXGrok
-      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel)
+      ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel)
       : (model ? String(model) : resolveGroundingMode(mode, deepModel));
     const safeTitle = String(articleTitle || 'this article').slice(0, 200);
     const safeUrl = String(articleUrl || '').slice(0, 500);
@@ -3741,7 +3741,7 @@ async function initTables() {
     console.log(`LiteLLM: ${process.env.LITELLM_URL}`);
     console.log(`LiteLLM Primary: ${primary || 'none detected'}${fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : ''}`);
     console.log(`Grounding Lite: ${grounding.liteModel || 'none'} | Pro: ${grounding.proModel || 'none'}`);
-    console.log(`xGrok: ${xgrok.available ? `Lite=${xgrok.liteModel} Deep=${xgrok.deepModel}` : 'not configured'}`);
+    console.log(`xGrok: ${xgrok.available ? `Lite=${xgrok.liteModel} Deep=${xgrok.deepModel} Thinking=${xgrok.thinkingModel}` : 'not configured'}`);
     const xFeedInfo = getXFeedStatus();
     console.log(`X-Feed: ${xFeedInfo.schedulerActive ? `active (next in ${xFeedInfo.schedule.nextRunHours}h)` : 'disabled'}`);
     console.log(`Database: ${process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')}`);

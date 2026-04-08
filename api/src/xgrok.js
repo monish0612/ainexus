@@ -322,14 +322,18 @@ async function xgrokComplete({
 /**
  * Resolve xGrok model for a given depth mode.
  *
- * @param {'lite'|'deep'|undefined} mode
+ * @param {'lite'|'deep'|'thinking'|undefined} mode
  * @param {string|undefined} xgrokLiteModel - from app settings
  * @param {string|undefined} xgrokDeepModel - from app settings
+ * @param {string|undefined} xgrokThinkingModel - from app settings
  * @returns {string}
  */
-function resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel) {
+function resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel) {
   if (mode === 'lite') {
     return xgrokLiteModel || process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+  }
+  if (mode === 'thinking') {
+    return xgrokThinkingModel || process.env.XGROK_THINKING_MODEL || 'grok-4-1-fast-reasoning';
   }
   return xgrokDeepModel || process.env.XGROK_DEEP_MODEL || 'grok-4-0709';
 }
@@ -339,6 +343,7 @@ function getXGrokConfig() {
     available: isXGrokAvailable(),
     liteModel: process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning',
     deepModel: process.env.XGROK_DEEP_MODEL || 'grok-4-0709',
+    thinkingModel: process.env.XGROK_THINKING_MODEL || 'grok-4-1-fast-reasoning',
   };
 }
 
