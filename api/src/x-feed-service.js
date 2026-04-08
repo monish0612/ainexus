@@ -50,6 +50,46 @@ const VISION_CONCURRENCY = 3;
 const VISION_MAX_RETRIES = 2;
 const VISION_MAX_IMAGES_PER_RUN = 20;
 
+async function _callLiteLLMFallback({ messages, temperature = 0.7, maxTokens = 4096, timeoutMs = 60_000 }) {
+  const baseUrl = String(process.env.LITELLM_URL || '').replace(/\/$/, '');
+  if (!baseUrl) throw new Error('LITELLM_URL not configured — cannot fallback');
+
+  const key = process.env.LITELLM_VIRTUAL_KEY || process.env.LITELLM_API_KEY;
+  const headers = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key.trim()}`;
+
+  let model = null;
+  try {
+    const raw = process.env._LITELLM_MODEL_PRIORITY;
+    if (raw) {
+      const list = JSON.parse(raw);
+      if (list.length > 0) model = list[0];
+    }
+  } catch {}
+
+  const body = { messages, max_tokens: maxTokens, temperature };
+  if (model) body.model = model;
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`LiteLLM fallback ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  return {
+    content: data.choices?.[0]?.message?.content || '',
+    model_used: data.model || model || 'litellm-fallback',
+    usage: data.usage || null,
+  };
+}
+
 // ── State ───────────────────────────────────────────────────────────────
 
 let _pool = null;
@@ -703,10 +743,28 @@ async function generateDigest(handleConfig, fetchResult, dateLong, dateShort, vi
 
   const { system, user } = buildSummarizerPrompts(handleConfig, dateLong, dateShort, postsContent, fetchResult.postsFound);
 
-  const result = await withRetry(
-    () => xgrokComplete({ model, messages: [{ role: 'system', content: system }, { role: 'user', content: user }], temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
-    { maxAttempts: 3, tag: 'X-FEED/summarize', label: `digest ${label}` },
-  );
+  const digestMessages = [{ role: 'system', content: system }, { role: 'user', content: user }];
+
+  let result;
+  try {
+    result = await withRetry(
+      () => xgrokComplete({ model, messages: digestMessages, temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
+      { maxAttempts: 3, tag: 'X-FEED/summarize', label: `digest ${label}` },
+    );
+  } catch (xgrokErr) {
+    const xgrokElapsed = Date.now() - t0;
+    tg.w('X-FEED/summarize', `xGrok FAILED for ${label} ${xgrokElapsed}ms — falling back to LiteLLM: ${xgrokErr.message?.slice(0, 120)}`);
+    try {
+      result = await withRetry(
+        () => _callLiteLLMFallback({ messages: digestMessages, temperature: 0.4, maxTokens: 8000, timeoutMs: SUMMARIZE_TIMEOUT_MS }),
+        { maxAttempts: 3, tag: 'X-FEED/summarize', label: `LiteLLM-fallback ${label}` },
+      );
+      tg.i('X-FEED/summarize', `✓ LiteLLM fallback SUCCEEDED for ${label} model=${result.model_used} ${Date.now() - t0}ms`);
+    } catch (litellmErr) {
+      tg.e('X-FEED/summarize', `LiteLLM fallback ALSO failed for ${label} ${Date.now() - t0}ms — no digest possible`, litellmErr);
+      return null;
+    }
+  }
 
   const elapsed = Date.now() - t0;
   const content = result.content || '';

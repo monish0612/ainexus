@@ -1646,19 +1646,34 @@ aiRouter.post('/summarize', async (req, res, next) => {
       { role: 'user', content: `URL: ${url}\n\nExtracted content:\n${content.slice(0, 10000)}` },
     ];
 
-    const llmResult = useXGrokSummarize
-      ? await xgrokComplete({
+    let llmResult;
+    if (useXGrokSummarize) {
+      try {
+        llmResult = await xgrokComplete({
           model: xgrokSummarizeModel || resolveXGrokModel('lite'),
           messages: summarizeMessages,
           maxTokens: 3000,
           temperature: 0.3,
-        })
-      : await callLiteLLM({
+        });
+      } catch (xgrokErr) {
+        const xgrokElapsed = Date.now() - _t0;
+        tg.w('AI/summarize', `xGrok FAILED ${xgrokElapsed}ms — falling back to LiteLLM: ${xgrokErr.message?.slice(0, 120)}`);
+        llmResult = await callLiteLLM({
           model: val.data.model || undefined,
           messages: summarizeMessages,
           maxTokens: 3000,
           temperature: 0.3,
         });
+        tg.i('AI/summarize', `✓ LiteLLM fallback SUCCEEDED model=${llmResult.model_used} ${Date.now() - _t0}ms`);
+      }
+    } else {
+      llmResult = await callLiteLLM({
+        model: val.data.model || undefined,
+        messages: summarizeMessages,
+        maxTokens: 3000,
+        temperature: 0.3,
+      });
+    }
 
     const parsed = parseJsonContent(llmResult.content);
     console.log('[SUMMARIZE] LLM keys:', Object.keys(parsed || {}));
@@ -1689,7 +1704,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
 
 // POST /api/v1/ai/smart-parse
 const AISmartParseSchema = z.object({
-  text: z.string().min(2).max(5000),
+  text: z.string().min(2).max(6000),
 });
 
 aiRouter.post('/smart-parse', async (req, res, next) => {
@@ -1984,10 +1999,44 @@ aiRouter.post('/search-followup', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (converseErr) {
+      } catch (primaryErr) {
+        const elapsedPrimary = Date.now() - _t0;
+        tg.w('AI/search-followup', `Primary ${providerTag} FAILED ${elapsedPrimary}ms — attempting cross-provider fallback`, primaryErr);
+
+        const canFallbackToGemini = useXGrok && isGroundingAvailable();
+        const canFallbackToXGrok = !useXGrok && isXGrokAvailable();
+        const fallbackOpts = { timeoutMs: 90000, maxTokens: 8192, temperature: 0.7 };
+
+        if (canFallbackToGemini) {
+          try {
+            const fbResult = await groundedConverse(turns, systemInstruction, fallbackOpts);
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/search-followup', `✓ Cross-fallback xgrok→gemini SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/search-followup', `Cross-fallback gemini ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        } else if (canFallbackToXGrok) {
+          try {
+            const xModel = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+            const fbResult = await xgrokConverse(turns, systemInstruction, { ...fallbackOpts, model: xModel });
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/search-followup', `✓ Cross-fallback gemini→xgrok SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/search-followup', `Cross-fallback xgrok ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        }
+
         _inflight.delete(cacheKey);
-        tg.w('AI/search-followup', `${providerTag} exhausted, notifying user via LLM model=${modelTag}`, converseErr);
-        const fb = await _notifyGroundingError(converseErr);
+        tg.e('AI/search-followup', `ALL providers exhausted ${Date.now() - _t0}ms — delivering LLM error notice`);
+        const fb = await _notifyGroundingError(primaryErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -2137,10 +2186,44 @@ aiRouter.post('/deep-research', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (converseErr) {
+      } catch (primaryErr) {
+        const elapsedPrimary = Date.now() - _t0;
+        tg.w('AI/deep-research', `Primary ${providerTag} FAILED ${elapsedPrimary}ms — attempting cross-provider fallback`, primaryErr);
+
+        const canFallbackToGemini = useXGrok && isGroundingAvailable();
+        const canFallbackToXGrok = !useXGrok && isXGrokAvailable();
+        const fallbackDeepOpts = { timeoutMs: 120000, maxTokens: 8192, temperature: 0.5 };
+
+        if (canFallbackToGemini) {
+          try {
+            const fbResult = await groundedConverse(turns, systemInstruction, fallbackDeepOpts);
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/deep-research', `✓ Cross-fallback xgrok→gemini SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/deep-research', `Cross-fallback gemini ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        } else if (canFallbackToXGrok) {
+          try {
+            const xModel = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+            const fbResult = await xgrokConverse(turns, systemInstruction, { ...fallbackDeepOpts, model: xModel });
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/deep-research', `✓ Cross-fallback gemini→xgrok SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/deep-research', `Cross-fallback xgrok ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        }
+
         _inflight.delete(cacheKey);
-        tg.w('AI/deep-research', `${providerTag} exhausted, notifying user via LLM model=${resolvedModel || 'default'}`, converseErr);
-        const fb = await _notifyGroundingError(converseErr);
+        tg.e('AI/deep-research', `ALL providers exhausted ${Date.now() - _t0}ms — delivering LLM error notice`);
+        const fb = await _notifyGroundingError(primaryErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -2239,10 +2322,44 @@ aiRouter.post('/article-followup', async (req, res, next) => {
         await _putToDbCache(cacheKey, payload);
         _inflight.delete(cacheKey);
         return payload;
-      } catch (converseErr) {
+      } catch (primaryErr) {
+        const elapsedPrimary = Date.now() - _t0;
+        tg.w('AI/article-followup', `Primary ${providerTag} FAILED ${elapsedPrimary}ms — attempting cross-provider fallback`, primaryErr);
+
+        const canFallbackToGemini = useXGrok && isGroundingAvailable();
+        const canFallbackToXGrok = !useXGrok && isXGrokAvailable();
+        const fallbackOpts = { timeoutMs: 90000, maxTokens: 8192, temperature: 0.7 };
+
+        if (canFallbackToGemini) {
+          try {
+            const fbResult = await groundedConverse(turns, systemInstruction, fallbackOpts);
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/article-followup', `✓ Cross-fallback xgrok→gemini SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/article-followup', `Cross-fallback gemini ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        } else if (canFallbackToXGrok) {
+          try {
+            const xModel = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+            const fbResult = await xgrokConverse(turns, systemInstruction, { ...fallbackOpts, model: xModel });
+            const fbElapsed = Date.now() - _t0;
+            tg.i('AI/article-followup', `✓ Cross-fallback gemini→xgrok SUCCEEDED ${fbElapsed}ms model=${fbResult.model}`);
+            const payload = { answer: fbResult.text, model: fbResult.model, sources: fbResult.sources || [], searchQueries: fbResult.searchQueries || [] };
+            await _putToDbCache(cacheKey, payload);
+            _inflight.delete(cacheKey);
+            return payload;
+          } catch (fbErr) {
+            tg.e('AI/article-followup', `Cross-fallback xgrok ALSO failed ${Date.now() - _t0}ms`, fbErr);
+          }
+        }
+
         _inflight.delete(cacheKey);
-        tg.w('AI/article-followup', `${providerTag} exhausted, notifying user via LLM model=${modelTag}`, converseErr);
-        const fb = await _notifyGroundingError(converseErr);
+        tg.e('AI/article-followup', `ALL providers exhausted ${Date.now() - _t0}ms — delivering LLM error notice`);
+        const fb = await _notifyGroundingError(primaryErr);
         return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
       }
     })();
@@ -2639,6 +2756,126 @@ appSettingsRouter.put('/', async (req, res, next) => {
 });
 
 app.use('/api/v1/app-settings', appSettingsRouter);
+
+// ═══════════════════════════════════════════════════════════════
+//  ROUTES — USER PREFERENCES  /api/v1/user-preferences
+//
+//  Cross-device settings sync. Stores user-facing preferences
+//  (theme, xGrok toggle, model names, provider choices, banks)
+//  so every device converges to the same state.
+//
+//  Separate from app_settings (which controls backend pipelines).
+// ═══════════════════════════════════════════════════════════════
+
+const userPreferencesRouter = express.Router();
+
+const MAX_PREF_KEY_LEN = 64;
+const MAX_PREF_VALUE_LEN = 8192;
+const MAX_PREF_BATCH_SIZE = 30;
+
+// ── GET /  →  { key: value, … } ─────────────────────────────
+
+userPreferencesRouter.get('/', async (_req, res, next) => {
+  const t0 = Date.now();
+  try {
+    const { rows } = await pool.query(
+      'SELECT key, value FROM user_preferences ORDER BY key',
+    );
+    const prefs = {};
+    for (const r of rows) prefs[r.key] = r.value;
+    tg.d('UserPrefs', `GET all → ${rows.length} keys (${Date.now() - t0}ms)`);
+    res.json(prefs);
+  } catch (err) {
+    tg.e('UserPrefs', `GET failed (${Date.now() - t0}ms)`, err);
+    next(err);
+  }
+});
+
+// ── PUT /  →  upsert single { key, value } ──────────────────
+
+userPreferencesRouter.put('/', async (req, res, next) => {
+  const t0 = Date.now();
+  try {
+    const { key, value } = req.body;
+    if (!key || typeof key !== 'string' || typeof value !== 'string') {
+      return res.status(400).json({ error: 'key and value (both strings) are required' });
+    }
+    if (key.length > MAX_PREF_KEY_LEN) {
+      return res.status(400).json({ error: `Key exceeds max length (${MAX_PREF_KEY_LEN})` });
+    }
+    if (value.length > MAX_PREF_VALUE_LEN) {
+      return res.status(400).json({ error: `Value exceeds max length (${MAX_PREF_VALUE_LEN})` });
+    }
+
+    await pool.query(
+      `INSERT INTO user_preferences (key, value, updated_at)
+       VALUES ($1, $2, NOW())
+       ON CONFLICT (key) DO UPDATE SET value = $2, updated_at = NOW()`,
+      [key, value],
+    );
+
+    const display = value.length > 60 ? value.slice(0, 60) + '…' : value;
+    tg.d('UserPrefs', `PUT ${key}=${display} (${Date.now() - t0}ms)`);
+    res.json({ ok: true, key, value });
+  } catch (err) {
+    tg.e('UserPrefs', `PUT failed key=${req.body?.key} (${Date.now() - t0}ms)`, err);
+    next(err);
+  }
+});
+
+// ── PUT /batch  →  upsert multiple [{ key, value }, …] ──────
+//    Single multi-row INSERT for maximum throughput.
+
+userPreferencesRouter.put('/batch', async (req, res, next) => {
+  const t0 = Date.now();
+  try {
+    const { entries } = req.body;
+    if (!Array.isArray(entries) || entries.length === 0) {
+      return res.status(400).json({ error: 'entries (non-empty array) is required' });
+    }
+    if (entries.length > MAX_PREF_BATCH_SIZE) {
+      return res.status(400).json({ error: `Batch exceeds max size (${MAX_PREF_BATCH_SIZE})` });
+    }
+
+    for (const entry of entries) {
+      if (!entry.key || typeof entry.key !== 'string' || typeof entry.value !== 'string') {
+        return res.status(400).json({ error: 'Each entry must have key and value (both strings)' });
+      }
+      if (entry.key.length > MAX_PREF_KEY_LEN) {
+        return res.status(400).json({ error: `Key "${entry.key}" exceeds max length` });
+      }
+      if (entry.value.length > MAX_PREF_VALUE_LEN) {
+        return res.status(400).json({ error: `Value for "${entry.key}" exceeds max length` });
+      }
+    }
+
+    // Single multi-row upsert — one round-trip regardless of batch size
+    const valueClauses = [];
+    const params = [];
+    for (let i = 0; i < entries.length; i++) {
+      const ki = i * 2 + 1;
+      const vi = i * 2 + 2;
+      valueClauses.push(`($${ki}, $${vi}, NOW())`);
+      params.push(entries[i].key, entries[i].value);
+    }
+
+    await pool.query(
+      `INSERT INTO user_preferences (key, value, updated_at)
+       VALUES ${valueClauses.join(', ')}
+       ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = EXCLUDED.updated_at`,
+      params,
+    );
+
+    const keys = entries.map((e) => e.key).join(', ');
+    tg.i('UserPrefs', `BATCH PUT ${entries.length} keys [${keys}] (${Date.now() - t0}ms)`);
+    res.json({ ok: true, count: entries.length });
+  } catch (err) {
+    tg.e('UserPrefs', `BATCH PUT failed (${Date.now() - t0}ms)`, err);
+    next(err);
+  }
+});
+
+app.use('/api/v1/user-preferences', userPreferencesRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — SYNC  /api/v1/sync
@@ -3426,6 +3663,15 @@ async function initTables() {
     INSERT INTO app_settings (key, value)
     VALUES ('news_summarize_provider', 'litellm')
     ON CONFLICT (key) DO NOTHING
+  `);
+
+  // ── User preferences (cross-device settings sync) ──────────
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
   `);
 
   console.log('[DB] Tables initialized');

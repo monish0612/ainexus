@@ -58,3 +58,47 @@ export const VISION_MAX_IMAGES_PER_RUN = 20;
 // ── API ────────────────────────────────────────────────────────────────
 
 export const XGROK_API_BASE = 'https://api.x.ai/v1';
+
+// ── LiteLLM fallback (when xGrok is down) ──────────────────────────────
+// Direct HTTP call to the LiteLLM proxy — avoids circular CJS deps.
+// Returns the same { content, model_used, usage } shape as xgrokComplete.
+
+export async function callLiteLLMFallback({ messages, temperature = 0.7, maxTokens = 4096, timeoutMs = 60_000 }) {
+  const baseUrl = String(process.env.LITELLM_URL || '').replace(/\/$/, '');
+  if (!baseUrl) throw new Error('LITELLM_URL not configured — cannot fallback');
+
+  const key = process.env.LITELLM_VIRTUAL_KEY || process.env.LITELLM_API_KEY;
+  const headers = { 'Content-Type': 'application/json' };
+  if (key) headers.Authorization = `Bearer ${key.trim()}`;
+
+  let model = null;
+  try {
+    const raw = process.env._LITELLM_MODEL_PRIORITY;
+    if (raw) {
+      const list = JSON.parse(raw);
+      if (list.length > 0) model = list[0];
+    }
+  } catch {}
+
+  const body = { messages, max_tokens: maxTokens, temperature };
+  if (model) body.model = model;
+
+  const response = await fetch(`${baseUrl}/v1/chat/completions`, {
+    method: 'POST',
+    headers,
+    body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+
+  if (!response.ok) {
+    const text = await response.text();
+    throw new Error(`LiteLLM fallback ${response.status}: ${text.slice(0, 300)}`);
+  }
+
+  const data = await response.json();
+  return {
+    content: data.choices?.[0]?.message?.content || '',
+    model_used: data.model || model || 'litellm-fallback',
+    usage: data.usage || null,
+  };
+}

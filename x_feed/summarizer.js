@@ -11,6 +11,7 @@ import {
   tg,
   xgrokComplete,
   resolveXGrokModel,
+  callLiteLLMFallback,
   SUMMARIZE_TIMEOUT_MS,
 } from './config.js';
 import { withRetry } from './retry.js';
@@ -180,25 +181,54 @@ export async function generateDigest(handleConfig, fetchResult, dateLong, dateSh
     postsFound,
   );
 
-  const result = await withRetry(
-    async () => {
-      return xgrokComplete({
-        model,
-        messages: [
-          { role: 'system', content: system },
-          { role: 'user', content: user },
-        ],
-        temperature: 0.4,
-        maxTokens: 8000,
-        timeoutMs: SUMMARIZE_TIMEOUT_MS,
-      });
-    },
-    {
-      maxAttempts: 3,
-      tag: 'X-FEED/summarize',
-      label: `digest ${label}`,
-    },
-  );
+  const digestMessages = [
+    { role: 'system', content: system },
+    { role: 'user', content: user },
+  ];
+
+  let result;
+  try {
+    result = await withRetry(
+      async () => {
+        return xgrokComplete({
+          model,
+          messages: digestMessages,
+          temperature: 0.4,
+          maxTokens: 8000,
+          timeoutMs: SUMMARIZE_TIMEOUT_MS,
+        });
+      },
+      {
+        maxAttempts: 3,
+        tag: 'X-FEED/summarize',
+        label: `digest ${label}`,
+      },
+    );
+  } catch (xgrokErr) {
+    const xgrokElapsed = Date.now() - t0;
+    tg.w('X-FEED/summarize', `xGrok FAILED for ${label} ${xgrokElapsed}ms — falling back to LiteLLM: ${xgrokErr.message?.slice(0, 120)}`);
+    try {
+      result = await withRetry(
+        async () => {
+          return callLiteLLMFallback({
+            messages: digestMessages,
+            temperature: 0.4,
+            maxTokens: 8000,
+            timeoutMs: SUMMARIZE_TIMEOUT_MS,
+          });
+        },
+        {
+          maxAttempts: 3,
+          tag: 'X-FEED/summarize',
+          label: `LiteLLM-fallback ${label}`,
+        },
+      );
+      tg.i('X-FEED/summarize', `✓ LiteLLM fallback SUCCEEDED for ${label} model=${result.model_used} ${Date.now() - t0}ms`);
+    } catch (litellmErr) {
+      tg.e('X-FEED/summarize', `LiteLLM fallback ALSO failed for ${label} ${Date.now() - t0}ms — no digest possible`, litellmErr);
+      return null;
+    }
+  }
 
   const elapsed = Date.now() - t0;
   const content = result.content || '';
