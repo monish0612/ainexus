@@ -13,17 +13,60 @@ const { tg } = require('./telegram');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-const GROUNDING_MODELS = (process.env.GROUNDING_MODELS || '')
+// Mutable model list — populated dynamically from LiteLLM discovery.
+// Falls back to GROUNDING_MODELS env var only until discovery completes.
+let _groundingModels = (process.env.GROUNDING_MODELS || '')
   .split(',')
   .map(m => m.trim())
   .filter(Boolean);
 
-if (GROUNDING_MODELS.length === 0) {
-  console.warn('[Grounding] ⚠️  GROUNDING_MODELS env var not set — grounding endpoints will fail until configured');
+let _proModel = process.env.GEMINI_PRO_MODEL || '';
+
+if (_groundingModels.length === 0) {
+  console.warn('[Grounding] ⚠️  No grounding models yet — waiting for LiteLLM discovery');
+}
+
+/**
+ * Update grounding models dynamically (called from LiteLLM discovery).
+ * Extracts Gemini models from the LiteLLM model list, strips the "gemini/"
+ * prefix so they work with the direct Gemini REST API.
+ *
+ * @param {string[]} litellmModels - Full model IDs from LiteLLM /v1/models
+ */
+function updateGroundingModels(litellmModels) {
+  const geminiModels = litellmModels
+    .filter(m => m.toLowerCase().startsWith('gemini/'))
+    .map(m => m.replace(/^gemini\//i, ''));
+
+  if (geminiModels.length === 0) return;
+
+  // Sort: prefer non-lite models first (better reasoning for grounding),
+  // then by version descending
+  geminiModels.sort((a, b) => {
+    const aLite = a.includes('lite') ? 1 : 0;
+    const bLite = b.includes('lite') ? 1 : 0;
+    if (aLite !== bLite) return aLite - bLite;
+    const verA = parseFloat((a.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]);
+    const verB = parseFloat((b.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]);
+    return verB - verA;
+  });
+
+  const changed = JSON.stringify(geminiModels) !== JSON.stringify(_groundingModels);
+  _groundingModels = geminiModels;
+
+  // Auto-detect a "pro" model if one is available
+  const proCandidate = geminiModels.find(m => m.includes('pro'));
+  if (proCandidate) _proModel = proCandidate;
+
+  if (changed) {
+    console.log(`[Grounding] Models updated from LiteLLM: [${_groundingModels.join(', ')}]` +
+      (_proModel ? ` | pro=${_proModel}` : ''));
+    tg.i('Grounding', `Models from LiteLLM: [${_groundingModels.join(', ')}]${_proModel ? ` pro=${_proModel}` : ''}`);
+  }
 }
 
 const DEFAULTS = {
-  temperature: 1.0,
+  temperature: 0.3,
   maxOutputTokens: 4096,
   timeoutMs: 30000,
 };
@@ -38,7 +81,7 @@ function getApiKey() {
 
 function pickModel(preferred) {
   if (preferred) return preferred;
-  return GROUNDING_MODELS[0];
+  return _groundingModels[0];
 }
 
 class GroundingError extends Error {
@@ -89,6 +132,49 @@ function parseGroundingResponse(data) {
   };
 }
 
+// ── Real-time system instruction builder ───────────────────────
+
+/**
+ * Build a system instruction that injects current date/time and mandates
+ * aggressive Google Search usage for real-time accuracy.
+ *
+ * @param {string} [baseInstruction] - Additional context (e.g. "The user previously searched for X")
+ * @returns {string}
+ */
+function buildGroundingSystemInstruction(baseInstruction) {
+  const now = new Date();
+  const utc = now.toISOString().replace('T', ' ').slice(0, 19) + ' UTC';
+  const ist = new Date(now.getTime() + 5.5 * 3600000)
+    .toISOString().replace('T', ' ').slice(0, 19) + ' IST';
+
+  const lines = [
+    'You are an expert real-time research assistant with access to Google Search.',
+    '',
+    `Current date and time: ${utc} (${ist}).`,
+    '',
+    'CORE RULES (follow for EVERY response):',
+    '- You MUST use Google Search for EVERY query, without exception.',
+    '- NEVER rely on your training data alone — it may be outdated.',
+    '- For ANY query involving "now", "current", "live", "today", "tonight", "latest",',
+    '  "happening", "upcoming", scores, news, events, prices, weather, stocks, sports,',
+    '  schedules, or ANY time-sensitive topic: search AGGRESSIVELY.',
+    '- Perform a FRESH Google Search even if prior messages discussed the same topic.',
+    '- NEVER say "no information available", "no match scheduled", "I don\'t have data",',
+    '  or similar WITHOUT first confirming via a live Google Search.',
+    '- When the user says "today", interpret it as the CURRENT DATE shown above.',
+    '- Include specific dates, times, and live status in your answers when relevant.',
+    '- Cite your sources inline.',
+    '- Provide comprehensive, well-structured answers with markdown formatting.',
+    '- Use bullet points for lists.',
+  ];
+
+  if (baseInstruction) {
+    lines.push('', baseInstruction);
+  }
+
+  return lines.join('\n');
+}
+
 // ── Core: Single grounded call ─────────────────────────────────
 
 async function _groundedCallOnce(modelId, body, timeoutMs) {
@@ -128,7 +214,7 @@ async function groundedGenerate({
   maxOutputTokens,
   timeoutMs,
 }) {
-  const models = model ? [model] : [...GROUNDING_MODELS];
+  const models = model ? [model] : [..._groundingModels];
   const temp = temperature ?? DEFAULTS.temperature;
   const maxTok = maxOutputTokens ?? DEFAULTS.maxOutputTokens;
   const timeout = timeoutMs ?? DEFAULTS.timeoutMs;
@@ -175,23 +261,20 @@ async function groundedGenerate({
  * @param {string} query - The user's search query
  * @param {object} [options]
  * @param {string} [options.model] - Override Gemini model
- * @param {number} [options.temperature=1.0]
+ * @param {number} [options.temperature=0.3]
  * @param {number} [options.maxTokens=4096]
  * @param {number} [options.timeoutMs=30000]
  * @returns {Promise<GroundedSearchResult>}
  */
 async function groundedSearch(query, options = {}) {
   const t0 = Date.now();
-  const modelHint = options.model || GROUNDING_MODELS[0] || 'default';
+  const modelHint = options.model || _groundingModels[0] || 'default';
   console.log(`[Grounding] Search → model=${modelHint}, q="${query.slice(0, 80)}"`);
   tg.d('GroundedSearch', `model=${modelHint} q="${query.slice(0, 80)}"`);
 
   const result = await groundedGenerate({
     prompt: query,
-    systemInstruction:
-      'You are a helpful research assistant. Answer the user\'s question using the Google Search tool. ' +
-      'Provide a comprehensive, well-structured answer. Use bullet points for lists. ' +
-      'Always cite your sources inline.',
+    systemInstruction: buildGroundingSystemInstruction(),
     model: options.model,
     temperature: options.temperature,
     maxOutputTokens: options.maxTokens,
@@ -216,7 +299,7 @@ async function groundedSearch(query, options = {}) {
  */
 async function groundedExtract(url, title, options = {}) {
   const t0 = Date.now();
-  const modelHint = options.model || GROUNDING_MODELS[0] || 'default';
+  const modelHint = options.model || _groundingModels[0] || 'default';
   const query = title
     ? `Provide the full detailed content and key information from this article: "${title}" (${url})`
     : `Retrieve and summarize the full content from this URL: ${url}`;
@@ -269,9 +352,9 @@ async function groundedExtract(url, title, options = {}) {
  */
 async function groundedConverse(history, systemInstruction, options = {}) {
   const primaryModel = options.model
-    || process.env.GEMINI_PRO_MODEL
-    || GROUNDING_MODELS[0];
-  const fallbackModels = GROUNDING_MODELS.filter(m => m !== primaryModel);
+    || _proModel
+    || _groundingModels[0];
+  const fallbackModels = _groundingModels.filter(m => m !== primaryModel);
   const allModels = [primaryModel, ...fallbackModels].filter(Boolean);
 
   if (allModels.length === 0) {
@@ -394,7 +477,7 @@ function isGroundingAvailable() {
  * @returns {string|undefined} model ID or undefined (let groundedConverse pick its default)
  */
 function resolveGroundingMode(mode, deepModel) {
-  if (mode === 'lite' && GROUNDING_MODELS.length > 0) return GROUNDING_MODELS[0];
+  if (mode === 'lite' && _groundingModels.length > 0) return _groundingModels[0];
   if (deepModel) return deepModel;
   return undefined;
 }
@@ -404,9 +487,9 @@ function resolveGroundingMode(mode, deepModel) {
  */
 function getGroundingConfig() {
   return {
-    liteModel: GROUNDING_MODELS[0] || null,
-    proModel: process.env.GEMINI_PRO_MODEL || GROUNDING_MODELS[0] || null,
-    allGroundingModels: [...GROUNDING_MODELS],
+    liteModel: _groundingModels[0] || null,
+    proModel: _proModel || _groundingModels[0] || null,
+    allGroundingModels: [..._groundingModels],
   };
 }
 
@@ -415,6 +498,8 @@ module.exports = {
   groundedExtract,
   groundedGenerate,
   groundedConverse,
+  buildGroundingSystemInstruction,
+  updateGroundingModels,
   isGroundingAvailable,
   resolveGroundingMode,
   getGroundingConfig,

@@ -22,6 +22,7 @@ const {
   groundedSearch,
   groundedExtract,
   groundedConverse,
+  updateGroundingModels,
   isGroundingAvailable,
   resolveGroundingMode,
   getGroundingConfig,
@@ -161,6 +162,8 @@ async function discoverLiteLLMModels() {
     modelPriorityList = _sortModelPriority(models);
     process.env._LITELLM_MODEL_PRIORITY = JSON.stringify(modelPriorityList);
     _discoveryAttempts = 0;
+
+    updateGroundingModels(models);
 
     const primary = modelPriorityList[0];
     const fallbacks = modelPriorityList.slice(1);
