@@ -563,18 +563,31 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
 async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }) {
   const feedT0 = Date.now();
   try {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 15000);
     let xml;
-    try {
-      const res = await fetch(feed.url, {
-        signal: controller.signal,
-        headers: { Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8', 'User-Agent': 'Nexus-AI-News/1.0' },
-      });
-      if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
-      xml = await res.text();
-    } finally {
-      clearTimeout(timeout);
+    const maxFeedRetries = 2;
+    for (let attempt = 0; attempt <= maxFeedRetries; attempt++) {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 20_000);
+      try {
+        const res = await fetch(feed.url, {
+          signal: controller.signal,
+          headers: { Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8', 'User-Agent': 'Nexus-AI-News/1.0' },
+        });
+        if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
+        xml = await res.text();
+        break;
+      } catch (fetchErr) {
+        clearTimeout(timeout);
+        if (attempt < maxFeedRetries) {
+          const delay = (attempt + 1) * 2000;
+          console.warn(`[NEWS] Feed ${feed.id} fetch failed (attempt ${attempt + 1}/${maxFeedRetries + 1}), retrying in ${delay}ms`);
+          await new Promise((r) => setTimeout(r, delay));
+          continue;
+        }
+        throw fetchErr;
+      } finally {
+        clearTimeout(timeout);
+      }
     }
 
     const allItems = parseFeedItems(xml);
@@ -610,7 +623,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
   }
 }
 
-async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtractFn } = {}) {
+async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtractFn, ensureTablesFn } = {}) {
   if (activeSyncPromise) {
     tg.d('NEWS/sync', `Sync already in progress — deduplicating (reason=${reason})`);
     return activeSyncPromise;
@@ -619,6 +632,13 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtra
   activeSyncPromise = (async () => {
     const syncT0 = Date.now();
     tg.d('NEWS/sync', `▶ Starting sync (reason=${reason})`);
+
+    // Pre-check: ensure critical tables exist before querying
+    if (typeof ensureTablesFn === 'function') {
+      try { await ensureTablesFn(); } catch (e) {
+        console.error('[NEWS] Table pre-check failed:', e.message);
+      }
+    }
 
     // Resolve the LLM provider once per sync cycle (not per article).
     let completeFn = null;
@@ -714,7 +734,7 @@ function getSyncState() {
   return { lastSyncAt, lastSyncResult, lastSyncError, inProgress: activeSyncPromise != null };
 }
 
-function startScheduler(pool, { getProviderFn, deepExtractFn } = {}) {
+function startScheduler(pool, { getProviderFn, deepExtractFn, ensureTablesFn } = {}) {
   if (schedulerHandle) return;
   const settings = getSettings(loadConfig());
   const intervalMinutes = Math.max(5, settings.refresh_interval_minutes);
@@ -723,7 +743,7 @@ function startScheduler(pool, { getProviderFn, deepExtractFn } = {}) {
   console.log(`[NEWS] Scheduler starting: interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
   tg.i('NEWS/scheduler', `Starting: interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
 
-  syncNewsFeeds(pool, { reason: 'startup', getProviderFn, deepExtractFn }).catch((e) => {
+  syncNewsFeeds(pool, { reason: 'startup', getProviderFn, deepExtractFn, ensureTablesFn }).catch((e) => {
     console.error('[NEWS] Initial sync failed:', e.message?.slice(0, 120));
     tg.e('NEWS/scheduler', 'Initial startup sync failed', e);
   });
@@ -731,7 +751,7 @@ function startScheduler(pool, { getProviderFn, deepExtractFn } = {}) {
   let consecutiveFailures = 0;
   schedulerHandle = setInterval(async () => {
     try {
-      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn, deepExtractFn });
+      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn, deepExtractFn, ensureTablesFn });
       consecutiveFailures = 0;
     } catch (e) {
       consecutiveFailures++;

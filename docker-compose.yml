@@ -32,7 +32,7 @@ services:
       - ainexus-network
 
   litellm:
-    image: ghcr.io/berriai/litellm:main-latest
+    image: ghcr.io/berriai/litellm:main-stable
     container_name: ainexus-litellm
     restart: unless-stopped
     ports:
@@ -41,12 +41,12 @@ services:
       - ./litellm/litellm_config.yaml:/app/config.yaml
     environment:
       - LITELLM_MASTER_KEY=${LITELLM_MASTER_KEY}
-      - DATABASE_URL=postgresql://ainexus:${DB_PASSWORD}@postgres:5432/ainexus
+      - DATABASE_URL=postgresql://ainexus:${DB_PASSWORD}@postgres:5432/litellm
       - REDIS_HOST=redis
       - REDIS_PORT=6379
       - GOOGLE_API_KEY=${GOOGLE_API_KEY}
       - GROQ_API_KEY=${GROQ_API_KEY}
-    command: ["--config", "/app/config.yaml", "--port", "4000", "--detailed_debug"]
+    command: ["--config", "/app/config.yaml", "--port", "4000"]
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:4000/health"]
       interval: 30s
@@ -70,7 +70,8 @@ services:
       POSTGRES_PASSWORD: ${DB_PASSWORD}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - ./database/init.sql:/docker-entrypoint-initdb.d/init.sql
+      - ./database/01-create-litellm-db.sh:/docker-entrypoint-initdb.d/01-create-litellm-db.sh
+      - ./database/02-init.sql:/docker-entrypoint-initdb.d/02-init.sql
     ports:
       - "5432:5432"
     healthcheck:

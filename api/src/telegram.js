@@ -9,8 +9,8 @@
 //  the server. Queue is capped to prevent memory leaks under load.
 // ═══════════════════════════════════════════════════════════════
 
-const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '5837094484:AAHLHOPIWIW7vuktHFB1zSYeJrUS8I8PFQE';
-const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '671766797';
+const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN || '';
+const CHAT_ID = process.env.TELEGRAM_CHAT_ID || '';
 const API_URL = `https://api.telegram.org/bot${BOT_TOKEN}/sendMessage`;
 
 const BATCH_INTERVAL = 3000;
@@ -62,6 +62,7 @@ function _splitMessage(text) {
 }
 
 async function _flush() {
+  if (!BOT_TOKEN || !CHAT_ID) return;
   if (_flushing || _queue.length === 0) return;
   _flushing = true;
   clearTimeout(_timer);

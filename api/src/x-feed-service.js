@@ -971,6 +971,11 @@ async function runDailySync({ reason = 'scheduled' } = {}) {
     const slot = getCurrentSlot();
     tg.i('X-FEED/sync', `▶ X Feed sync starting (reason=${reason}, slot=${slot}, date=${today})`);
 
+    // Re-ensure tables exist before every sync (guards against external drops)
+    try { await ensureXFeedTable(); } catch (e) {
+      console.error('[X-FEED] Table pre-check failed:', e.message);
+    }
+
     if (!_pool) {
       const msg = 'Database pool not initialized';
       tg.e('X-FEED/sync', msg);

@@ -49,14 +49,45 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const SALT_ROUNDS = 12;
 
+// ── Validate critical env vars at boot ──────────────────────────
+const _REQUIRED_ENV = ['DATABASE_URL', 'JWT_SECRET'];
+for (const key of _REQUIRED_ENV) {
+  if (!process.env[key]) {
+    console.error(`[FATAL] Missing required env var: ${key}`);
+    process.exit(1);
+  }
+}
+
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE
 // ═══════════════════════════════════════════════════════════════
 
-const pool = new Pool({ connectionString: process.env.DATABASE_URL });
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  max: 20,
+  idleTimeoutMillis: 30_000,
+  connectionTimeoutMillis: 10_000,
+  statement_timeout: 30_000,
+  query_timeout: 30_000,
+});
 
 pool.on('error', (err) => {
   console.error('[DB] Unexpected pool error:', err.message);
+  tg.e('DB/pool', 'Unexpected pool error', err);
+});
+
+// ═══════════════════════════════════════════════════════════════
+//  PROCESS-LEVEL ERROR HANDLERS
+// ═══════════════════════════════════════════════════════════════
+
+process.on('unhandledRejection', (reason) => {
+  console.error('[PROCESS] Unhandled rejection:', reason);
+  tg.e('Process', 'Unhandled promise rejection', reason instanceof Error ? reason : new Error(String(reason)));
+});
+
+process.on('uncaughtException', (err) => {
+  console.error('[PROCESS] Uncaught exception:', err.message);
+  tg.fatal('Process', 'Uncaught exception — process may be unstable', err);
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -66,6 +97,17 @@ pool.on('error', (err) => {
 app.use(helmet());
 app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json({ limit: '10mb' }));
+
+const rateLimit = require('express-rate-limit');
+const apiLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 120,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later' },
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+});
+app.use('/api/', apiLimiter);
 
 app.use((req, _res, next) => {
   const ts = new Date().toISOString();
@@ -779,9 +821,15 @@ function normalizeDictionaryResponse(payload, word) {
 app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
-    res.json({ status: 'ok', timestamp: new Date().toISOString() });
+    const tableCheck = await verifyTablesExist();
+    res.json({
+      status: tableCheck.ok ? 'ok' : 'degraded',
+      database: 'connected',
+      tables: tableCheck.ok ? 'all present' : `missing: ${tableCheck.missing.join(', ')}`,
+      timestamp: new Date().toISOString(),
+    });
   } catch (err) {
-    res.status(503).json({ status: 'error', message: err.message });
+    res.status(503).json({ status: 'error', message: 'Database connection failed' });
   }
 });
 
@@ -3640,10 +3688,53 @@ app.use((err, _req, res, _next) => {
 
 // ═══════════════════════════════════════════════════════════════
 //  DATABASE INIT — create tables if missing
+//
+//  Each table is created in its own query so a single failure
+//  does not roll back every table. A periodic health check
+//  (every 5 min) re-runs this if tables disappear at runtime.
 // ═══════════════════════════════════════════════════════════════
 
+const _REQUIRED_TABLES = [
+  'users', 'categories', 'transactions', 'ai_conversations', 'sync_log',
+  'news_articles', 'deleted_guids', 'article_chat_messages',
+  'article_chat_summaries', 'saved_words', 'expenses', 'budget_entries',
+  'category_learnings', 'ai_response_cache', 'app_settings',
+  'user_preferences', 'x_feed_sync_state',
+];
+
+async function _runSafe(label, fn) {
+  try {
+    await fn();
+  } catch (e) {
+    console.error(`[DB] ${label} failed: ${e.message}`);
+    tg.e('DB/init', `${label} failed`, e);
+  }
+}
+
+async function verifyTablesExist() {
+  try {
+    const { rows } = await pool.query(
+      `SELECT tablename FROM pg_tables WHERE schemaname = 'public'`,
+    );
+    const existing = new Set(rows.map((r) => r.tablename));
+    const missing = _REQUIRED_TABLES.filter((t) => !existing.has(t));
+    return { ok: missing.length === 0, missing, existing: [...existing] };
+  } catch (e) {
+    return { ok: false, missing: _REQUIRED_TABLES, existing: [], error: e.message };
+  }
+}
+
 async function initTables() {
-  await pool.query(`
+  const t0 = Date.now();
+
+  // Ensure pgcrypto is available for gen_random_uuid() on older PG versions
+  await _runSafe('pgcrypto extension', () =>
+    pool.query('CREATE EXTENSION IF NOT EXISTS "pgcrypto"'),
+  );
+
+  // ── Core tables (created individually so one failure ≠ all fail) ──
+
+  await _runSafe('users', () => pool.query(`
     CREATE TABLE IF NOT EXISTS users (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name VARCHAR(255) NOT NULL,
@@ -3654,16 +3745,20 @@ async function initTables() {
       member_since TIMESTAMPTZ DEFAULT NOW(),
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('categories', () => pool.query(`
     CREATE TABLE IF NOT EXISTS categories (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       name VARCHAR(100) NOT NULL,
       icon VARCHAR(50),
       color VARCHAR(20),
       sort_order INT DEFAULT 0
-    );
+    )
+  `));
 
+  await _runSafe('transactions', () => pool.query(`
     CREATE TABLE IF NOT EXISTS transactions (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID REFERENCES users(id),
@@ -3675,8 +3770,10 @@ async function initTables() {
       transaction_date TIMESTAMPTZ NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('ai_conversations', () => pool.query(`
     CREATE TABLE IF NOT EXISTS ai_conversations (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID REFERENCES users(id),
@@ -3689,8 +3786,10 @@ async function initTables() {
       messages JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('sync_log', () => pool.query(`
     CREATE TABLE IF NOT EXISTS sync_log (
       id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
       user_id UUID REFERENCES users(id),
@@ -3699,8 +3798,10 @@ async function initTables() {
       operation VARCHAR(20) NOT NULL,
       payload JSONB,
       created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('news_articles', () => pool.query(`
     CREATE TABLE IF NOT EXISTS news_articles (
       id TEXT PRIMARY KEY,
       title TEXT NOT NULL,
@@ -3722,13 +3823,17 @@ async function initTables() {
       published_at TIMESTAMPTZ,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('deleted_guids', () => pool.query(`
     CREATE TABLE IF NOT EXISTS deleted_guids (
       guid TEXT PRIMARY KEY,
       deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('article_chat_messages', () => pool.query(`
     CREATE TABLE IF NOT EXISTS article_chat_messages (
       id TEXT PRIMARY KEY,
       article_id TEXT NOT NULL,
@@ -3737,16 +3842,19 @@ async function initTables() {
       model TEXT DEFAULT '',
       sources_json TEXT NOT NULL DEFAULT '[]',
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
-    CREATE INDEX IF NOT EXISTS idx_acm_article ON article_chat_messages(article_id);
+    )
+  `));
 
+  await _runSafe('article_chat_summaries', () => pool.query(`
     CREATE TABLE IF NOT EXISTS article_chat_summaries (
       article_id TEXT PRIMARY KEY,
       summary_text TEXT NOT NULL,
       pairs_covered INTEGER NOT NULL DEFAULT 0,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('saved_words', () => pool.query(`
     CREATE TABLE IF NOT EXISTS saved_words (
       id TEXT PRIMARY KEY,
       word TEXT NOT NULL,
@@ -3756,8 +3864,10 @@ async function initTables() {
       saved_at TEXT NOT NULL DEFAULT '',
       response_json TEXT NOT NULL DEFAULT '{}',
       created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('expenses', () => pool.query(`
     CREATE TABLE IF NOT EXISTS expenses (
       id TEXT PRIMARY KEY,
       amount DECIMAL(12,2) NOT NULL,
@@ -3769,40 +3879,75 @@ async function initTables() {
       is_manual_category BOOLEAN NOT NULL DEFAULT FALSE,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('budget_entries', () => pool.query(`
     CREATE TABLE IF NOT EXISTS budget_entries (
       id TEXT PRIMARY KEY,
       amount DECIMAL(12,2) NOT NULL,
       set_at TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('category_learnings', () => pool.query(`
     CREATE TABLE IF NOT EXISTS category_learnings (
       keyword TEXT PRIMARY KEY,
       category TEXT NOT NULL,
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
-    );
+    )
+  `));
 
+  await _runSafe('ai_response_cache', () => pool.query(`
     CREATE TABLE IF NOT EXISTS ai_response_cache (
       cache_key TEXT PRIMARY KEY,
       result_json JSONB NOT NULL,
       created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
+  await _runSafe('app_settings', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS app_settings (
+      key   TEXT PRIMARY KEY,
+      value TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
+  await _runSafe('user_preferences', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS user_preferences (
+      key        TEXT PRIMARY KEY,
+      value      TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
+  await _runSafe('x_feed_sync_state', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS x_feed_sync_state (
+      handle TEXT PRIMARY KEY,
+      last_window_end TEXT,
+      last_sync_at TIMESTAMPTZ,
+      total_articles INTEGER NOT NULL DEFAULT 0,
+      total_posts_processed INTEGER NOT NULL DEFAULT 0,
+      last_error TEXT
+    )
+  `));
+
+  // ── Migrate legacy news_articles (id UUID → TEXT) ──────────────
+  await _runSafe('news_articles id→TEXT', async () => {
+    const { rows } = await pool.query(
+      `SELECT data_type FROM information_schema.columns
+       WHERE table_name = 'news_articles' AND column_name = 'id'`,
     );
-    CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_response_cache (created_at);
+    if (rows[0] && rows[0].data_type === 'uuid') {
+      await pool.query('ALTER TABLE news_articles ALTER COLUMN id TYPE TEXT');
+      console.log('[DB] Changed news_articles.id from UUID to TEXT');
+    }
+  });
 
-  `);
-
-  // Fix column type: old table may have `id UUID` but news-service generates TEXT ids
-  try {
-    await pool.query('ALTER TABLE news_articles ALTER COLUMN id TYPE TEXT');
-    console.log('[DB] Changed news_articles.id from UUID to TEXT');
-  } catch (e) {
-    // already TEXT or doesn't exist yet — ignore
-  }
-
-  // Migrate existing news_articles table — add columns that may be missing
+  // ── Add columns that may be missing from older schema ──────────
   const colMigrations = [
     ['is_featured', 'BOOLEAN NOT NULL DEFAULT FALSE'],
     ['content_json', "TEXT NOT NULL DEFAULT '{}'"],
@@ -3826,64 +3971,95 @@ async function initTables() {
   ];
 
   for (const [col, def] of colMigrations) {
-    try {
-      await pool.query(`ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS ${col} ${def}`);
-    } catch (e) {
-      // column already exists — ignore
-    }
+    await _runSafe(`news_articles.${col}`, () =>
+      pool.query(`ALTER TABLE news_articles ADD COLUMN IF NOT EXISTS ${col} ${def}`),
+    );
   }
 
-  // Create indexes after migration so columns are guaranteed to exist
-  try {
-    await pool.query(`
-      CREATE UNIQUE INDEX IF NOT EXISTS idx_news_guid ON news_articles(guid);
-      CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
-      CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at);
-    `);
-  } catch (e) {
-    console.warn('[DB] Index creation warning:', e.message);
-  }
+  // ── Indexes ────────────────────────────────────────────────────
+  await _runSafe('indexes', () => pool.query(`
+    CREATE INDEX IF NOT EXISTS idx_acm_article ON article_chat_messages(article_id);
+    CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_response_cache(created_at);
+    CREATE UNIQUE INDEX IF NOT EXISTS idx_news_guid ON news_articles(guid);
+    CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
+    CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at)
+  `));
 
-  // ── App-wide settings (key-value store) ──────────────────────
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS app_settings (
-      key   TEXT PRIMARY KEY,
-      value TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  // Seed default: RSS ingestion uses LiteLLM unless overridden
-  await pool.query(`
+  // ── Seed defaults ─────────────────────────────────────────────
+  await _runSafe('seed app_settings', () => pool.query(`
     INSERT INTO app_settings (key, value)
     VALUES ('news_summarize_provider', 'litellm')
     ON CONFLICT (key) DO NOTHING
-  `);
+  `));
 
-  // ── User preferences (cross-device settings sync) ──────────
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS user_preferences (
-      key        TEXT PRIMARY KEY,
-      value      TEXT NOT NULL,
-      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-    )
-  `);
-
-  console.log('[DB] Tables initialized');
+  // ── Verify ────────────────────────────────────────────────────
+  const check = await verifyTablesExist();
+  if (check.ok) {
+    console.log(`[DB] All ${_REQUIRED_TABLES.length} tables initialized (${Date.now() - t0}ms)`);
+    tg.i('DB/init', `✓ All ${_REQUIRED_TABLES.length} tables ready (${Date.now() - t0}ms)`);
+  } else {
+    const msg = `CRITICAL: ${check.missing.length} tables still missing after init: ${check.missing.join(', ')}`;
+    console.error(`[DB] ${msg}`);
+    tg.e('DB/init', msg);
+  }
 }
+
+// ── Periodic table health check (auto-recovery) ────────────────
+let _tableHealthOk = true;
+const _TABLE_HEALTH_INTERVAL_MS = 5 * 60 * 1000;
+
+setInterval(async () => {
+  try {
+    const check = await verifyTablesExist();
+    if (!check.ok) {
+      if (_tableHealthOk) {
+        tg.e('DB/health', `Tables disappeared! Missing: ${check.missing.join(', ')} — auto-recovering`);
+      }
+      _tableHealthOk = false;
+      console.warn(`[DB] Health check: ${check.missing.length} tables missing — running initTables()`);
+      await initTables();
+    } else if (!_tableHealthOk) {
+      _tableHealthOk = true;
+      tg.i('DB/health', '✓ Tables recovered after auto-repair');
+      console.log('[DB] Health check: all tables restored');
+    }
+  } catch (e) {
+    console.error('[DB] Health check error:', e.message);
+  }
+}, _TABLE_HEALTH_INTERVAL_MS).unref();
 
 // ═══════════════════════════════════════════════════════════════
 //  START
 // ═══════════════════════════════════════════════════════════════
 
+async function _initTablesWithRetry(maxRetries = 3) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      await initTables();
+      const check = await verifyTablesExist();
+      if (check.ok) return;
+      if (attempt < maxRetries) {
+        const delay = attempt * 2000;
+        console.warn(`[DB] ${check.missing.length} tables missing after attempt ${attempt}/${maxRetries}, retrying in ${delay}ms…`);
+        await new Promise((r) => setTimeout(r, delay));
+      }
+    } catch (err) {
+      if (attempt === maxRetries) throw err;
+      const delay = attempt * 2000;
+      console.error(`[DB] Init attempt ${attempt}/${maxRetries} failed: ${err.message}, retrying in ${delay}ms…`);
+      await new Promise((r) => setTimeout(r, delay));
+    }
+  }
+}
+
 (async () => {
   try {
-    await initTables();
+    await _initTablesWithRetry(3);
     await discoverLiteLLMModels();
 
     // ── Register LLM providers for plug-and-play news ingestion ──
     registerProvider('litellm', {
-      complete: async () => null, // sentinel: news-service uses its own built-in callLiteLLM
+      complete: async () => null,
       isAvailable: () => true,
       timeoutMs: 35_000,
     });
@@ -3909,7 +4085,7 @@ async function initTables() {
       },
       isAvailable: () => isXGrokAvailable(),
       timeoutMs: 55_000,
-      hasOwnRetry: true, // xgrok.js callXGrok already retries 3x internally
+      hasOwnRetry: true,
     });
 
     const registeredProviders = listProviders();
@@ -3917,13 +4093,17 @@ async function initTables() {
     tg.i('Providers', `Registered: ${registeredProviders.join(', ')}`);
 
     // ── Start news scheduler with provider resolution ────────────
-    startScheduler(pool, { getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent });
+    startScheduler(pool, {
+      getProviderFn: _resolveNewsProvider,
+      deepExtractFn: deepExtractContent,
+      ensureTablesFn: initTables,
+    });
 
-    // ── Start X Feed scheduler (9 PM IST daily digest) ──────────
+    // ── Start X Feed scheduler (8 AM + 9 PM IST daily digest) ───
     await startXFeedScheduler(pool);
   } catch (err) {
     console.error('[INIT] Startup error:', err.message);
-    tg.e('Startup', 'Init failed', err);
+    tg.e('Startup', 'Init failed — server will start but features may be degraded', err);
   }
 
   app.listen(PORT, () => {
@@ -3944,3 +4124,24 @@ async function initTables() {
     tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available} | X-Feed: ${xFeedInfo.schedulerActive}`);
   });
 })();
+
+// ═══════════════════════════════════════════════════════════════
+//  GRACEFUL SHUTDOWN
+// ═══════════════════════════════════════════════════════════════
+
+async function _shutdown(signal) {
+  console.log(`[SHUTDOWN] ${signal} received — draining…`);
+  tg.i('Shutdown', `${signal} received — draining connections`);
+
+  try {
+    await pool.end();
+    console.log('[SHUTDOWN] Database pool closed');
+  } catch (e) {
+    console.error('[SHUTDOWN] Pool close error:', e.message);
+  }
+
+  process.exit(0);
+}
+
+process.on('SIGTERM', () => _shutdown('SIGTERM'));
+process.on('SIGINT', () => _shutdown('SIGINT'));
