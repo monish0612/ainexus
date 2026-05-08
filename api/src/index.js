@@ -2138,21 +2138,21 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
       { role: 'user', content: JSON.stringify({ articles: userPayload }) },
     ];
 
-    // Token budgeting (rev. 2): summary length was bumped from ~30 words to
-    // ~90 words/article (4–6 sentences) — see prompts.js. Each summary is
-    // now ≈120 output tokens. A full batch of 10 articles ≈ 1200 tokens of
-    // summary text + ~400 tokens of JSON envelope (id quoting, brackets,
-    // newlines) = ~1600 tokens nominal. We allow 3800 to leave generous
-    // headroom for the rare verbose batch (long topic + named-entity
-    // density) without ever hitting Flash Lite's 8K output ceiling. Lower
-    // temperature (0.2) keeps the output deterministic and discourages the
-    // model from padding sentences with filler when it thinks creatively.
+    // Token budgeting (rev. 3): summary length bumped again from ~90 to
+    // ~165 words/article (6–9 sentences) — see prompts.js. Each summary
+    // is now ≈220 output tokens. A full batch of 10 articles ≈ 2200
+    // tokens of summary text + ~500 tokens of JSON envelope (id quoting,
+    // brackets, newlines) = ~2700 tokens nominal. We allow 4800 so a
+    // verbose batch (named-entity-dense topics, longer near the 220-word
+    // ceiling) still has ~75% headroom. Flash Lite's 8K output ceiling
+    // is comfortably out of reach. Lower temperature (0.2) keeps the
+    // output deterministic and discourages padding.
     let llmResult;
     try {
       llmResult = await callLiteLLM({
         model: requestedModel || undefined,
         messages,
-        maxTokens: 3800,
+        maxTokens: 4800,
         temperature: 0.2,
       });
     } catch (firstErr) {
@@ -2162,7 +2162,7 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
       tg.w('AI/summarize-batch', `Settings model ${requestedModel || '(none)'} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
       llmResult = await callLiteLLM({
         messages,
-        maxTokens: 3800,
+        maxTokens: 4800,
         temperature: 0.2,
       });
     }
