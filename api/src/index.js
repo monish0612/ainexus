@@ -315,6 +315,32 @@ async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 204
   throw lastError;
 }
 
+// ── LiteLLM model id normalisation ─────────────────────────────
+// Clients send a bare Gemini model id (e.g. "gemini-3.1-flash-lite-preview")
+// because that's what they store in app settings. LiteLLM, however, requires
+// the provider-prefixed form ("gemini/gemini-3.1-flash-lite-preview"). This
+// helper turns a user-facing id into a LiteLLM-routable id while preserving
+// any existing provider prefix the caller already supplied.
+function _normalizeLiteLLMGeminiId(id) {
+  if (typeof id !== 'string') return null;
+  const trimmed = id.trim();
+  if (!trimmed) return null;
+  if (trimmed.includes('/')) return trimmed;
+  return 'gemini/' + trimmed;
+}
+
+// Pick the LiteLLM model id for a "lite" call: `liteModel` from settings wins,
+// then the legacy `model` field (which is already routed/prefixed by callers
+// who set it manually), else null so the caller falls back to its default.
+function _pickLiteLLMModel(liteModel, legacyModel) {
+  const norm = _normalizeLiteLLMGeminiId(liteModel);
+  if (norm) return norm;
+  if (typeof legacyModel === 'string' && legacyModel.trim()) {
+    return legacyModel.trim();
+  }
+  return null;
+}
+
 // ── Public accessors ───────────────────────────────────────────
 
 function getPrimaryModel() {
@@ -439,21 +465,25 @@ const AIRephraseSchema = z.object({
   platform: z.string().min(1),
   intent: z.string().max(500).optional(),
   model: z.string().optional(),
+  liteModel: z.string().max(200).optional(),
 });
 
 const AICorrectSchema = z.object({
   text: z.string().min(1).max(2000),
   model: z.string().optional(),
+  liteModel: z.string().max(200).optional(),
 });
 
 const AIDefineSchema = z.object({
   word: z.string().min(1).max(100),
   model: z.string().optional(),
+  liteModel: z.string().max(200).optional(),
 });
 
 const AISummarizeSchema = z.object({
   url: z.string().url().max(2000),
   model: z.string().optional(),
+  liteModel: z.string().max(200).optional(),
 });
 
 // Batch quick-summary for the For You "catch up" pile (Gemini Flash Lite).
@@ -467,6 +497,7 @@ const AISummarizeArticlesBatchSchema = z.object({
     content: z.string().max(4000),
   })).min(1).max(12),
   model: z.string().optional(),
+  liteModel: z.string().max(200).optional(),
 });
 
 // Bulk mark-as-read for the For You "Clear All" / "Done" flows.
@@ -1133,6 +1164,67 @@ function _invalidateProviderCache() {
   _providerCache.expiresAt = 0;
 }
 
+// ── Settings-model resolvers (from user_preferences) ──────────────
+//
+// These power the news-service scheduler and any internal job that needs
+// to honour the user's settings.liteModel / settings.xgrokLiteModel.
+// Cached with a short TTL so a hot scheduler loop doesn't hammer Postgres.
+const _settingsModelCache = {
+  liteModel: { value: null, expiresAt: 0 },
+  xgrokLiteModel: { value: null, expiresAt: 0 },
+};
+const _SETTINGS_MODEL_TTL_MS = 30_000;
+
+async function _readUserPreference(key) {
+  const { rows } = await pool.query(
+    'SELECT value FROM user_preferences WHERE key = $1',
+    [key],
+  );
+  const raw = rows[0]?.value;
+  if (typeof raw !== 'string') return null;
+  const trimmed = raw.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/** Reads `lite_model` from user_preferences and prefixes for LiteLLM routing. */
+async function getConfiguredLiteModel() {
+  const cache = _settingsModelCache.liteModel;
+  if (cache.expiresAt > Date.now()) return cache.value;
+  try {
+    const raw = await _readUserPreference('lite_model');
+    const normalized = _normalizeLiteLLMGeminiId(raw);
+    cache.value = normalized;
+    cache.expiresAt = Date.now() + _SETTINGS_MODEL_TTL_MS;
+    return normalized;
+  } catch (e) {
+    cache.expiresAt = Date.now() + 5_000; // shorter TTL on error
+    tg.w('Settings', 'Failed to read user_preferences.lite_model — using fallback', e);
+    return null;
+  }
+}
+
+/** Reads `xgrok_lite_model` from user_preferences (raw, no prefixing). */
+async function getConfiguredXGrokLiteModel() {
+  const cache = _settingsModelCache.xgrokLiteModel;
+  if (cache.expiresAt > Date.now()) return cache.value;
+  try {
+    const raw = await _readUserPreference('xgrok_lite_model');
+    cache.value = raw;
+    cache.expiresAt = Date.now() + _SETTINGS_MODEL_TTL_MS;
+    return raw;
+  } catch (e) {
+    cache.expiresAt = Date.now() + 5_000;
+    tg.w('Settings', 'Failed to read user_preferences.xgrok_lite_model — using fallback', e);
+    return null;
+  }
+}
+
+/** Bust the cache when the client just pushed a new value (called from /user-preferences). */
+function _invalidateSettingsModelCache() {
+  _settingsModelCache.liteModel.expiresAt = 0;
+  _settingsModelCache.xgrokLiteModel.expiresAt = 0;
+}
+
 function _cleanArticleMarkdown(md) {
   if (!md) return md;
   return md
@@ -1201,7 +1293,13 @@ newsRouter.get('/', async (_req, res, next) => {
 
 newsRouter.post('/refresh', async (_req, res, next) => {
   try {
-    const result = await syncNewsFeeds(pool, { reason: 'manual', getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent });
+    const result = await syncNewsFeeds(pool, {
+      reason: 'manual',
+      getProviderFn: _resolveNewsProvider,
+      getLiteModelFn: getConfiguredLiteModel,
+      getXGrokLiteModelFn: getConfiguredXGrokLiteModel,
+      deepExtractFn: deepExtractContent,
+    });
     const rows = await pool.query(
       `SELECT * FROM news_articles
        ORDER BY is_featured DESC, COALESCE(published_at, created_at) DESC, updated_at DESC`,
@@ -1326,7 +1424,13 @@ newsRouter.post('/force-resync', async (_req, res, next) => {
       ? require('path').resolve(__dirname, '../../news_rss_feeds.json')
       : require('path').resolve(__dirname, '../news_rss_feeds.json');
     const config = JSON.parse(require('fs').readFileSync(feedsPath, 'utf8'));
-    syncNewsFeeds(pool, { reason: 'force-resync', getProviderFn: _resolveNewsProvider, deepExtractFn: deepExtractContent }).catch((e) => console.error('[NEWS] force-resync error:', e));
+    syncNewsFeeds(pool, {
+      reason: 'force-resync',
+      getProviderFn: _resolveNewsProvider,
+      getLiteModelFn: getConfiguredLiteModel,
+      getXGrokLiteModelFn: getConfiguredXGrokLiteModel,
+      deepExtractFn: deepExtractContent,
+    }).catch((e) => console.error('[NEWS] force-resync error:', e));
     res.json({ deleted: del.rowCount, message: 'All non-saved articles removed. Re-fetching with new prompts in background.' });
   } catch (err) {
     next(err);
@@ -1384,10 +1488,11 @@ aiRouter.post('/rephrase', async (req, res, next) => {
     const platformId = normalizeRephrasePlatformId(val.data.platform) || 'casual';
     const intent = asString(val.data.intent || '').trim();
     const systemPrompt = buildRephraseSystemPrompt(platformId, intent);
-    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${(val.data.text || '').length}`);
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
+    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${(val.data.text || '').length}, model=${pickedModel || '(default)'}`);
 
     const result = await callLiteLLM({
-      model: val.data.model || undefined,
+      model: pickedModel || undefined,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: val.data.text },
@@ -1419,10 +1524,11 @@ aiRouter.post('/correct', async (req, res, next) => {
   try {
     const val = validate(AICorrectSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
-    tg.d('AI/correct', `textLen=${(val.data.text || '').length}`);
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
+    tg.d('AI/correct', `textLen=${(val.data.text || '').length}, model=${pickedModel || '(default)'}`);
 
     const result = await callLiteLLM({
-      model: val.data.model || undefined,
+      model: pickedModel || undefined,
       messages: [
         { role: 'system', content: COACH_SYSTEM_PROMPT },
         { role: 'user', content: val.data.text },
@@ -1503,12 +1609,13 @@ aiRouter.post('/define', async (req, res, next) => {
   try {
     const val = validate(AIDefineSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
-    tg.d('AI/define', `word="${val.data.word}"`);
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
+    tg.d('AI/define', `word="${val.data.word}", model=${pickedModel || '(default)'}`);
 
     const systemPrompt = buildDictionarySystemPrompt(val.data.word);
 
     const result = await callLiteLLM({
-      model: val.data.model || undefined,
+      model: pickedModel || undefined,
       messages: [
         { role: 'system', content: systemPrompt },
         { role: 'user', content: val.data.word },
@@ -1865,7 +1972,8 @@ aiRouter.post('/summarize', async (req, res, next) => {
 
     const url = val.data.url;
     const wantXGrok = req.body.provider === 'xgrok';
-    tg.d('AI/summarize', `▶ url="${url.slice(0, 80)}" provider=${req.body.provider || 'litellm'} wantXGrok=${wantXGrok}`);
+    const pickedLiteLLMModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
+    tg.d('AI/summarize', `▶ url="${url.slice(0, 80)}" provider=${req.body.provider || 'litellm'} wantXGrok=${wantXGrok} model=${pickedLiteLLMModel || '(default)'}`);
 
     // ── Stages 1–4: Deep content extraction ──────────────────────────
     const extracted = await deepExtractContent(url, { logTag: 'AI/summarize' });
@@ -1925,7 +2033,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
         const _s5b = Date.now();
         try {
           llmResult = await callLiteLLM({
-            model: val.data.model || undefined,
+            model: pickedLiteLLMModel || undefined,
             messages: summarizeMessages,
             maxTokens: 3000,
             temperature: 0.3,
@@ -1941,7 +2049,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
     } else {
       const _s5 = Date.now();
       llmResult = await callLiteLLM({
-        model: val.data.model || undefined,
+        model: pickedLiteLLMModel || undefined,
         messages: summarizeMessages,
         maxTokens: 3000,
         temperature: 0.3,
@@ -1999,9 +2107,23 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const { articles } = val.data;
-    const requestedModel = val.data.model || 'gemini/gemini-2.5-flash-lite';
+    // Hard rule: the user's settings.liteModel is the source of truth. Only
+    // fall back to a server-resolved model when the client has somehow
+    // omitted both `liteModel` and the legacy `model` field — this should
+    // never happen in normal operation because the Flutter SettingsController
+    // always seeds liteModel before any AI call.
+    let requestedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
+    if (!requestedModel) {
+      const dbModel = await getConfiguredLiteModel();
+      if (dbModel) {
+        tg.w('AI/summarize-batch', `Client omitted liteModel — using server-cached settings model ${dbModel}`);
+        requestedModel = dbModel;
+      } else {
+        tg.w('AI/summarize-batch', 'No liteModel set anywhere — falling back to LiteLLM priority list');
+      }
+    }
 
-    tg.d('AI/summarize-batch', `▶ ${articles.length} articles model=${requestedModel}`);
+    tg.d('AI/summarize-batch', `▶ ${articles.length} articles model=${requestedModel || '(priority-list)'}`);
 
     const userPayload = articles.map((a) => ({
       id: a.id,
@@ -2025,16 +2147,16 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
     let llmResult;
     try {
       llmResult = await callLiteLLM({
-        model: requestedModel,
+        model: requestedModel || undefined,
         messages,
         maxTokens: 2200,
         temperature: 0.2,
       });
     } catch (firstErr) {
-      // Lite-only call may have hit a transient error or model-not-found —
-      // retry once with the priority list so we still serve a response if
-      // Flash Lite itself is unavailable.
-      tg.w('AI/summarize-batch', `Primary model ${requestedModel} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
+      // Settings-model failed (likely transient or temporarily missing on
+      // LiteLLM). Retry once with the discovered priority list so the user
+      // still gets a response — but logged loudly so we can investigate.
+      tg.w('AI/summarize-batch', `Settings model ${requestedModel || '(none)'} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
       llmResult = await callLiteLLM({
         messages,
         maxTokens: 2200,
@@ -2087,6 +2209,7 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
 // POST /api/v1/ai/smart-parse
 const AISmartParseSchema = z.object({
   text: z.string().min(2).max(6000),
+  liteModel: z.string().max(200).optional(),
 });
 
 aiRouter.post('/smart-parse', async (req, res, next) => {
@@ -2096,10 +2219,12 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const { text } = val.data;
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
     console.log('[AI] smart-parse →', text);
-    tg.d('AI/smart-parse', `text="${text.slice(0, 60)}"`);
+    tg.d('AI/smart-parse', `text="${text.slice(0, 60)}", model=${pickedModel || '(default)'}`);
 
     const result = await callLiteLLM({
+      model: pickedModel || undefined,
       messages: [
         { role: 'system', content: SMART_PARSE_SYSTEM_PROMPT },
         { role: 'user', content: text },
@@ -2136,6 +2261,7 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
 // POST /api/v1/ai/categorize
 const AICategorizeSchema = z.object({
   description: z.string().min(2).max(500),
+  liteModel: z.string().max(200).optional(),
 });
 
 aiRouter.post('/search', async (req, res, next) => {
@@ -2224,6 +2350,7 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
       xgrokModel,
       mode,
       deepModel,
+      liteModel,
       xgrokLiteModel,
       xgrokDeepModel,
       xgrokThinkingModel,
@@ -2247,7 +2374,7 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
     // precedence as raw overrides for callers that don't yet send `mode`.
     const resolvedGeminiModel = model
       ? String(model)
-      : resolveGroundingMode(effMode, deepModel);
+      : resolveGroundingMode(effMode, deepModel, liteModel);
     const resolvedXGrokModel = resolveXGrokModel(
       effMode,
       xgrokLiteModel || xgrokModel,
@@ -2302,7 +2429,7 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
       if (canFallbackToGemini) {
         try {
           result = await groundedSearch(trimmedQ, {
-            model: resolveGroundingMode('lite'),
+            model: resolveGroundingMode('lite', undefined, liteModel),
             timeoutMs: 30000,
           });
           usedProvider = 'gemini (fallback)';
@@ -2365,7 +2492,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { query, initialAnswer, question, history, model, mode, deepModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
+    const { query, initialAnswer, question, history, model, mode, deepModel, liteModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -2379,7 +2506,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
 
     const resolvedModel = useXGrok
       ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel)
-      : (model ? String(model) : resolveGroundingMode(mode, deepModel));
+      : (model ? String(model) : resolveGroundingMode(mode, deepModel, liteModel));
     const safeQuery = String(query || '').slice(0, 500);
     const trimmedQ = String(question).trim();
     const histLen = Array.isArray(history) ? history.length : 0;
@@ -2701,7 +2828,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
   const _t0 = Date.now();
   let modelTag = 'default';
   try {
-    const { articleUrl, articleTitle, question, history, model, mode, deepModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
+    const { articleUrl, articleTitle, question, history, model, mode, deepModel, liteModel, provider, searchRequired, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel } = req.body || {};
 
     if (!question || String(question).trim().length < 2) {
       return res.status(400).json({ error: 'question is required (min 2 chars)' });
@@ -2715,7 +2842,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
 
     const resolvedModel = useXGrok
       ? resolveXGrokModel(mode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel)
-      : (model ? String(model) : resolveGroundingMode(mode, deepModel));
+      : (model ? String(model) : resolveGroundingMode(mode, deepModel, liteModel));
     const safeTitle = String(articleTitle || 'this article').slice(0, 200);
     const safeUrl = String(articleUrl || '').slice(0, 500);
     const trimmedQ = String(question).trim();
@@ -2850,10 +2977,12 @@ aiRouter.post('/categorize', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     const { description } = val.data;
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
     console.log('[AI] categorize →', description);
-    tg.d('AI/categorize', `desc="${description.slice(0, 60)}"`);
+    tg.d('AI/categorize', `desc="${description.slice(0, 60)}", model=${pickedModel || '(default)'}`);
 
     const result = await callLiteLLM({
+      model: pickedModel || undefined,
       messages: [
         { role: 'system', content: CATEGORIZE_SYSTEM_PROMPT },
         { role: 'user', content: description },
@@ -2890,11 +3019,12 @@ aiRouter.post('/categorize', async (req, res, next) => {
 aiRouter.post('/summarize-history', async (req, res, next) => {
   const _t0 = Date.now();
   try {
-    const { messages, articleContext } = req.body || {};
+    const { messages, articleContext, liteModel } = req.body || {};
 
     if (!Array.isArray(messages) || messages.length < 2) {
       return res.status(400).json({ error: 'messages array required (min 2 entries)' });
     }
+    const pickedModel = _pickLiteLLMModel(liteModel, undefined);
 
     const liteLLMMessages = [
       {
@@ -2923,9 +3053,10 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
     });
 
     console.log(`[SummarizeHistory] ${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}"`);
-    tg.d('AI/summarize-history', `${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}"`);
+    tg.d('AI/summarize-history', `${messages.length} msgs, ctx="${(articleContext || '').slice(0, 50)}", model=${pickedModel || '(default)'}`);
 
     const result = await callLiteLLM({
+      model: pickedModel || undefined,
       messages: liteLLMMessages,
       maxTokens: 1024,
       temperature: 0.3,
@@ -3277,6 +3408,13 @@ userPreferencesRouter.put('/', async (req, res, next) => {
       [key, value],
     );
 
+    if (key === 'lite_model' || key === 'xgrok_lite_model') {
+      _invalidateSettingsModelCache();
+    }
+    if (key === 'news_summarize_provider') {
+      _invalidateProviderCache();
+    }
+
     const display = value.length > 60 ? value.slice(0, 60) + '…' : value;
     tg.d('UserPrefs', `PUT ${key}=${display} (${Date.now() - t0}ms)`);
     res.json({ ok: true, key, value });
@@ -3329,8 +3467,15 @@ userPreferencesRouter.put('/batch', async (req, res, next) => {
       params,
     );
 
-    const keys = entries.map((e) => e.key).join(', ');
-    tg.i('UserPrefs', `BATCH PUT ${entries.length} keys [${keys}] (${Date.now() - t0}ms)`);
+    const keys = entries.map((e) => e.key);
+    if (keys.includes('lite_model') || keys.includes('xgrok_lite_model')) {
+      _invalidateSettingsModelCache();
+    }
+    if (keys.includes('news_summarize_provider')) {
+      _invalidateProviderCache();
+    }
+
+    tg.i('UserPrefs', `BATCH PUT ${entries.length} keys [${keys.join(', ')}] (${Date.now() - t0}ms)`);
     res.json({ ok: true, count: entries.length });
   } catch (err) {
     tg.e('UserPrefs', `BATCH PUT failed (${Date.now() - t0}ms)`, err);
@@ -4286,7 +4431,12 @@ async function _initTablesWithRetry(maxRetries = 3) {
 
     registerProvider('xgrok', {
       complete: async (msgs, opts) => {
-        const model = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
+        // Prefer the model passed from the caller (resolved from
+        // user_preferences.xgrok_lite_model). Falls back to env then to
+        // the historic default — but the caller almost always supplies one.
+        const model = (typeof opts?.model === 'string' && opts.model.trim())
+          || process.env.XGROK_LITE_MODEL
+          || 'grok-4-1-fast-non-reasoning';
         const t0 = Date.now();
         try {
           const result = await xgrokComplete({
@@ -4315,6 +4465,8 @@ async function _initTablesWithRetry(maxRetries = 3) {
     // ── Start news scheduler with provider resolution ────────────
     startScheduler(pool, {
       getProviderFn: _resolveNewsProvider,
+      getLiteModelFn: getConfiguredLiteModel,
+      getXGrokLiteModelFn: getConfiguredXGrokLiteModel,
       deepExtractFn: deepExtractContent,
       ensureTablesFn: initTables,
     });

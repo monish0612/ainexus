@@ -469,16 +469,34 @@ function isGroundingAvailable() {
 }
 
 /**
+ * Strip a "gemini/" prefix that LiteLLM uses but the direct Gemini REST API
+ * does not expect. Returns null if the cleaned value is empty.
+ */
+function _stripGeminiPrefix(value) {
+  if (typeof value !== 'string') return null;
+  const trimmed = value.trim();
+  if (!trimmed) return null;
+  return trimmed.replace(/^gemini\//i, '');
+}
+
+/**
  * Resolve a UI mode ("lite" / "deep") to the actual Gemini model.
  * Flutter sends mode instead of a model name so nothing is hardcoded client-side.
  *
  * @param {string|undefined} mode   - "lite" or "deep" (default)
  * @param {string|undefined} deepModel - client-configured deep model (from app settings)
+ * @param {string|undefined} liteModel - client-configured lite model (from app settings)
  * @returns {string|undefined} model ID or undefined (let groundedConverse pick its default)
  */
-function resolveGroundingMode(mode, deepModel) {
-  if (mode === 'lite' && _groundingModels.length > 0) return _groundingModels[0];
-  if (deepModel) return deepModel;
+function resolveGroundingMode(mode, deepModel, liteModel) {
+  if (mode === 'lite') {
+    const cleanedLite = _stripGeminiPrefix(liteModel);
+    if (cleanedLite) return cleanedLite;
+    if (_groundingModels.length > 0) return _groundingModels[0];
+    return undefined;
+  }
+  const cleanedDeep = _stripGeminiPrefix(deepModel);
+  if (cleanedDeep) return cleanedDeep;
   return undefined;
 }
 

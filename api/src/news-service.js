@@ -394,7 +394,7 @@ function fillTemplate(tpl, title, content) {
   return String(tpl || '').replaceAll('{title}', title).replaceAll('{content}', content);
 }
 
-async function generateSummary({ title, content, imageUrl, promptKey, settings, config, completeFn, fallbackCompleteFn }) {
+async function generateSummary({ title, content, imageUrl, promptKey, settings, config, completeFn, fallbackCompleteFn, liteModel, xgrokLiteModel }) {
   if (!content || content.trim().length < 100) return null;
 
   const pcfg = config[promptKey] || config.summary_prompt || {};
@@ -408,9 +408,20 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
     content.slice(0, limit),
   );
 
-  const _litellmComplete = (msgs, opts) => callLiteLLM(preferredModel(), msgs, opts);
-  const _primaryComplete = completeFn || _litellmComplete;
-  const _fallbackComplete = fallbackCompleteFn || (completeFn ? _litellmComplete : null);
+  // Honour the user's settings.liteModel for ALL server-side LiteLLM calls.
+  // Falls back to the discovered priority list only when the setting is unset
+  // (e.g. on a fresh server before any client has synced their preferences).
+  const _litellmComplete = (msgs, opts) =>
+    callLiteLLM(liteModel || preferredModel(), msgs, opts);
+  // For external providers (xGrok), prefer the user's configured xgrokLiteModel
+  // so xGrok-routed news summaries also match what the Settings page shows.
+  const _externalComplete = completeFn
+    ? (msgs, opts) => completeFn(msgs, { ...opts, model: xgrokLiteModel || opts.model })
+    : null;
+  const _primaryComplete = _externalComplete || _litellmComplete;
+  const _fallbackComplete = fallbackCompleteFn
+    ? (msgs, opts) => fallbackCompleteFn(msgs, { ...opts, model: liteModel || opts.model })
+    : (completeFn ? _litellmComplete : null);
 
   const buildMsgs = (useImg) => {
     const msgs = [{ role: 'system', content: sys }];
@@ -478,7 +489,7 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
   }
 }
 
-async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }) {
+async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }) {
   const existing = await pool.query('SELECT id FROM news_articles WHERE guid = $1', [item.guid]);
   if (existing.rows.length > 0) return false;
 
@@ -521,6 +532,8 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
       config,
       completeFn,
       fallbackCompleteFn,
+      liteModel,
+      xgrokLiteModel,
     });
     if (settings.api_delay_seconds > 0) await sleep(settings.api_delay_seconds * 1000);
     return gen;
@@ -560,7 +573,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   return true;
 }
 
-async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }) {
+async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }) {
   const feedT0 = Date.now();
   try {
     let xml;
@@ -603,7 +616,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
 
     const results = await Promise.all(
       items.map((item) =>
-        processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn }).catch((e) => {
+        processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }).catch((e) => {
           console.error(`[NEWS] Item failed (${feed.id}):`, e.message?.slice(0, 120));
           tg.w('NEWS/item', `Item fail feed=${feed.id} "${item?.title?.slice(0, 40) || '?'}"`, e);
           return false;
@@ -623,7 +636,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
   }
 }
 
-async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtractFn, ensureTablesFn } = {}) {
+async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn } = {}) {
   if (activeSyncPromise) {
     tg.d('NEWS/sync', `Sync already in progress — deduplicating (reason=${reason})`);
     return activeSyncPromise;
@@ -640,6 +653,27 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtra
       }
     }
 
+    // Resolve the user's configured lite/xgrok-lite models ONCE per cycle.
+    // This drives the model used for every article summary in this sync,
+    // matching what the Settings page on every device will report.
+    let liteModel = null;
+    let xgrokLiteModel = null;
+    if (typeof getLiteModelFn === 'function') {
+      try {
+        liteModel = await getLiteModelFn();
+      } catch (e) {
+        tg.w('NEWS/sync', 'getLiteModelFn failed — falling back to LiteLLM priority', e);
+      }
+    }
+    if (typeof getXGrokLiteModelFn === 'function') {
+      try {
+        xgrokLiteModel = await getXGrokLiteModelFn();
+      } catch (e) {
+        tg.w('NEWS/sync', 'getXGrokLiteModelFn failed — falling back to env default', e);
+      }
+    }
+    tg.d('NEWS/sync', `Models resolved: lite=${liteModel || '(priority-list)'} xgrokLite=${xgrokLiteModel || '(env-default)'}`);
+
     // Resolve the LLM provider once per sync cycle (not per article).
     let completeFn = null;
     let fallbackCompleteFn = null;
@@ -651,10 +685,11 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtra
         if (provider && typeof provider.complete === 'function') {
           completeFn = provider.complete;
           providerName = provider.name || 'external';
-          // When using an external provider, litellm is the automatic fallback
-          fallbackCompleteFn = (msgs, opts) => callLiteLLM(preferredModel(), msgs, opts);
+          // When using an external provider, litellm is the automatic fallback.
+          // The fallback also uses the user's settings.liteModel.
+          fallbackCompleteFn = (msgs, opts) => callLiteLLM(liteModel || preferredModel(), msgs, opts);
           console.log(`[NEWS] Using LLM provider: ${providerName} (with litellm fallback)`);
-          tg.i('NEWS/sync', `Provider resolved: ${providerName} (litellm fallback ready) for reason=${reason}`);
+          tg.i('NEWS/sync', `Provider resolved: ${providerName} (litellm fallback ready, liteModel=${liteModel || '(priority)'}) for reason=${reason}`);
         }
       } catch (e) {
         console.warn(`[NEWS] getProviderFn failed, falling back to LiteLLM:`, e.message?.slice(0, 100));
@@ -673,7 +708,7 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, deepExtra
     await Promise.all(
       feeds.map((feed) =>
         feedLimiter(async () => {
-          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn });
+          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel });
           counts[feed.id] = n;
           total += n;
         }),
@@ -734,7 +769,7 @@ function getSyncState() {
   return { lastSyncAt, lastSyncResult, lastSyncError, inProgress: activeSyncPromise != null };
 }
 
-function startScheduler(pool, { getProviderFn, deepExtractFn, ensureTablesFn } = {}) {
+function startScheduler(pool, { getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn } = {}) {
   if (schedulerHandle) return;
   const settings = getSettings(loadConfig());
   const intervalMinutes = Math.max(5, settings.refresh_interval_minutes);
@@ -743,7 +778,7 @@ function startScheduler(pool, { getProviderFn, deepExtractFn, ensureTablesFn } =
   console.log(`[NEWS] Scheduler starting: interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
   tg.i('NEWS/scheduler', `Starting: interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
 
-  syncNewsFeeds(pool, { reason: 'startup', getProviderFn, deepExtractFn, ensureTablesFn }).catch((e) => {
+  syncNewsFeeds(pool, { reason: 'startup', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn }).catch((e) => {
     console.error('[NEWS] Initial sync failed:', e.message?.slice(0, 120));
     tg.e('NEWS/scheduler', 'Initial startup sync failed', e);
   });
@@ -751,7 +786,7 @@ function startScheduler(pool, { getProviderFn, deepExtractFn, ensureTablesFn } =
   let consecutiveFailures = 0;
   schedulerHandle = setInterval(async () => {
     try {
-      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn, deepExtractFn, ensureTablesFn });
+      await syncNewsFeeds(pool, { reason: 'scheduled', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn });
       consecutiveFailures = 0;
     } catch (e) {
       consecutiveFailures++;
