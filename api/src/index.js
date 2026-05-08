@@ -15,6 +15,7 @@ const {
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,
   buildSummarizerSystemPrompt,
+  buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
   CATEGORIZE_SYSTEM_PROMPT,
 } = require('./prompts');
@@ -453,6 +454,25 @@ const AIDefineSchema = z.object({
 const AISummarizeSchema = z.object({
   url: z.string().url().max(2000),
   model: z.string().optional(),
+});
+
+// Batch quick-summary for the For You "catch up" pile (Gemini Flash Lite).
+// Client sends already-extracted text; server only does the LLM call.
+const AISummarizeArticlesBatchSchema = z.object({
+  articles: z.array(z.object({
+    id: z.string().min(1).max(200),
+    title: z.string().min(1).max(500),
+    source: z.string().max(120).optional(),
+    category: z.string().max(60).optional(),
+    content: z.string().max(4000),
+  })).min(1).max(12),
+  model: z.string().optional(),
+});
+
+// Bulk mark-as-read for the For You "Clear All" / "Done" flows.
+// Idempotent. Never touches saved=TRUE.
+const NewsMarkAllReadSchema = z.object({
+  ids: z.array(z.string().min(1).max(200)).min(1).max(500),
 });
 
 const SyncPushSchema = z.object({
@@ -1234,6 +1254,43 @@ newsRouter.post('/:id/read', async (req, res, next) => {
   }
 });
 
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/v1/news/mark-all-read
+//
+// Bulk mark-as-read for the For You "Clear All" / summary "Done" flows.
+// Idempotent: takes an explicit id list (max 500) and only updates rows that
+// are NOT saved (saved=TRUE rows are never touched, matching the UX promise
+// that the Saved tab is preserved end-to-end).
+// ─────────────────────────────────────────────────────────────────────────
+newsRouter.post('/mark-all-read', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const v = validate(NewsMarkAllReadSchema, req.body);
+    if (!v.ok) {
+      tg.w('News/mark-all-read', `validation failed: ${v.error?.slice?.(0, 120) || 'unknown'}`);
+      return res.status(400).json({ error: v.error });
+    }
+
+    const { ids } = v.data;
+    tg.d('News/mark-all-read', `▶ ${ids.length} ids`);
+    const result = await pool.query(
+      'UPDATE news_articles SET read = TRUE, updated_at = NOW() WHERE id = ANY($1::text[]) AND saved = FALSE',
+      [ids],
+    );
+    // Bumped d→i so the daily Telegram digest shows when the For You /
+    // catch-up clear-out fires in production. Saved-row protection is
+    // surfaced explicitly (requested - updated = saved-or-missing rows).
+    tg.i(
+      'News/mark-all-read',
+      `✓ requested=${ids.length} updated=${result.rowCount} skipped=${ids.length - result.rowCount} ${Date.now() - _t0}ms`,
+    );
+    res.json({ requested: ids.length, updated: result.rowCount, ok: true });
+  } catch (err) {
+    tg.e('News/mark-all-read', `FATAL ${Date.now() - _t0}ms ids=${req.body?.ids?.length || 0}: ${err.message?.slice(0, 200)}`, err);
+    next(err);
+  }
+});
+
 newsRouter.delete('/cleanup-mock', async (_req, res, next) => {
   try {
     const result = await pool.query(
@@ -1923,6 +1980,110 @@ aiRouter.post('/summarize', async (req, res, next) => {
   }
 });
 
+// ═══════════════════════════════════════════════════════════════════════
+//  POST /api/v1/ai/summarize-articles-batch
+//
+//  Batch quick-summary for the News > For You "catch up" feature. Caller
+//  sends N already-extracted articles (title + condensed body) and we
+//  return a 1-2 sentence summary per id using Gemini 2.5 Flash Lite via
+//  LiteLLM (with automatic cascading fallback to other models if Lite is
+//  down — handled by callLiteLLM's model-priority list).
+//
+//  The Flutter client batches client-side (10 per request, 4 concurrent)
+//  so this endpoint stays simple and fast: one LLM round-trip per request.
+// ═══════════════════════════════════════════════════════════════════════
+aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const val = validate(AISummarizeArticlesBatchSchema, req.body);
+    if (!val.ok) return res.status(400).json({ error: val.error });
+
+    const { articles } = val.data;
+    const requestedModel = val.data.model || 'gemini/gemini-2.5-flash-lite';
+
+    tg.d('AI/summarize-batch', `▶ ${articles.length} articles model=${requestedModel}`);
+
+    const userPayload = articles.map((a) => ({
+      id: a.id,
+      title: a.title,
+      source: a.source || '',
+      category: a.category || '',
+      content: a.content,
+    }));
+
+    const messages = [
+      { role: 'system', content: buildBatchArticleSummaryPrompt() },
+      { role: 'user', content: JSON.stringify({ articles: userPayload }) },
+    ];
+
+    // Token budgeting: 12 articles × ~70 tokens of summary + JSON envelope ≈
+    // 1100 tokens. We give ~2200 to leave headroom for the rare verbose
+    // batch (e.g. all 12 articles need a longer 2-sentence summary), while
+    // staying well under Flash Lite's 8K output ceiling. Lower temperature
+    // (0.2) makes the output more deterministic — the model is less prone
+    // to padding sentences with filler when it thinks creatively.
+    let llmResult;
+    try {
+      llmResult = await callLiteLLM({
+        model: requestedModel,
+        messages,
+        maxTokens: 2200,
+        temperature: 0.2,
+      });
+    } catch (firstErr) {
+      // Lite-only call may have hit a transient error or model-not-found —
+      // retry once with the priority list so we still serve a response if
+      // Flash Lite itself is unavailable.
+      tg.w('AI/summarize-batch', `Primary model ${requestedModel} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
+      llmResult = await callLiteLLM({
+        messages,
+        maxTokens: 2200,
+        temperature: 0.2,
+      });
+    }
+
+    let parsed;
+    try {
+      parsed = parseJsonContent(llmResult.content);
+    } catch (parseErr) {
+      tg.w('AI/summarize-batch', `JSON parse failed model=${llmResult.model_used} contentLen=${llmResult.content?.length || 0}: ${parseErr.message?.slice(0, 100)}`);
+      parsed = { summaries: [] };
+    }
+
+    // Build a Map keyed by id so we tolerate model reordering / dropped items.
+    const byId = new Map();
+    const rawArr = Array.isArray(parsed?.summaries) ? parsed.summaries : [];
+    for (const item of rawArr) {
+      if (!item || typeof item !== 'object') continue;
+      const id = asString(item.id);
+      const summary = asString(item.summary);
+      if (id && summary) byId.set(id, summary);
+    }
+
+    // Always echo every requested id; fill missing with a safe headline-only fallback
+    // so the client can render something instead of getting a 200 with gaps.
+    const summaries = articles.map((a) => ({
+      id: a.id,
+      summary: byId.get(a.id) || `Headline: ${a.title}`,
+    }));
+
+    const elapsed = Date.now() - _t0;
+    const fallbacks = articles.length - byId.size;
+    tg.i('AI/summarize-batch', `✓ ${articles.length} articles ${elapsed}ms model=${llmResult.model_used} fallback=${fallbacks}`);
+
+    res.json({
+      summaries,
+      model: llmResult.model_used,
+      count: articles.length,
+      fallbackCount: fallbacks,
+      usage: llmResult.usage,
+    });
+  } catch (err) {
+    tg.e('AI/summarize-batch', `FATAL ${Date.now() - _t0}ms count=${req.body?.articles?.length || 0}: ${err.message?.slice(0, 200)}`, err);
+    next(err);
+  }
+});
+
 // POST /api/v1/ai/smart-parse
 const AISmartParseSchema = z.object({
   text: z.string().min(2).max(6000),
@@ -2038,11 +2199,35 @@ aiRouter.post('/search', async (req, res, next) => {
 // POST /api/v1/ai/grounded-search  (Gemini + Google Search  OR  xGrok + web_search)
 // Production-grade: primary provider → cross-provider fallback → LLM error notice.
 // Both xgrokSearch and groundedSearch have internal retries (3× with backoff).
+//
+// Body params:
+//   query              required, the search query (min 2 chars)
+//   provider           optional, 'xgrok' to prefer xGrok, else Gemini
+//   mode               optional, 'lite' (default) | 'deep' | 'thinking'
+//   model              optional legacy, raw Gemini model override
+//   xgrokModel         optional legacy, raw xGrok model override (treated as lite)
+//   deepModel          optional, Gemini deep model id when mode='deep'
+//   xgrokLiteModel     optional, xGrok lite model id when mode='lite'
+//   xgrokDeepModel     optional, xGrok deep model id when mode='deep'
+//   xgrokThinkingModel optional, xGrok thinking model id when mode='thinking'
+//
+// Default mode is 'lite' to preserve historical behaviour for callers that
+// only sent {query, provider, xgrokModel?}.
 aiRouter.post('/grounded-search', async (req, res, next) => {
   const _t0 = Date.now();
   let providerTag = 'gemini';
   try {
-    const { query, model, provider, xgrokModel } = req.body || {};
+    const {
+      query,
+      model,
+      provider,
+      xgrokModel,
+      mode,
+      deepModel,
+      xgrokLiteModel,
+      xgrokDeepModel,
+      xgrokThinkingModel,
+    } = req.body || {};
     if (!query || String(query).trim().length < 2) {
       return res.status(400).json({ error: 'query is required (min 2 chars)' });
     }
@@ -2054,7 +2239,30 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
     const hasGemini = isGroundingAvailable();
     const hasXGrok = isXGrokAvailable();
 
-    tg.d('AI/grounded-search', `provider=${providerTag} model=${model || xgrokModel || 'default'} q="${trimmedQ.slice(0, 80)}" gemini=${hasGemini} xgrok=${hasXGrok}`);
+    // Normalise mode: lite is the safe default (matches legacy behaviour).
+    const effMode = (mode === 'deep' || mode === 'thinking') ? mode : 'lite';
+    const isDeep = effMode !== 'lite';
+
+    // Resolve provider-specific models. Legacy `model`/`xgrokModel` take
+    // precedence as raw overrides for callers that don't yet send `mode`.
+    const resolvedGeminiModel = model
+      ? String(model)
+      : resolveGroundingMode(effMode, deepModel);
+    const resolvedXGrokModel = resolveXGrokModel(
+      effMode,
+      xgrokLiteModel || xgrokModel,
+      xgrokDeepModel,
+      xgrokThinkingModel,
+    );
+
+    // Adaptive timeouts — deep / thinking models need significantly longer.
+    // These are upper bounds; the providers' own retries still apply within.
+    const geminiTimeoutMs = isDeep ? 75000 : 30000;
+    const xgrokTimeoutMs = isDeep ? 120000 : 75000;
+
+    tg.d('AI/grounded-search',
+      `provider=${providerTag} mode=${effMode} model=${useXGrok ? resolvedXGrokModel : (resolvedGeminiModel || 'default')} `
+      + `q="${trimmedQ.slice(0, 80)}" gemini=${hasGemini} xgrok=${hasXGrok}`);
 
     if (!useXGrok && !hasGemini) {
       tg.e('AI/grounded-search', `No provider available: gemini=${hasGemini} xgrok=${hasXGrok}`);
@@ -2067,25 +2275,36 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
     // ── Primary provider attempt ──────────────────────────────────────
     try {
       if (useXGrok) {
-        const xModel = xgrokModel || process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
-        result = await xgrokSearch(trimmedQ, { model: xModel });
+        result = await xgrokSearch(trimmedQ, {
+          model: resolvedXGrokModel,
+          timeoutMs: xgrokTimeoutMs,
+        });
         if (result.sources) {
           result.sources = result.sources.map((s, i) => ({ index: i, title: s.title || '', url: s.url || '' }));
         }
       } else {
-        result = await groundedSearch(trimmedQ, { model });
+        result = await groundedSearch(trimmedQ, {
+          model: resolvedGeminiModel,
+          timeoutMs: geminiTimeoutMs,
+        });
       }
     } catch (primaryErr) {
       const elapsed = Date.now() - _t0;
-      tg.w('AI/grounded-search', `Primary ${providerTag} failed ${elapsed}ms, attempting cross-provider fallback`, primaryErr);
+      tg.w('AI/grounded-search', `Primary ${providerTag} (${effMode}) failed ${elapsed}ms, attempting cross-provider fallback`, primaryErr);
 
       // ── Cross-provider fallback ───────────────────────────────────
+      // Cross-fallback intentionally drops to LITE on the alternate provider
+      // so the user still gets a result quickly when their preferred
+      // deep/thinking path is unavailable.
       const canFallbackToGemini = useXGrok && hasGemini;
       const canFallbackToXGrok = !useXGrok && hasXGrok;
 
       if (canFallbackToGemini) {
         try {
-          result = await groundedSearch(trimmedQ, { model });
+          result = await groundedSearch(trimmedQ, {
+            model: resolveGroundingMode('lite'),
+            timeoutMs: 30000,
+          });
           usedProvider = 'gemini (fallback)';
           tg.i('AI/grounded-search', `Cross-fallback xgrok→gemini succeeded ${Date.now() - _t0}ms`);
         } catch (fallbackErr) {
@@ -2093,8 +2312,8 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
         }
       } else if (canFallbackToXGrok) {
         try {
-          const xModel = process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning';
-          result = await xgrokSearch(trimmedQ, { model: xModel });
+          const xModel = resolveXGrokModel('lite', xgrokLiteModel || xgrokModel);
+          result = await xgrokSearch(trimmedQ, { model: xModel, timeoutMs: 75000 });
           if (result.sources) {
             result.sources = result.sources.map((s, i) => ({ index: i, title: s.title || '', url: s.url || '' }));
           }
@@ -2114,12 +2333,13 @@ aiRouter.post('/grounded-search', async (req, res, next) => {
 
     const elapsed = Date.now() - _t0;
     if (!result.fallback) {
-      tg.i('AI/grounded-search', `✓ provider=${usedProvider} model=${result.model} ${elapsed}ms, ${(result.sources || []).length} sources`);
+      tg.i('AI/grounded-search', `✓ provider=${usedProvider} mode=${effMode} model=${result.model} ${elapsed}ms, ${(result.sources || []).length} sources`);
     }
     res.json({
       answer: result.text,
       query: trimmedQ,
       model: result.model,
+      mode: effMode,
       searchQueries: result.searchQueries || [],
       sources: result.sources || [],
       citations: result.citations || [],

@@ -405,12 +405,67 @@ const CATEGORIZE_SYSTEM_PROMPT = [
   'No markdown fences. No explanation outside JSON.',
 ].join('\n');
 
+// ── Batch Article Summarizer (For You "catch-up" feature) ──────────────────
+//
+// Used by POST /api/v1/ai/summarize-articles-batch. Client sends N already-
+// extracted articles (title + condensed body) and we ask the model for a
+// short, scannable summary per article so the user can sweep through a big
+// unread pile vertically. Strict JSON output keyed by id so the client can
+// map results back even if order shifts.
+//
+// Production tuning notes:
+//   - Hard 45-word cap per summary keeps the reader card height predictable
+//     (no overflow, no wasted screen real estate when scrolling 200+ items).
+//   - "Echo every id, never drop" rule lets the server treat the response as
+//     a strict mapping; missing ids fall through to a "Headline: <title>"
+//     server-side fallback so the client always renders something.
+//   - The two SUMMARY SHAPES below are explicit so the model has no excuse
+//     to produce empty / one-word / opinion-laden outputs on edge content.
+const BATCH_ARTICLE_SUMMARY_SYSTEM_PROMPT = [
+  'You are a senior news editor writing one-paragraph briefings for a busy reader who is sweeping through a large unread pile.',
+  'You will receive a JSON object with `articles`: an ordered list, each item shaped { id, title, source, category, content }.',
+  '',
+  'For EACH article, write a SHARP, INFORMATION-DENSE summary that lets the reader understand the story without opening it.',
+  '',
+  'SUMMARY SHAPE — pick ONE based on the content:',
+  '  A. NEWSY / EVENT story → Sentence 1 = the concrete WHAT (who did what, the number/decision/outcome).',
+  '                           Sentence 2 = the WHY-IT-MATTERS or NEXT-STEP (impact, context, what to watch).',
+  '  B. ANALYSIS / OPINION  → Sentence 1 = the core thesis stated plainly.',
+  '                           Sentence 2 = the strongest evidence or the practical implication.',
+  '  C. THIN / HEADER-ONLY  → A single sentence prefixed with "Headline: " that paraphrases the title with any',
+  '                           extra signal the body provides. NEVER invent facts that are not in the content.',
+  '',
+  'HARD CONSTRAINTS:',
+  '  - Length: 1–2 sentences, MAX 45 words total. Aim for ~30 words.',
+  '  - Plain English at a high-school reading level. NO jargon, NO acronyms without expansion, NO emojis, NO markdown, NO hashtags.',
+  '  - Active voice. Concrete nouns and verbs. Lead with the most important fact.',
+  '  - NO filler ("In this article…", "The author discusses…", "It is reported that…").',
+  '  - NO hedging ("might", "could be", "seems to") unless the source itself hedges.',
+  '  - PRESERVE specific numbers, names, dates, and locations from the content. They make the summary scannable.',
+  '  - DO NOT add your own opinions, recommendations, or warnings.',
+  '  - NEVER quote a chunk of the article verbatim — paraphrase tightly.',
+  '',
+  'OUTPUT — return STRICT JSON, no markdown fences, no extra commentary, no leading or trailing text:',
+  '{',
+  '  "summaries": [',
+  '    { "id": "<echo the input id EXACTLY as received>", "summary": "<1–2 sentence quick summary>" }',
+  '  ]',
+  '}',
+  '',
+  'COMPLETENESS RULE: You MUST output one entry for EVERY input id, in the SAME order. If the body is empty, paywalled, or unparseable, fall back to shape C (Headline: …). Never skip an id. Never duplicate an id.',
+].join('\n');
+
+function buildBatchArticleSummaryPrompt() {
+  return BATCH_ARTICLE_SUMMARY_SYSTEM_PROMPT;
+}
+
 module.exports = {
   REPHRASE_PLATFORMS,
   buildRephraseSystemPrompt,
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,
   buildSummarizerSystemPrompt,
+  buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
   CATEGORIZE_SYSTEM_PROMPT,
 };
