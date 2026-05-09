@@ -2138,21 +2138,29 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
       { role: 'user', content: JSON.stringify({ articles: userPayload }) },
     ];
 
-    // Token budgeting (rev. 3): summary length bumped again from ~90 to
-    // ~165 words/article (6–9 sentences) — see prompts.js. Each summary
-    // is now ≈220 output tokens. A full batch of 10 articles ≈ 2200
-    // tokens of summary text + ~500 tokens of JSON envelope (id quoting,
-    // brackets, newlines) = ~2700 tokens nominal. We allow 4800 so a
-    // verbose batch (named-entity-dense topics, longer near the 220-word
-    // ceiling) still has ~75% headroom. Flash Lite's 8K output ceiling
-    // is comfortably out of reach. Lower temperature (0.2) keeps the
-    // output deterministic and discourages padding.
+    // Token budgeting (rev. 4): switched from "one giant paragraph" to
+    // structured magazine format (lede + 2-4 body paragraphs separated by
+    // \n\n + optional "• " bullet block). Length range bumped to 220-280
+    // words/article (ceiling 350) — see prompts.js for the structure.
+    //
+    // Token math:
+    //   • 240 words × 10 articles ≈ 2400 words ≈ 3120 output tokens.
+    //   • Structured output adds ~80 tokens/article in JSON envelope
+    //     overhead vs. flat (each "\n\n" is 2 chars, bullet markers
+    //     add 2 chars each, multiple paragraph boundaries add escape
+    //     density). Envelope total ≈ 1000 tokens.
+    //   • Nominal total ≈ 4100 tokens. Verbose batch (350-word ceiling
+    //     hit by every article + lots of bullets) ≈ 5500 tokens.
+    //   • maxTokens 6500 leaves ~18% headroom over verbose case AND stays
+    //     comfortably below Flash Lite's 8K output ceiling.
+    //   • Lower temperature (0.2) keeps output deterministic and
+    //     discourages the model from padding paragraphs with filler.
     let llmResult;
     try {
       llmResult = await callLiteLLM({
         model: requestedModel || undefined,
         messages,
-        maxTokens: 4800,
+        maxTokens: 6500,
         temperature: 0.2,
       });
     } catch (firstErr) {
@@ -2162,7 +2170,7 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
       tg.w('AI/summarize-batch', `Settings model ${requestedModel || '(none)'} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
       llmResult = await callLiteLLM({
         messages,
-        maxTokens: 4800,
+        maxTokens: 6500,
         temperature: 0.2,
       });
     }
