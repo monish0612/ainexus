@@ -3909,6 +3909,56 @@ savedSearchesRouter.get('/', async (_req, res, next) => {
   }
 });
 
+// GET /api/v1/saved-searches/tombstones — incremental delete log
+//
+// Cross-device delete sync: when Device A deletes a saved search, the
+// row is removed AND a tombstone row is written into deleted_saved_searches
+// (id, deleted_at). Device B periodically pulls this endpoint with
+// ?since=<iso-timestamp> to find out which ids it should also remove
+// locally. The watermark advances as Device B observes new tombstones,
+// so the server only ever ships the delta (typically <50 rows).
+//
+// Wire shape:  Array<{ id: string, deletedAt: ISO-8601 string }>
+//
+// IMPORTANT: this route MUST be registered before `/:id` because Express
+// matches in registration order — otherwise 'tombstones' would be parsed
+// as `:id`.
+savedSearchesRouter.get('/tombstones', async (req, res, next) => {
+  try {
+    const since = req.query.since;
+    const params = [];
+    let where = '';
+    if (typeof since === 'string' && since.length > 0) {
+      // PG accepts ISO-8601; if the client sends garbage we surface 400.
+      const d = new Date(since);
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ error: 'invalid since timestamp' });
+      }
+      params.push(d.toISOString());
+      where = 'WHERE deleted_at > $1';
+    }
+    const { rows } = await pool.query(
+      `SELECT id, deleted_at
+         FROM deleted_saved_searches
+         ${where}
+        ORDER BY deleted_at ASC
+        LIMIT 1000`,
+      params,
+    );
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        deletedAt:
+          r.deleted_at instanceof Date
+            ? r.deleted_at.toISOString()
+            : String(r.deleted_at || ''),
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
 // POST /api/v1/saved-searches — upsert one saved search
 savedSearchesRouter.post('/', async (req, res, next) => {
   try {
@@ -3951,6 +4001,14 @@ savedSearchesRouter.post('/', async (req, res, next) => {
         model, provider, mode, pinned, savedAt, updatedAt,
       ],
     );
+    // Cross-device "undelete": if the user deleted this id on a previous
+    // device and then re-saved it (locally undelete + push), drop any
+    // existing tombstone so the row's POST winning is not later undone
+    // when other devices pull /tombstones.
+    await pool.query(
+      'DELETE FROM deleted_saved_searches WHERE id = $1',
+      [id],
+    );
     console.log(`[SAVED_SEARCHES] Upsert: ${id} (${responseType})`);
     res.json({ ok: true, id });
   } catch (err) {
@@ -3973,12 +4031,25 @@ savedSearchesRouter.get('/:id', async (req, res, next) => {
   }
 });
 
-// DELETE /api/v1/saved-searches/:id — hard delete (also cascade-deletes
-// chat messages and conversation summary so the server never accumulates
-// orphans).
+// DELETE /api/v1/saved-searches/:id — hard delete + write tombstone so
+// other devices can sync the deletion on their next index pull.
+//
+// Order of operations is intentional:
+//   1. Write the tombstone FIRST (idempotent INSERT … ON CONFLICT DO
+//      UPDATE SET deleted_at = NOW()). Even if a later step fails, the
+//      tombstone is already durable so cross-device sync still works.
+//   2. Cascade-delete chat messages → summaries → parent row, in that
+//      order, so we never leave child rows pointing at a missing parent
+//      (FK-shaped cleanup, even though we don't enforce real FKs here).
 savedSearchesRouter.delete('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
+    await pool.query(
+      `INSERT INTO deleted_saved_searches (id, deleted_at)
+       VALUES ($1, NOW())
+       ON CONFLICT (id) DO UPDATE SET deleted_at = NOW()`,
+      [id],
+    );
     await pool.query(
       'DELETE FROM saved_search_chat_messages WHERE search_id = $1',
       [id],
@@ -3991,7 +4062,9 @@ savedSearchesRouter.delete('/:id', async (req, res, next) => {
       'DELETE FROM saved_searches WHERE id = $1',
       [id],
     );
-    console.log(`[SAVED_SEARCHES] Delete: ${id} | rows: ${result.rowCount}`);
+    console.log(
+      `[SAVED_SEARCHES] Delete: ${id} | rows: ${result.rowCount} | tombstone written`,
+    );
     res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
@@ -4385,7 +4458,7 @@ const _REQUIRED_TABLES = [
   'category_learnings', 'ai_response_cache', 'app_settings',
   'user_preferences', 'x_feed_sync_state',
   'saved_searches', 'saved_search_chat_messages',
-  'saved_search_chat_summaries',
+  'saved_search_chat_summaries', 'deleted_saved_searches',
 ];
 
 async function _runSafe(label, fn) {
@@ -4663,6 +4736,18 @@ async function initTables() {
     )
   `));
 
+  // ── Cross-device delete sync for saved_searches ──────────────────
+  // When a saved search is deleted on any device, we write a tombstone
+  // here. Other devices pull this list with ?since=<watermark> on every
+  // foreground transition and apply the deletes locally. Keeps the
+  // saved-searches view consistent across all of a user's devices.
+  await _runSafe('deleted_saved_searches', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS deleted_saved_searches (
+      id TEXT PRIMARY KEY,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
   // ── Migrate legacy news_articles (id UUID → TEXT) ──────────────
   await _runSafe('news_articles id→TEXT', async () => {
     const { rows } = await pool.query(
@@ -4712,7 +4797,8 @@ async function initTables() {
     CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
     CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at);
     CREATE INDEX IF NOT EXISTS idx_sscm_search ON saved_search_chat_messages(search_id);
-    CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at)
+    CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_dss_deleted_at ON deleted_saved_searches(deleted_at)
   `));
 
   // ── Seed defaults ─────────────────────────────────────────────

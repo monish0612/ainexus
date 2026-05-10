@@ -304,3 +304,15 @@ CREATE TABLE IF NOT EXISTS saved_search_chat_summaries (
   pairs_covered INTEGER NOT NULL DEFAULT 0,
   updated_at TEXT NOT NULL DEFAULT ''
 );
+
+-- ═══════════════════════════════════════════════════════════════
+-- DELETED SAVED SEARCHES (cross-device delete sync tombstones)
+-- ═══════════════════════════════════════════════════════════════
+-- When a saved search is deleted on any device, we write a tombstone
+-- here. Other devices pull /api/v1/saved-searches/tombstones?since=<ts>
+-- on every foreground transition and apply the deletes locally.
+CREATE TABLE IF NOT EXISTS deleted_saved_searches (
+  id TEXT PRIMARY KEY,
+  deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_dss_deleted_at ON deleted_saved_searches(deleted_at);
