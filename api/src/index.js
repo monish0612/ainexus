@@ -3847,6 +3847,314 @@ articleChatsRouter.delete('/:articleId/summary', async (req, res, next) => {
 app.use('/api/v1/article-chats', articleChatsRouter);
 
 // ═══════════════════════════════════════════════════════════════
+//  SAVED SEARCHES (InsightAI bookmarked searches + chat history)
+//
+//  Mirrors the article-chats endpoints in shape and semantics so the
+//  Flutter SavedSearchStore can use the proven local-first / fire-
+//  and-forget sync pattern without any client-side branching.
+//
+//  Wire shape (camelCase outbound, tolerant of snake_case inbound) is
+//  documented in lib/domain/entities/saved_search.dart.
+// ═══════════════════════════════════════════════════════════════
+
+const savedSearchesRouter = express.Router();
+
+// Helper: parse responseJson which may arrive as a structured object or
+// as a JSON-encoded string (Flutter's _decodedResponseJsonForWire sends
+// the structured form when possible, falls back to the raw string).
+function _stringifyResponseJson(value) {
+  if (value == null) return '{}';
+  if (typeof value === 'string') return value;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return '{}';
+  }
+}
+
+// Maps a DB row to the camelCase wire shape SavedSearchEntry.fromJson()
+// expects. Drift round-trips losslessly via this format.
+function _rowToSavedSearch(row) {
+  let parsedResponse = {};
+  try {
+    parsedResponse = JSON.parse(row.response_json || '{}');
+  } catch {
+    parsedResponse = row.response_json || '{}';
+  }
+  return {
+    id: row.id,
+    kind: row.kind || 'query',
+    query: row.query || '',
+    title: row.title || '',
+    responseType: row.response_type || '',
+    responseJson: parsedResponse,
+    model: row.model || '',
+    provider: row.provider || '',
+    mode: row.mode || '',
+    pinned: row.pinned !== false,
+    savedAt: row.saved_at || '',
+    updatedAt: row.updated_at || '',
+  };
+}
+
+// GET /api/v1/saved-searches — list all saved searches (newest first)
+savedSearchesRouter.get('/', async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM saved_searches WHERE pinned = TRUE ORDER BY updated_at DESC',
+    );
+    res.json(rows.map(_rowToSavedSearch));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/saved-searches — upsert one saved search
+savedSearchesRouter.post('/', async (req, res, next) => {
+  try {
+    const b = req.body || {};
+    const id = b.id;
+    if (!id || typeof id !== 'string') {
+      return res.status(400).json({ error: 'id is required' });
+    }
+    const kind = b.kind || 'query';
+    const query = b.query || '';
+    const title = b.title || '';
+    const responseType = b.responseType || b.response_type || '';
+    const responseJson = _stringifyResponseJson(b.responseJson ?? b.response_json);
+    const model = b.model || '';
+    const provider = b.provider || '';
+    const mode = b.mode || '';
+    const pinned = b.pinned !== false;
+    const savedAt = b.savedAt || b.saved_at || new Date().toISOString();
+    const updatedAt = b.updatedAt || b.updated_at || savedAt;
+
+    await pool.query(
+      `INSERT INTO saved_searches
+         (id, kind, query, title, response_type, response_json,
+          model, provider, mode, pinned, saved_at, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+       ON CONFLICT (id) DO UPDATE SET
+         kind          = EXCLUDED.kind,
+         query         = EXCLUDED.query,
+         title         = EXCLUDED.title,
+         response_type = EXCLUDED.response_type,
+         response_json = EXCLUDED.response_json,
+         model         = EXCLUDED.model,
+         provider      = EXCLUDED.provider,
+         mode          = EXCLUDED.mode,
+         pinned        = EXCLUDED.pinned,
+         saved_at      = EXCLUDED.saved_at,
+         updated_at    = EXCLUDED.updated_at`,
+      [
+        id, kind, query, title, responseType, responseJson,
+        model, provider, mode, pinned, savedAt, updatedAt,
+      ],
+    );
+    console.log(`[SAVED_SEARCHES] Upsert: ${id} (${responseType})`);
+    res.json({ ok: true, id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/saved-searches/:id — fetch one saved search
+savedSearchesRouter.get('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      'SELECT * FROM saved_searches WHERE id = $1',
+      [id],
+    );
+    if (rows.length === 0) return res.status(404).json({ error: 'not found' });
+    res.json(_rowToSavedSearch(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/saved-searches/:id — hard delete (also cascade-deletes
+// chat messages and conversation summary so the server never accumulates
+// orphans).
+savedSearchesRouter.delete('/:id', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    await pool.query(
+      'DELETE FROM saved_search_chat_messages WHERE search_id = $1',
+      [id],
+    );
+    await pool.query(
+      'DELETE FROM saved_search_chat_summaries WHERE search_id = $1',
+      [id],
+    );
+    const result = await pool.query(
+      'DELETE FROM saved_searches WHERE id = $1',
+      [id],
+    );
+    console.log(`[SAVED_SEARCHES] Delete: ${id} | rows: ${result.rowCount}`);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/saved-searches/:id/chat — all chat messages for a search,
+// oldest first (matches Flutter's `loadMessages` ordering).
+savedSearchesRouter.get('/:id/chat', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      `SELECT id, search_id, role, text, model, sources_json, created_at
+         FROM saved_search_chat_messages
+        WHERE search_id = $1
+        ORDER BY created_at ASC`,
+      [id],
+    );
+    // Map snake_case → the camelCase shape SavedSearchStore.pullMessagesFromServer accepts.
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        searchId: r.search_id,
+        role: r.role,
+        text: r.text || '',
+        model: r.model || '',
+        sourcesJson: r.sources_json || '[]',
+        createdAt: r.created_at || '',
+      })),
+    );
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST /api/v1/saved-searches/:id/chat — upsert a chat message
+savedSearchesRouter.post('/:id/chat', async (req, res, next) => {
+  try {
+    const { id: searchId } = req.params;
+    const b = req.body || {};
+    const id = b.id;
+    const role = b.role;
+    if (!id || !role) {
+      return res.status(400).json({ error: 'id and role are required' });
+    }
+
+    await pool.query(
+      `INSERT INTO saved_search_chat_messages
+         (id, search_id, role, text, model, sources_json, created_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7)
+       ON CONFLICT (id) DO UPDATE SET
+         text         = EXCLUDED.text,
+         model        = EXCLUDED.model,
+         sources_json = EXCLUDED.sources_json`,
+      [
+        id,
+        searchId,
+        role,
+        b.text || '',
+        b.model || '',
+        b.sourcesJson || b.sources_json || '[]',
+        b.createdAt || b.created_at || new Date().toISOString(),
+      ],
+    );
+
+    // Bump parent updatedAt so the cross-device History list re-orders by
+    // activity (best-effort — a missing parent row is fine, the message
+    // can land before the parent in eventual-consistency scenarios).
+    await pool.query(
+      'UPDATE saved_searches SET updated_at = $1 WHERE id = $2',
+      [b.createdAt || b.created_at || new Date().toISOString(), searchId],
+    );
+
+    res.json({ ok: true, id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/saved-searches/:id/chat — clear all chat messages for a search
+savedSearchesRouter.delete('/:id/chat', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM saved_search_chat_messages WHERE search_id = $1',
+      [id],
+    );
+    console.log(`[SAVED_SEARCHES] Cleared chats: ${id} | rows: ${result.rowCount}`);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/saved-searches/:id/summary — get conversation summary
+savedSearchesRouter.get('/:id/summary', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const { rows } = await pool.query(
+      'SELECT summary_text, pairs_covered, updated_at FROM saved_search_chat_summaries WHERE search_id = $1',
+      [id],
+    );
+    if (rows.length === 0) return res.json({});
+    res.json({
+      summaryText: rows[0].summary_text,
+      pairsCovered: rows[0].pairs_covered,
+      updatedAt: rows[0].updated_at,
+    });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// PUT /api/v1/saved-searches/:id/summary — upsert conversation summary
+savedSearchesRouter.put('/:id/summary', async (req, res, next) => {
+  try {
+    const { id: searchId } = req.params;
+    const b = req.body || {};
+    const summaryText = b.summaryText ?? b.summary_text;
+    const pairsCovered = b.pairsCovered ?? b.pairs_covered;
+    if (typeof summaryText !== 'string' || typeof pairsCovered !== 'number') {
+      return res.status(400).json({ error: 'summaryText and pairsCovered are required' });
+    }
+    await pool.query(
+      `INSERT INTO saved_search_chat_summaries
+         (search_id, summary_text, pairs_covered, updated_at)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (search_id) DO UPDATE SET
+         summary_text  = EXCLUDED.summary_text,
+         pairs_covered = EXCLUDED.pairs_covered,
+         updated_at    = EXCLUDED.updated_at`,
+      [
+        searchId,
+        summaryText,
+        pairsCovered,
+        b.updatedAt || b.updated_at || new Date().toISOString(),
+      ],
+    );
+    console.log(`[SAVED_SEARCHES] Summary upsert: ${searchId} (${pairsCovered} pairs)`);
+    res.json({ ok: true, searchId, pairsCovered });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE /api/v1/saved-searches/:id/summary — drop conversation summary
+savedSearchesRouter.delete('/:id/summary', async (req, res, next) => {
+  try {
+    const { id } = req.params;
+    const result = await pool.query(
+      'DELETE FROM saved_search_chat_summaries WHERE search_id = $1',
+      [id],
+    );
+    console.log(`[SAVED_SEARCHES] Summary delete: ${id} | rows: ${result.rowCount}`);
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use('/api/v1/saved-searches', savedSearchesRouter);
+
+// ═══════════════════════════════════════════════════════════════
 //  EXPENSES
 // ═══════════════════════════════════════════════════════════════
 
@@ -4076,6 +4384,8 @@ const _REQUIRED_TABLES = [
   'article_chat_summaries', 'saved_words', 'expenses', 'budget_entries',
   'category_learnings', 'ai_response_cache', 'app_settings',
   'user_preferences', 'x_feed_sync_state',
+  'saved_searches', 'saved_search_chat_messages',
+  'saved_search_chat_summaries',
 ];
 
 async function _runSafe(label, fn) {
@@ -4311,6 +4621,48 @@ async function initTables() {
     )
   `));
 
+  // ── Saved Searches (InsightAI bookmarked searches + chat) ──────
+  // Mirrors the article_chat_* shape so the wire format and sync
+  // semantics are identical to the proven news follow-up path.
+  await _runSafe('saved_searches', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_searches (
+      id TEXT PRIMARY KEY,
+      kind TEXT NOT NULL DEFAULT 'query',
+      query TEXT NOT NULL DEFAULT '',
+      title TEXT NOT NULL DEFAULT '',
+      response_type TEXT NOT NULL DEFAULT '',
+      response_json TEXT NOT NULL DEFAULT '{}',
+      model TEXT NOT NULL DEFAULT '',
+      provider TEXT NOT NULL DEFAULT '',
+      mode TEXT NOT NULL DEFAULT '',
+      pinned BOOLEAN NOT NULL DEFAULT TRUE,
+      saved_at TEXT NOT NULL DEFAULT '',
+      updated_at TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
+  await _runSafe('saved_search_chat_messages', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_search_chat_messages (
+      id TEXT PRIMARY KEY,
+      search_id TEXT NOT NULL,
+      role TEXT NOT NULL,
+      text TEXT NOT NULL DEFAULT '',
+      model TEXT DEFAULT '',
+      sources_json TEXT NOT NULL DEFAULT '[]',
+      created_at TEXT NOT NULL DEFAULT ''
+    )
+  `));
+
+  await _runSafe('saved_search_chat_summaries', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS saved_search_chat_summaries (
+      search_id TEXT PRIMARY KEY,
+      summary_text TEXT NOT NULL,
+      pairs_covered INTEGER NOT NULL DEFAULT 0,
+      updated_at TEXT NOT NULL DEFAULT ''
+    )
+  `));
+
   // ── Migrate legacy news_articles (id UUID → TEXT) ──────────────
   await _runSafe('news_articles id→TEXT', async () => {
     const { rows } = await pool.query(
@@ -4358,7 +4710,9 @@ async function initTables() {
     CREATE INDEX IF NOT EXISTS idx_ai_cache_created ON ai_response_cache(created_at);
     CREATE UNIQUE INDEX IF NOT EXISTS idx_news_guid ON news_articles(guid);
     CREATE INDEX IF NOT EXISTS idx_news_published ON news_articles(published_at);
-    CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at)
+    CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_sscm_search ON saved_search_chat_messages(search_id);
+    CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at)
   `));
 
   // ── Seed defaults ─────────────────────────────────────────────

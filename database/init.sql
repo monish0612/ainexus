@@ -262,3 +262,45 @@ CREATE TABLE IF NOT EXISTS x_feed_sync_state (
   total_posts_processed INTEGER NOT NULL DEFAULT 0,
   last_error TEXT
 );
+
+-- ═══════════════════════════════════════════════════════════════
+-- SAVED SEARCHES (InsightAI bookmarked searches + chat history)
+-- Mirrors article_chat_* shape so wire format and sync semantics are
+-- identical to the news follow-up path. See backend/api/src/index.js
+-- savedSearchesRouter for the REST surface.
+-- ═══════════════════════════════════════════════════════════════
+CREATE TABLE IF NOT EXISTS saved_searches (
+  id TEXT PRIMARY KEY,
+  kind TEXT NOT NULL DEFAULT 'query',
+  query TEXT NOT NULL DEFAULT '',
+  title TEXT NOT NULL DEFAULT '',
+  response_type TEXT NOT NULL DEFAULT '',
+  response_json TEXT NOT NULL DEFAULT '{}',
+  model TEXT NOT NULL DEFAULT '',
+  provider TEXT NOT NULL DEFAULT '',
+  mode TEXT NOT NULL DEFAULT '',
+  pinned BOOLEAN NOT NULL DEFAULT TRUE,
+  saved_at TEXT NOT NULL DEFAULT '',
+  updated_at TEXT NOT NULL DEFAULT '',
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at);
+
+CREATE TABLE IF NOT EXISTS saved_search_chat_messages (
+  id TEXT PRIMARY KEY,
+  search_id TEXT NOT NULL,
+  role TEXT NOT NULL,
+  text TEXT NOT NULL DEFAULT '',
+  model TEXT DEFAULT '',
+  sources_json TEXT NOT NULL DEFAULT '[]',
+  created_at TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS idx_sscm_search ON saved_search_chat_messages(search_id);
+
+CREATE TABLE IF NOT EXISTS saved_search_chat_summaries (
+  search_id TEXT PRIMARY KEY,
+  summary_text TEXT NOT NULL,
+  pairs_covered INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL DEFAULT ''
+);
