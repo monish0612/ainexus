@@ -18,11 +18,15 @@ const {
   buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
   CATEGORIZE_SYSTEM_PROMPT,
+  IMAGE_LENS_PROMPT,
+  buildVisionExpertPrompt,
 } = require('./prompts');
 const {
   groundedSearch,
   groundedExtract,
   groundedConverse,
+  groundedSearchVision,
+  groundedConverseVision,
   updateGroundingModels,
   isGroundingAvailable,
   resolveGroundingMode,
@@ -31,11 +35,19 @@ const {
 const {
   xgrokSearch,
   xgrokConverse,
+  xgrokSearchVision,
+  xgrokConverseVision,
   xgrokComplete,
   isXGrokAvailable,
   resolveXGrokModel,
   getXGrokConfig,
 } = require('./xgrok');
+const crypto = require('crypto');
+const {
+  validateImagePayload: _validateImagePayloadShared,
+  preprocessForVision,
+  isSharpAvailable,
+} = require('./image-preprocess');
 const {
   register: registerProvider,
   complete: llmProviderComplete,
@@ -2974,6 +2986,485 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     if (!res.headersSent) res.json(response);
   } catch (err) {
     tg.e('AI/article-followup', `Failed model=${modelTag} ${Date.now() - _t0}ms`, err);
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
+      return res.status(err.status || 500).json({ error: err.message, code: err.code });
+    }
+    next(err);
+  }
+});
+
+// ── Image vision helpers ──────────────────────────────────────────
+// Wire-shape validation + sha1 cache key. Validation lives in
+// `image-preprocess.js` so /image-search and /image-followup stay
+// byte-for-byte aligned with the Flutter client.
+function _hashImage(b64) {
+  return crypto.createHash('sha1').update(b64).digest('hex').slice(0, 16);
+}
+
+// ── Hedged parallel executor ──────────────────────────────────────
+// Pattern: fire `primaryFn` immediately. If it hasn't resolved within
+// `hedgeMs`, fire `fallbackFn` in parallel. First resolved wins.
+// If primary succeeds before the timer fires we never spend a second
+// API call. If primary fails fast, fallback fires immediately.
+//
+// `tag` is used purely for telegram log breadcrumbs.
+//
+// Returns `{ result, winner, hedged }` where winner is 'primary' or
+// 'fallback'. Both errors are aggregated into a single error with
+// `primaryError`/`fallbackError` properties if both fail.
+function _hedgedRace(primaryFn, fallbackFn, hedgeMs, tag) {
+  return new Promise((resolve, reject) => {
+    if (!fallbackFn) {
+      Promise.resolve()
+        .then(primaryFn)
+        .then((result) => resolve({ result, winner: 'primary', hedged: false }))
+        .catch(reject);
+      return;
+    }
+
+    const tStart = Date.now();
+    let settled = false;
+    let primaryDone = false;
+    let primaryErr = null;
+    let fallbackPromise = null;
+    let fallbackDone = false;
+    let fallbackErr = null;
+    let hedged = false;
+
+    const settle = (winner, result) => {
+      if (settled) return;
+      settled = true;
+      const elapsed = Date.now() - tStart;
+      if (winner === 'fallback') {
+        tg.i(tag, `Hedged FALLBACK won in ${elapsed}ms`);
+      } else if (hedged) {
+        tg.d(tag, `Primary won despite hedge fired (fallback abandoned) in ${elapsed}ms`);
+      }
+      // Detach the loser so any later reject doesn't leak.
+      if (fallbackPromise) fallbackPromise.catch(() => {});
+      resolve({ result, winner, hedged });
+    };
+
+    const fail = () => {
+      if (settled) return;
+      // Only fail when BOTH have terminated unsuccessfully.
+      const fallbackTerminal = !fallbackPromise || fallbackDone;
+      if (!primaryDone || !fallbackTerminal) return;
+      if (!primaryErr || (fallbackPromise && !fallbackErr)) return;
+      settled = true;
+      const aggMsg = `[primary] ${primaryErr?.message?.slice(0, 200)}`
+        + (fallbackErr ? ` | [fallback] ${fallbackErr.message?.slice(0, 200)}` : '');
+      const agg = new Error(`Both providers failed: ${aggMsg}`);
+      agg.name = 'AggregateProviderError';
+      agg.primaryError = primaryErr;
+      agg.fallbackError = fallbackErr;
+      reject(agg);
+    };
+
+    const startFallback = (reason) => {
+      if (fallbackPromise || settled) return;
+      hedged = true;
+      tg.i(tag, `${reason}, firing fallback in parallel`);
+      fallbackPromise = Promise.resolve()
+        .then(fallbackFn)
+        .then((result) => {
+          fallbackDone = true;
+          settle('fallback', result);
+        })
+        .catch((e) => {
+          fallbackDone = true;
+          fallbackErr = e;
+          fail();
+        });
+    };
+
+    const hedgeTimer = setTimeout(() => {
+      if (primaryDone) return;
+      startFallback(`Primary slow (>${hedgeMs}ms)`);
+    }, hedgeMs);
+    if (typeof hedgeTimer.unref === 'function') hedgeTimer.unref();
+
+    // Fire primary immediately.
+    Promise.resolve()
+      .then(primaryFn)
+      .then((result) => {
+        primaryDone = true;
+        clearTimeout(hedgeTimer);
+        settle('primary', result);
+      })
+      .catch((e) => {
+        primaryDone = true;
+        primaryErr = e;
+        clearTimeout(hedgeTimer);
+        if (!fallbackPromise) {
+          startFallback(`Primary failed fast (${e?.message?.slice(0, 80) || 'unknown'})`);
+        } else {
+          fail(); // fallback already running; settle when it terminates
+        }
+      });
+  });
+}
+
+// Hedge delays — fire the backup provider in parallel after this many
+// ms when the primary hasn't responded. Tuned per mode so deep/thinking
+// requests (which legitimately take longer) don't trip the hedge.
+const _HEDGE_DELAY_MS = {
+  lite: 6000,
+  deep: 18000,
+  thinking: 18000,
+};
+
+// POST /api/v1/ai/image-search  (Gemini Vision / xGrok Vision + search)
+//
+// Single-shot multimodal grounded search. Mirrors /grounded-search:
+// same provider/mode/model-slot routing, same response shape
+// ({answer, query, model, sources, citations, searchQueries}), with
+// `image` (base64) + `imageMediaType` added to the request body.
+//
+// Robustness contract:
+//   • Validation rejects in <1ms (no provider call).
+//   • Image is preprocessed (resize→1568px / re-encode JPEG q=82 /
+//     EXIF strip) when sharp is available — large phone photos shrink
+//     to <500KB before any network egress.
+//   • Hedged parallel fallback fires the alternate provider in
+//     parallel after a per-mode delay; first success wins.
+//   • Every retry / fallback / cache-hit / preprocessing step emits
+//     a telegram breadcrumb so prod issues are post-mortem-friendly.
+//   • Final tier is `_notifyGroundingError` so the client always
+//     gets a typed envelope, never a raw 500.
+aiRouter.post('/image-search', async (req, res, next) => {
+  const _t0 = Date.now();
+  let providerTag = 'gemini';
+  try {
+    const {
+      query,
+      image,
+      imageMediaType,
+      model,
+      provider,
+      xgrokModel,
+      mode,
+      deepModel,
+      liteModel,
+      xgrokLiteModel,
+      xgrokDeepModel,
+      xgrokThinkingModel,
+    } = req.body || {};
+
+    const rawQ = String(query || '').trim();
+    // When the user uploads an image and types nothing, fall back to the
+    // canonical "lens" prompt — same wording as the Anthropic chat sample,
+    // so the model identifies-then-explains exactly like the reference UX.
+    const trimmedQ = rawQ.length > 0 ? rawQ : IMAGE_LENS_PROMPT;
+    const validation = _validateImagePayloadShared(image, imageMediaType);
+    if (!validation.ok) {
+      tg.d('AI/image-search', `400 validation: ${validation.error}`);
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const wantXGrok = provider === 'xgrok';
+    const useXGrok = wantXGrok && isXGrokAvailable();
+    providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const hasGemini = isGroundingAvailable();
+    const hasXGrok = isXGrokAvailable();
+
+    if (!useXGrok && !hasGemini) {
+      tg.e('AI/image-search', `No vision provider available: gemini=${hasGemini} xgrok=${hasXGrok} requested=${provider || 'gemini'}`);
+      return res.status(503).json({ error: 'No vision search provider configured' });
+    }
+
+    const effMode = (mode === 'deep' || mode === 'thinking') ? mode : 'lite';
+    const isDeep = effMode !== 'lite';
+
+    const resolvedGeminiModel = model
+      ? String(model)
+      : resolveGroundingMode(effMode, deepModel, liteModel);
+    const resolvedXGrokModel = resolveXGrokModel(
+      effMode,
+      xgrokLiteModel || xgrokModel,
+      xgrokDeepModel,
+      xgrokThinkingModel,
+    );
+
+    // Server-side preprocessing — resize + recompress huge phone photos.
+    const prep = await preprocessForVision(validation.base64, validation.mediaType);
+    if (prep.downscaled || prep.processedBytes !== prep.originalBytes) {
+      tg.d('AI/image-search',
+        `prep ${(prep.originalBytes / 1024).toFixed(0)}KB → ${(prep.processedBytes / 1024).toFixed(0)}KB `
+        + `(${prep.downscaled ? 'resized' : 'transcoded'}) ${prep.durationMs}ms sharp=${isSharpAvailable()}`);
+    }
+
+    // Vision payloads are larger and the model has to actually look at
+    // the bytes — give both providers more headroom than the text path.
+    const geminiTimeoutMs = isDeep ? 90000 : 45000;
+    const xgrokTimeoutMs = isDeep ? 150000 : 90000;
+
+    tg.d('AI/image-search',
+      `provider=${providerTag} mode=${effMode} model=${useXGrok ? resolvedXGrokModel : (resolvedGeminiModel || 'default')} `
+      + `q="${trimmedQ.slice(0, 80)}" media=${prep.mediaType} bytes=${(prep.processedBytes / 1024).toFixed(0)}KB `
+      + `gemini=${hasGemini} xgrok=${hasXGrok}`);
+
+    // ── Build provider call thunks ─────────────────────────────────
+    // Wrap both so the cross-provider fallback path can race them.
+    // Both providers receive THE SAME universal-expert system prompt
+    // (lifted from the cursor_ai_image_chat_prompt.md sample) — the
+    // only per-provider variance is the search-tool name.
+    const geminiSysInstr = buildVisionExpertPrompt({ searchTool: 'google_search' });
+    const xgrokSysInstr = buildVisionExpertPrompt({ searchTool: 'web_search' });
+
+    const geminiCall = () => groundedSearchVision(trimmedQ, prep.base64, prep.mediaType, {
+      model: useXGrok ? resolveGroundingMode('lite', undefined, liteModel) : resolvedGeminiModel,
+      timeoutMs: geminiTimeoutMs,
+      systemInstruction: geminiSysInstr,
+    });
+    const xgrokCall = async () => {
+      const r = await xgrokSearchVision(trimmedQ, prep.base64, prep.mediaType, {
+        model: useXGrok
+          ? resolvedXGrokModel
+          : resolveXGrokModel('lite', xgrokLiteModel || xgrokModel),
+        timeoutMs: xgrokTimeoutMs,
+        systemInstruction: xgrokSysInstr,
+      });
+      if (r.sources) {
+        r.sources = r.sources.map((s, i) => ({ index: i, title: s.title || '', url: s.url || '' }));
+      }
+      return r;
+    };
+
+    const primaryFn = useXGrok ? xgrokCall : geminiCall;
+    const fallbackFn = useXGrok
+      ? (hasGemini ? geminiCall : null)
+      : (hasXGrok ? xgrokCall : null);
+    const hedgeMs = _HEDGE_DELAY_MS[effMode] || _HEDGE_DELAY_MS.lite;
+
+    let result;
+    let usedProvider = providerTag;
+    try {
+      const race = await _hedgedRace(primaryFn, fallbackFn, hedgeMs, 'AI/image-search');
+      result = race.result;
+      if (race.winner === 'fallback') {
+        usedProvider = useXGrok ? 'gemini (hedged)' : 'xgrok (hedged)';
+      }
+    } catch (raceErr) {
+      const elapsed = Date.now() - _t0;
+      tg.e('AI/image-search', `Both providers failed ${elapsed}ms — delivering LLM error notice`, raceErr);
+      const primary = raceErr.primaryError || raceErr;
+      result = await _notifyGroundingError(primary);
+    }
+
+    const elapsed = Date.now() - _t0;
+    if (!result.fallback) {
+      tg.i('AI/image-search', `✓ provider=${usedProvider} mode=${effMode} model=${result.model} ${elapsed}ms, ${(result.sources || []).length} sources`);
+    } else {
+      tg.w('AI/image-search', `⚠ degraded notice delivered (provider=${providerTag} mode=${effMode}) ${elapsed}ms`);
+    }
+    res.json({
+      answer: result.text,
+      query: trimmedQ,
+      model: result.model,
+      mode: effMode,
+      searchQueries: result.searchQueries || [],
+      sources: result.sources || [],
+      citations: result.citations || [],
+      usage: result.usage,
+      fallback: result.fallback || false,
+    });
+  } catch (err) {
+    const elapsed = Date.now() - _t0;
+    if (err.name === 'GroundingError' || err.name === 'XGrokError') {
+      tg.e('AI/image-search', `FATAL provider=${providerTag} ${elapsed}ms [${err.code}]`, err);
+      return res.status(err.status || 500).json({
+        error: err.message,
+        code: err.code,
+      });
+    }
+    tg.e('AI/image-search', `FATAL provider=${providerTag} ${elapsed}ms`, err);
+    next(err);
+  }
+});
+
+// POST /api/v1/ai/image-followup  (Gemini Vision / xGrok Vision — multi-turn)
+//
+// Multi-turn multimodal follow-up over an image. Mirrors
+// /article-followup but the body also carries `image`, `imageMediaType`,
+// and an optional `initialAnswer` from the original /image-search call
+// (so turn #1 still has a grounding anchor when `history` is empty).
+// Response: { answer, model, sources, searchQueries }.
+//
+// Same robustness contract as /image-search:
+//   • Validation rejects in <1ms.
+//   • Image is preprocessed before egress.
+//   • DB cache + in-flight dedupe (image hash + question + history).
+//   • Hedged parallel fallback — backup provider fires after a delay
+//     so a slow primary doesn't block the user.
+//   • Graceful `_notifyGroundingError` when both providers exhaust.
+aiRouter.post('/image-followup', async (req, res, next) => {
+  const _t0 = Date.now();
+  let modelTag = 'default';
+  let providerTag = 'gemini';
+  try {
+    const {
+      query,
+      initialAnswer,
+      question,
+      history,
+      image,
+      imageMediaType,
+      model,
+      mode,
+      deepModel,
+      liteModel,
+      provider,
+      searchRequired,
+      xgrokLiteModel,
+      xgrokDeepModel,
+      xgrokThinkingModel,
+    } = req.body || {};
+
+    if (!question || String(question).trim().length < 2) {
+      tg.d('AI/image-followup', `400 validation: question missing/too-short`);
+      return res.status(400).json({ error: 'question is required (min 2 chars)' });
+    }
+
+    const validation = _validateImagePayloadShared(image, imageMediaType);
+    if (!validation.ok) {
+      tg.d('AI/image-followup', `400 validation: ${validation.error}`);
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const wantXGrok = provider === 'xgrok';
+    const useXGrok = wantXGrok && isXGrokAvailable();
+    providerTag = useXGrok ? 'xgrok' : 'gemini';
+    const hasGemini = isGroundingAvailable();
+    const hasXGrok = isXGrokAvailable();
+
+    if (!useXGrok && !hasGemini) {
+      tg.e('AI/image-followup', `No vision provider available: gemini=${hasGemini} xgrok=${hasXGrok} requested=${provider || 'gemini'}`);
+      return res.status(503).json({ error: 'No vision search provider configured' });
+    }
+
+    const effMode = (mode === 'deep' || mode === 'thinking') ? mode : 'lite';
+
+    const resolvedModel = useXGrok
+      ? resolveXGrokModel(effMode, xgrokLiteModel, xgrokDeepModel, xgrokThinkingModel)
+      : (model ? String(model) : resolveGroundingMode(effMode, deepModel, liteModel));
+    const safeQuery = String(query || '').slice(0, 500);
+    const safeInitial = String(initialAnswer || '').slice(0, 1500);
+    const trimmedQ = String(question).trim();
+    const histLen = Array.isArray(history) ? history.length : 0;
+    modelTag = resolvedModel || effMode || 'default';
+    const forceSearch = searchRequired !== false;
+
+    // Server-side preprocessing — same shrink logic as /image-search.
+    const prep = await preprocessForVision(validation.base64, validation.mediaType);
+    if (prep.downscaled || prep.processedBytes !== prep.originalBytes) {
+      tg.d('AI/image-followup',
+        `prep ${(prep.originalBytes / 1024).toFixed(0)}KB → ${(prep.processedBytes / 1024).toFixed(0)}KB `
+        + `(${prep.downscaled ? 'resized' : 'transcoded'}) ${prep.durationMs}ms sharp=${isSharpAvailable()}`);
+    }
+
+    // Image-bound cache key — different bytes ⇒ different conversation.
+    // Use the PREPROCESSED bytes so a 12MP photo and its resized form
+    // collapse onto the same cache slot (the model only ever sees the
+    // resized form anyway).
+    const imgKey = _hashImage(prep.base64);
+    const cacheKey = `if::${providerTag}::${imgKey}::${trimmedQ.slice(0, 200)}::${histLen}::${modelTag}`;
+    tg.d('AI/image-followup',
+      `provider=${providerTag} model=${modelTag} mode=${effMode} hist=${histLen} `
+      + `media=${prep.mediaType} bytes=${(prep.processedBytes / 1024).toFixed(0)}KB forceSearch=${forceSearch}`);
+
+    const dbCached = await _getFromDbCache(cacheKey);
+    if (dbCached) {
+      console.log('[ImageFollowUp] DB cache hit — returning instantly');
+      tg.d('AI/image-followup', `Cache hit model=${dbCached.model || modelTag} ${Date.now() - _t0}ms`);
+      return res.json(dbCached);
+    }
+
+    const flight = _inflight.get(cacheKey);
+    if (flight?.pending) {
+      console.log('[ImageFollowUp] Awaiting in-flight request from prior connection');
+      tg.d('AI/image-followup', `In-flight dedup hit — sharing prior promise`);
+      try { return res.json(await flight.pending); } catch { /* fall through */ }
+    }
+
+    // Shared universal-expert prompt — same wording for Gemini and
+    // xGrok, with provider-specific tool name and follow-up context
+    // (original query + initial answer) interpolated. This is the
+    // SAME prompt as /image-search so the reply style stays
+    // consistent across the upload→follow-up arc.
+    const systemInstruction = buildVisionExpertPrompt({
+      searchTool: useXGrok ? 'web_search' : 'google_search',
+      isFollowUp: true,
+      originalQuery: safeQuery,
+      originalAnswer: safeInitial,
+      searchRequired: forceSearch !== false,
+    });
+
+    const turns = [];
+    if (Array.isArray(history)) {
+      for (const h of history) {
+        if (h && h.role && h.text) {
+          turns.push({ role: String(h.role), text: String(h.text).slice(0, 4000) });
+        }
+      }
+    }
+    turns.push({ role: 'user', text: trimmedQ });
+
+    const converseOpts = { timeoutMs: 120000, maxTokens: 8192, temperature: 0.7 };
+    if (resolvedModel) converseOpts.model = resolvedModel;
+    const fbConverseOpts = { timeoutMs: 120000, maxTokens: 8192, temperature: 0.7 };
+
+    const geminiCall = () => groundedConverseVision(turns, systemInstruction, prep.base64, prep.mediaType, useXGrok ? fbConverseOpts : converseOpts);
+    const xgrokCall = () => xgrokConverseVision(
+      turns,
+      systemInstruction,
+      prep.base64,
+      prep.mediaType,
+      useXGrok ? converseOpts : { ...fbConverseOpts, model: process.env.XGROK_LITE_MODEL || 'grok-4-1-fast-non-reasoning' },
+    );
+
+    const primaryFn = useXGrok ? xgrokCall : geminiCall;
+    const fallbackFn = useXGrok
+      ? (hasGemini ? geminiCall : null)
+      : (hasXGrok ? xgrokCall : null);
+    const hedgeMs = _HEDGE_DELAY_MS[effMode] || _HEDGE_DELAY_MS.lite;
+
+    const apiPromise = (async () => {
+      try {
+        const race = await _hedgedRace(primaryFn, fallbackFn, hedgeMs, 'AI/image-followup');
+        const result = race.result;
+        if (race.winner === 'fallback') {
+          tg.i('AI/image-followup', `✓ Hedged ${useXGrok ? 'xgrok→gemini' : 'gemini→xgrok'} fallback won model=${result.model} ${Date.now() - _t0}ms`);
+        }
+        const payload = {
+          answer: result.text,
+          model: result.model,
+          sources: result.sources || [],
+          searchQueries: result.searchQueries || [],
+        };
+        await _putToDbCache(cacheKey, payload);
+        _inflight.delete(cacheKey);
+        return payload;
+      } catch (raceErr) {
+        _inflight.delete(cacheKey);
+        tg.e('AI/image-followup', `ALL providers exhausted ${Date.now() - _t0}ms — delivering LLM error notice`, raceErr);
+        const primary = raceErr.primaryError || raceErr;
+        const fb = await _notifyGroundingError(primary);
+        return { answer: fb.text, model: fb.model, sources: [], searchQueries: [], fallback: true };
+      }
+    })();
+
+    _inflight.set(cacheKey, { pending: apiPromise, ts: Date.now() });
+
+    const response = await apiPromise;
+    if (!response.fallback) {
+      tg.i('AI/image-followup', `✓ provider=${providerTag} model=${response.model || modelTag} ${Date.now() - _t0}ms, ${(response.sources || []).length} sources`);
+    } else {
+      tg.w('AI/image-followup', `⚠ degraded notice delivered (provider=${providerTag} mode=${effMode}) ${Date.now() - _t0}ms`);
+    }
+    if (!res.headersSent) res.json(response);
+  } catch (err) {
+    tg.e('AI/image-followup', `Failed provider=${providerTag} model=${modelTag} ${Date.now() - _t0}ms`, err);
     if (err.name === 'GroundingError' || err.name === 'XGrokError') {
       return res.status(err.status || 500).json({ error: err.message, code: err.code });
     }

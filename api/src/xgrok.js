@@ -296,6 +296,143 @@ async function xgrokConverse(history, systemInstruction, options = {}) {
   return result;
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  VISION (multimodal) — image + web_search via Responses API
+//
+//  Grok 4 series is natively multimodal so the same model resolution
+//  used by the text path applies here. The wire difference is the
+//  user content becoming an array of items including
+//  { type: 'input_image', image_url: 'data:<mime>;base64,...' }.
+//
+//  Two surfaces:
+//   • xgrokSearchVision  — single-shot ImageSearch
+//   • xgrokConverseVision — multi-turn ImageFollowUp (image is
+//                           re-attached to the LAST user turn on
+//                           every call so a stateless backend keeps
+//                           full vision context).
+// ═══════════════════════════════════════════════════════════════
+
+function _normaliseMediaType(mediaType) {
+  const m = String(mediaType || '').trim().toLowerCase();
+  if (!m) return 'image/jpeg';
+  if (m === 'image/jpg') return 'image/jpeg';
+  return m;
+}
+
+function _toDataUrl(imageB64, mediaType) {
+  if (typeof imageB64 !== 'string') return '';
+  if (imageB64.startsWith('data:')) return imageB64;
+  return `data:${_normaliseMediaType(mediaType)};base64,${imageB64}`;
+}
+
+async function xgrokSearchVision(query, imageB64, mediaType, options = {}) {
+  const t0 = Date.now();
+  const model = options.model || process.env.XGROK_DEFAULT_MODEL || 'grok-4-0709';
+  const safeQ = String(query || '').slice(0, 80);
+  console.log(`[xGrok] SearchVision → model=${model}, q="${safeQ}", media=${mediaType}`);
+  tg.d('xGrokSearchVision', `model=${model} q="${safeQ}" media=${mediaType}`);
+
+  const userText = String(query || '').trim() || 'Describe this image in detail.';
+
+  // Caller may inject a custom expert prompt (used by the
+  // /image-search route, which wires in the universal-expert
+  // template from prompts.js). Fall back to a slim default for
+  // direct module-level callers / tests.
+  const sysContent =
+    options.systemInstruction ||
+    'You are an expert visual research assistant with access to web_search. '
+      + 'The user has attached an image. First identify what is in the image, then use web_search '
+      + 'to enrich your answer with current real-world context (people, places, products, events, prices, etc.). '
+      + 'Provide a comprehensive, well-structured answer with markdown formatting. Cite sources when possible.';
+
+  const input = [
+    {
+      role: 'system',
+      content: sysContent,
+    },
+    {
+      role: 'user',
+      content: [
+        { type: 'input_image', image_url: _toDataUrl(imageB64, mediaType) },
+        { type: 'input_text', text: userText },
+      ],
+    },
+  ];
+
+  const result = await _callWithRetry(async () => {
+    const data = await _callResponsesOnce(model, input, {
+      tools: [{ type: 'web_search' }, { type: 'x_search' }],
+      temperature: options.temperature ?? DEFAULTS.temperature,
+      maxTokens: options.maxTokens ?? DEFAULTS.maxTokens,
+      timeoutMs: options.timeoutMs ?? DEFAULTS.timeoutMs,
+    });
+    return _parseResponsesResult(data, model);
+  }, model);
+
+  const elapsed = Date.now() - t0;
+  console.log(`[xGrok] SearchVision done in ${elapsed}ms — model=${result.model}`);
+  tg.i('xGrokSearchVision', `✓ model=${result.model} ${elapsed}ms, ${result.sources.length} sources`);
+  return result;
+}
+
+async function xgrokConverseVision(history, systemInstruction, imageB64, mediaType, options = {}) {
+  const model = options.model || process.env.XGROK_DEFAULT_MODEL || 'grok-4-0709';
+  const timeout = options.timeoutMs ?? DEFAULTS.timeoutMs;
+  const maxTok = options.maxTokens ?? DEFAULTS.maxTokens;
+  const temp = options.temperature ?? DEFAULTS.temperature;
+
+  const t0 = Date.now();
+  console.log(`[xGrok] ConverseVision → model=${model}, ${history.length} turns, media=${mediaType}`);
+  tg.d('xGrokConverseVision', `model=${model}, ${history.length} turns, media=${mediaType}`);
+
+  const input = [];
+  if (systemInstruction) {
+    input.push({ role: 'system', content: systemInstruction });
+  }
+
+  // Find the last user turn so we can attach the image to it.
+  let lastUserIdx = -1;
+  for (let i = history.length - 1; i >= 0; i--) {
+    const role = history[i]?.role;
+    if (role !== 'assistant' && role !== 'model') {
+      lastUserIdx = i;
+      break;
+    }
+  }
+
+  for (let i = 0; i < history.length; i++) {
+    const h = history[i];
+    const role = h.role === 'assistant' ? 'assistant' : 'user';
+    if (i === lastUserIdx && role === 'user') {
+      input.push({
+        role,
+        content: [
+          { type: 'input_image', image_url: _toDataUrl(imageB64, mediaType) },
+          { type: 'input_text', text: h.text },
+        ],
+      });
+    } else {
+      input.push({ role, content: h.text });
+    }
+  }
+
+  const result = await _callWithRetry(async () => {
+    const data = await _callResponsesOnce(model, input, {
+      temperature: temp,
+      maxTokens: maxTok,
+      tools: [{ type: 'web_search' }, { type: 'x_search' }],
+      timeoutMs: timeout,
+    });
+    return _parseResponsesResult(data, model);
+  }, model);
+
+  const elapsed = Date.now() - t0;
+  console.log(`[xGrok] ConverseVision done in ${elapsed}ms — model=${result.model}`);
+  tg.i('xGrokConverseVision', `✓ model=${result.model} ${elapsed}ms, ${result.sources.length} sources`);
+
+  return result;
+}
+
 /**
  * xGrok simple completion (no tools) — for summarization, rephrase, etc.
  * Uses Chat Completions API (faster, no web search overhead).
@@ -351,6 +488,8 @@ module.exports = {
   callXGrok: xgrokComplete,
   xgrokSearch,
   xgrokConverse,
+  xgrokSearchVision,
+  xgrokConverseVision,
   xgrokComplete,
   isXGrokAvailable,
   resolveXGrokModel,

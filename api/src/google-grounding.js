@@ -461,6 +461,223 @@ async function groundedConverse(history, systemInstruction, options = {}) {
   );
 }
 
+// ═══════════════════════════════════════════════════════════════
+//  VISION (multimodal) — image + Google Search grounding
+//
+//  Same `google_search` tool, same model list — Gemini 2.x/3.x are
+//  natively multimodal so no separate "vision model" is needed. The
+//  only wire difference is an `inline_data` part alongside the text.
+//
+//  Two surfaces:
+//   • groundedSearchVision  — single-shot ImageSearch
+//   • groundedConverseVision — multi-turn ImageFollowUp (image is
+//                              re-attached to the LAST user turn on
+//                              every call so a stateless backend
+//                              keeps full vision context).
+// ═══════════════════════════════════════════════════════════════
+
+function _normaliseMediaType(mediaType) {
+  const m = String(mediaType || '').trim().toLowerCase();
+  if (!m) return 'image/jpeg';
+  if (m === 'image/jpg') return 'image/jpeg';
+  return m;
+}
+
+function _stripDataUrlPrefix(b64) {
+  if (typeof b64 !== 'string') return '';
+  const idx = b64.indexOf('base64,');
+  return idx === -1 ? b64 : b64.slice(idx + 'base64,'.length);
+}
+
+async function groundedSearchVision(query, imageB64, mediaType, options = {}) {
+  const t0 = Date.now();
+  const modelHint = options.model || _groundingModels[0] || 'default';
+  const safeQ = String(query || '').slice(0, 80);
+  console.log(`[Grounding] SearchVision → model=${modelHint}, q="${safeQ}", media=${mediaType}`);
+  tg.d('GroundedSearchVision', `model=${modelHint} q="${safeQ}" media=${mediaType}`);
+
+  const models = options.model ? [options.model] : [..._groundingModels];
+  if (models.length === 0) {
+    throw new GroundingError('No grounding models configured', 'CONFIG', 0);
+  }
+  const temp = options.temperature ?? DEFAULTS.temperature;
+  const maxTok = options.maxTokens ?? DEFAULTS.maxOutputTokens;
+  const timeout = options.timeoutMs ?? DEFAULTS.timeoutMs;
+
+  const body = {
+    contents: [{
+      role: 'user',
+      parts: [
+        {
+          inline_data: {
+            mime_type: _normaliseMediaType(mediaType),
+            data: _stripDataUrlPrefix(imageB64),
+          },
+        },
+        { text: String(query || '').trim() || 'Describe this image in detail.' },
+      ],
+    }],
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: temp, maxOutputTokens: maxTok },
+  };
+
+  const sysInstr = options.systemInstruction || buildGroundingSystemInstruction(
+    'The user has attached an image. Identify what is in the image, then use Google Search to enrich your answer with current real-world context (people, places, products, events, prices, etc.).',
+  );
+  body.systemInstruction = { parts: [{ text: sysInstr }] };
+
+  let lastError;
+  for (const m of models) {
+    try {
+      const data = await _groundedCallOnce(m, body, timeout);
+      const result = parseGroundingResponse(data);
+      const elapsed = Date.now() - t0;
+      console.log(`[Grounding] SearchVision done in ${elapsed}ms — model=${m}, ${result.sources.length} sources`);
+      tg.i('GroundedSearchVision', `✓ model=${m} ${elapsed}ms, ${result.sources.length} sources`);
+      return { ...result, model: m };
+    } catch (e) {
+      lastError = e;
+      if (models.length > 1) {
+        console.warn(`[Grounding] SearchVision ${m} failed, trying next... (${e.message.slice(0, 120)})`);
+        tg.w('GroundedSearchVision', `${m} failed, falling back`, e);
+      }
+    }
+  }
+
+  tg.e('GroundedSearchVision', `All models exhausted: ${models.join(', ')}`, lastError);
+  throw lastError;
+}
+
+async function groundedConverseVision(history, systemInstruction, imageB64, mediaType, options = {}) {
+  const primaryModel = options.model || _proModel || _groundingModels[0];
+  const fallbackModels = _groundingModels.filter(m => m !== primaryModel);
+  const allModels = [primaryModel, ...fallbackModels].filter(Boolean);
+
+  if (allModels.length === 0) {
+    throw new GroundingError('No grounding models configured', 'CONFIG', 0);
+  }
+
+  const timeout = options.timeoutMs ?? 90000;
+  const maxTok = options.maxTokens ?? 8192;
+  const temp = options.temperature ?? 0.7;
+  const RETRIES_PER_MODEL = 3;
+  const apiKey = getApiKey();
+
+  // Attach image to the LAST user turn so the model has fresh vision
+  // context. Earlier turns reference what was previously seen — they
+  // do NOT need the image bytes (Gemini is stateless across calls and
+  // we re-attach on every request anyway).
+  const lastUserIdx = (() => {
+    for (let i = history.length - 1; i >= 0; i--) {
+      const role = history[i]?.role;
+      if (role !== 'assistant' && role !== 'model') return i;
+    }
+    return -1;
+  })();
+
+  const contents = history.map((h, i) => {
+    const role = h.role === 'assistant' ? 'model' : 'user';
+    if (i === lastUserIdx && role === 'user') {
+      return {
+        role,
+        parts: [
+          {
+            inline_data: {
+              mime_type: _normaliseMediaType(mediaType),
+              data: _stripDataUrlPrefix(imageB64),
+            },
+          },
+          { text: h.text },
+        ],
+      };
+    }
+    return { role, parts: [{ text: h.text }] };
+  });
+
+  const body = {
+    contents,
+    tools: [{ google_search: {} }],
+    generationConfig: { temperature: temp, maxOutputTokens: maxTok },
+  };
+  if (systemInstruction) {
+    body.systemInstruction = { parts: [{ text: systemInstruction }] };
+  }
+
+  const t0 = Date.now();
+  console.log(`[Grounding] ConverseVision → models=[${allModels.join(',')}], ${history.length} turns, media=${mediaType}`);
+  tg.d('GroundedConverseVision', `models=[${allModels.join(',')}], ${history.length} turns, media=${mediaType}`);
+
+  let lastError;
+
+  for (let mi = 0; mi < allModels.length; mi++) {
+    const modelId = allModels[mi];
+    const url = `${GEMINI_API_BASE}/models/${modelId}:generateContent?key=${apiKey}`;
+
+    for (let attempt = 0; attempt < RETRIES_PER_MODEL; attempt++) {
+      try {
+        if (attempt > 0) {
+          const delay = Math.min(800 * Math.pow(2, attempt - 1), 4000);
+          console.log(`[Grounding] ConverseVision retry ${attempt + 1}/${RETRIES_PER_MODEL} model=${modelId} in ${delay}ms`);
+          tg.w('GroundedConverseVision', `Retry ${attempt + 1}/${RETRIES_PER_MODEL} model=${modelId}`, lastError);
+          await new Promise(r => setTimeout(r, delay));
+        }
+
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(body),
+          signal: AbortSignal.timeout(timeout),
+        });
+
+        if (!response.ok) {
+          const errText = await response.text();
+          const status = response.status;
+          const isRetryable = status === 429 || status >= 500;
+
+          lastError = new GroundingError(
+            `Gemini ${status} [${modelId}]: ${errText.slice(0, 300)}`,
+            status === 429 ? 'RATE_LIMIT' : status >= 500 ? 'SERVER' : 'API',
+            status,
+          );
+
+          if (isRetryable && attempt < RETRIES_PER_MODEL - 1) continue;
+          break;
+        }
+
+        const data = await response.json();
+        const result = parseGroundingResponse(data);
+        const elapsed = Date.now() - t0;
+        console.log(`[Grounding] ConverseVision done in ${elapsed}ms — model=${modelId}, ${result.sources.length} sources`);
+        tg.i('GroundedConverseVision', `✓ model=${modelId} ${elapsed}ms, ${result.sources.length} sources`);
+
+        return { ...result, model: modelId };
+      } catch (e) {
+        if (e.name === 'GroundingError') {
+          lastError = e;
+          break;
+        }
+        lastError = e;
+        const isNetwork = /timeout|ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|fetch failed/i.test(e.message);
+        if (!isNetwork || attempt >= RETRIES_PER_MODEL - 1) break;
+      }
+    }
+
+    if (allModels.length > 1) {
+      console.warn(`[Grounding] ConverseVision ${modelId} exhausted, ${mi < allModels.length - 1 ? `trying ${allModels[mi + 1]}` : 'no more models'}`);
+      tg.w('GroundedConverseVision', `${modelId} exhausted${mi < allModels.length - 1 ? `, trying ${allModels[mi + 1]}` : ''}`, lastError);
+    }
+  }
+
+  const elapsed = Date.now() - t0;
+  tg.e('GroundedConverseVision', `All ${allModels.length} models × ${RETRIES_PER_MODEL} retries exhausted in ${elapsed}ms: [${allModels.join(',')}]`, lastError);
+  if (lastError?.name === 'GroundingError') throw lastError;
+  throw new GroundingError(
+    `All grounding vision models exhausted [${allModels.join(',')}]: ${(lastError?.message || 'unknown').slice(0, 200)}`,
+    'EXHAUSTED',
+    0,
+  );
+}
+
 /**
  * Check if Google Search Grounding is available (key configured).
  */
@@ -516,6 +733,8 @@ module.exports = {
   groundedExtract,
   groundedGenerate,
   groundedConverse,
+  groundedSearchVision,
+  groundedConverseVision,
   buildGroundingSystemInstruction,
   updateGroundingModels,
   isGroundingAvailable,

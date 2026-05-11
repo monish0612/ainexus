@@ -3,3 +3,8 @@ data/*.db
 data/*.db-shm
 data/*.db-wal
 .env
+
+# Transient debug + live-test output (regenerated on every run)
+api/*.log
+api/sharp-install.log
+api/live-test-*.log
