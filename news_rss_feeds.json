@@ -132,6 +132,28 @@
       "enabled": true,
       "prompt_key": "tech_summary_prompt",
       "description": "Transformative AI and enterprise technology coverage"
+    },
+    {
+      "id": "lensmen_reviews",
+      "name": "Lensmen Reviews",
+      "url": "https://lensmenreviews.com/reviews/feed/",
+      "category": "movies",
+      "app_category": "Movies",
+      "enabled": true,
+      "skip_summary": true,
+      "deep_extract": true,
+      "description": "Movie reviews — full original article content (no AI summary)"
+    },
+    {
+      "id": "techcrunch_ai",
+      "name": "TechCrunch — AI",
+      "url": "https://techcrunch.com/category/artificial-intelligence/feed/",
+      "category": "general",
+      "app_category": "General",
+      "enabled": true,
+      "skip_summary": true,
+      "deep_extract": true,
+      "description": "TechCrunch AI section — full original article content (no AI summary)"
     }
   ],
   "settings": {

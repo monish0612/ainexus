@@ -56,6 +56,16 @@ const {
   has: hasProvider,
   getHealth: getProviderHealth,
 } = require('./llm-providers');
+const {
+  geminiComplete,
+  listAvailableModels: listGeminiModels,
+  isGeminiModel,
+  stripGeminiPrefix,
+  normaliseModelId,
+  GeminiDirectError,
+  ERROR_CODES: GEMINI_ERROR_CODES,
+  mapErrorToHttp: mapGeminiErrorToHttp,
+} = require('./gemini-direct');
 const { tg } = require('./telegram');
 
 const app = express();
@@ -278,8 +288,110 @@ async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
 }
 
 // ── Smart caller with retry + fallback ─────────────────────────
+//
+// Routing matrix (in order):
+//   1. Caller-supplied Gemini model       → direct Google REST API
+//      (no proxy hop, the model id from Settings is sent verbatim
+//      to generativelanguage.googleapis.com so a brand-new model
+//      works the day Google ships it).
+//   2. If the direct call fails for a recoverable reason
+//      (model-not-found / rate-limit / server / network) AND
+//      `modelPriorityList` has other Gemini candidates discovered
+//      from LiteLLM, retry against those — this is the
+//      "self-healing" path so a typo in Settings degrades to the
+//      next best Gemini model instead of a hard failure.
+//   3. Non-Gemini model id (e.g. `groq/llama-…`) or no model
+//      supplied → fall back to the legacy LiteLLM proxy. This keeps
+//      the Llama fallback alive for the edge case where every
+//      Gemini call is rejected (e.g. paid-tier outage).
+//
+// The function always throws a `GeminiDirectError` when the entire
+// chain fails on the Gemini path, so the global error handler can
+// emit a rich `{error: {code, message, model}}` envelope to the
+// client.
 
-async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048 }) {
+async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048, jsonOutput = false }) {
+  // ── Path 1: direct Gemini ──────────────────────────────────
+  //
+  // Triggered when:
+  //   a) The caller explicitly passes a Gemini-shaped id
+  //      (`gemini-…` or `gemini/…`) — typically the user's
+  //      settings.liteModel from app preferences.
+  //   b) No model is supplied and the discovered LiteLLM priority
+  //      list contains at least one Gemini id — i.e. the
+  //      auto-pick path. We pick the first Gemini id from the list
+  //      and route DIRECT to Google (not back through the proxy)
+  //      so the "we don't depend on LiteLLM" invariant holds for
+  //      every Gemini code path, not just user-customised ones.
+  const explicitGemini = isGeminiModel(model);
+  const autoPickGemini = !model && modelPriorityList.some((m) => isGeminiModel(m));
+
+  if (explicitGemini || autoPickGemini) {
+    const userModel = explicitGemini ? stripGeminiPrefix(model) : null;
+    const fallbacks = modelPriorityList
+      .filter((m) => isGeminiModel(m))
+      .map((m) => stripGeminiPrefix(m))
+      .filter((m) => m && m !== userModel);
+    const modelsToTry = userModel ? [userModel, ...fallbacks] : fallbacks;
+
+    if (modelsToTry.length === 0) {
+      throw new GeminiDirectError(
+        'No Gemini models available — set a model in Settings → Gemini Lite model',
+        GEMINI_ERROR_CODES.INVALID_MODEL,
+        400,
+      );
+    }
+
+    let lastError;
+    for (let i = 0; i < modelsToTry.length; i++) {
+      const m = modelsToTry[i];
+      try {
+        const result = await geminiComplete({
+          model: m,
+          messages,
+          temperature,
+          maxTokens,
+          jsonOutput,
+        });
+        if (i > 0) {
+          tg.w(
+            'GeminiDirect',
+            `Fallback ${m} succeeded after ${modelsToTry[0]} failed (${lastError?.code || 'unknown'})`,
+          );
+        }
+        return result;
+      } catch (e) {
+        lastError = e;
+        const recoverable =
+          e instanceof GeminiDirectError &&
+          (
+            e.code === GEMINI_ERROR_CODES.MODEL_NOT_FOUND ||
+            e.code === GEMINI_ERROR_CODES.RATE_LIMIT ||
+            e.code === GEMINI_ERROR_CODES.SERVER ||
+            e.code === GEMINI_ERROR_CODES.NETWORK ||
+            e.code === GEMINI_ERROR_CODES.TIMEOUT ||
+            e.code === GEMINI_ERROR_CODES.EMPTY
+          );
+        if (!recoverable) break;
+      }
+    }
+
+    tg.e(
+      'GeminiDirect',
+      `All Gemini models exhausted (${modelsToTry.join(', ')}): ${lastError?.code || lastError?.message}`,
+      lastError,
+    );
+    throw lastError;
+  }
+
+  // ── Path 2: legacy LiteLLM proxy (non-Gemini, e.g. Groq llama) ─
+  //
+  // Only used when the caller explicitly passes a non-Gemini id
+  // (e.g. `groq/llama-3.3-70b-versatile`) OR the priority list has
+  // no Gemini ids at all (degenerate case — proxy mis-configured).
+  // The proxy is still the path of least resistance for Groq today;
+  // a future PR can swap this to a `groq-direct.js` module the same
+  // way Gemini was migrated.
   if (modelPriorityList.length === 0 && !model) {
     await discoverLiteLLMModels();
     if (modelPriorityList.length === 0) {
@@ -327,21 +439,30 @@ async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 204
   throw lastError;
 }
 
-// ── LiteLLM model id normalisation ─────────────────────────────
+// ── Model id normalisation ─────────────────────────────────────
 // Clients send a bare Gemini model id (e.g. "gemini-3.1-flash-lite-preview")
-// because that's what they store in app settings. LiteLLM, however, requires
-// the provider-prefixed form ("gemini/gemini-3.1-flash-lite-preview"). This
-// helper turns a user-facing id into a LiteLLM-routable id while preserving
-// any existing provider prefix the caller already supplied.
+// because that's what they store in app settings. The direct-Google path
+// in `gemini-direct.js` consumes the bare id verbatim, while the legacy
+// LiteLLM proxy path expects the provider-prefixed form
+// ("gemini/gemini-3.1-flash-lite-preview").
+//
+// We keep both formats valid downstream:
+//   • The direct path's `isGeminiModel` accepts both prefixed and bare ids
+//     and strips the prefix before sending to Google.
+//   • `_callLiteLLMOnce` (proxy path) sends whatever it gets; the proxy is
+//     happy with `gemini/<id>`.
+//
+// Therefore we DO NOT prefix here any more — passing the bare id keeps
+// the caller's intent intact and lets the routing layer decide which
+// transport to use based on `isGeminiModel`.
 function _normalizeLiteLLMGeminiId(id) {
   if (typeof id !== 'string') return null;
   const trimmed = id.trim();
   if (!trimmed) return null;
-  if (trimmed.includes('/')) return trimmed;
-  return 'gemini/' + trimmed;
+  return trimmed;
 }
 
-// Pick the LiteLLM model id for a "lite" call: `liteModel` from settings wins,
+// Pick the model id for a "lite" call: `liteModel` from settings wins,
 // then the legacy `model` field (which is already routed/prefixed by callers
 // who set it manually), else null so the caller falls back to its default.
 function _pickLiteLLMModel(liteModel, legacyModel) {
@@ -1198,7 +1319,15 @@ async function _readUserPreference(key) {
   return trimmed.length > 0 ? trimmed : null;
 }
 
-/** Reads `lite_model` from user_preferences and prefixes for LiteLLM routing. */
+/**
+ * Reads `lite_model` from user_preferences. Returns the BARE id
+ * (e.g. `gemini-3.1-flash-lite-preview`) — no `gemini/` prefix is
+ * added any more because the direct-Google transport in
+ * `gemini-direct.js` consumes the bare id verbatim. The legacy
+ * LiteLLM proxy path also accepts the bare id (LiteLLM auto-detects
+ * the provider from the id pattern), so this is safe for both
+ * transports.
+ */
 async function getConfiguredLiteModel() {
   const cache = _settingsModelCache.liteModel;
   if (cache.expiresAt > Date.now()) return cache.value;
@@ -1418,6 +1547,7 @@ newsRouter.post('/clear-fallbacks', async (_req, res, next) => {
       `DELETE FROM news_articles
        WHERE saved = FALSE
          AND (summary_markdown LIKE '# %\n\n## Article Preview%'
+              OR summary_markdown LIKE '%<!-- summary-unavailable -->%'
               OR summary_markdown IS NULL
               OR LENGTH(summary_markdown) < 200)`,
     );
@@ -3578,6 +3708,29 @@ aiRouter.post('/summarize-history', async (req, res, next) => {
   }
 });
 
+// ── GET /api/v1/ai/models ───────────────────────────────────────
+// Dynamic model directory backed by Google's live `/v1beta/models`
+// endpoint. The Settings screen calls this to populate the Gemini
+// Lite dropdown so the user picks from models the configured API
+// key can ACTUALLY invoke. Cached 5 min server-side (see
+// `gemini-direct.js`) — pass `?refresh=1` to force a re-fetch.
+//
+// Response shape:
+//   {
+//     models: [{ id, displayName, description, inputTokenLimit, outputTokenLimit }],
+//     primary: 'gemini-3.1-flash-lite-preview',
+//     cachedAt: '2026-05-28T10:42:00.000Z'
+//   }
+aiRouter.get('/models', async (req, res, next) => {
+  try {
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    const data = await listGeminiModels({ force });
+    res.json(data);
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/api/v1/ai', aiRouter);
 
 // ═══════════════════════════════════════════════════════════════
@@ -4927,10 +5080,34 @@ app.use((_req, res) => {
 });
 
 app.use((err, _req, res, _next) => {
+  // Gemini-direct failures carry rich diagnostic info — surface the
+  // structured envelope to the client (toast layer) so the user can
+  // see *why* a call failed (bad model id, rate-limit, safety block,
+  // …) instead of a generic "Internal server error".
+  if (err instanceof GeminiDirectError) {
+    const status = mapGeminiErrorToHttp(err);
+    console.error(`[ERROR] GeminiDirect ${err.code} (${status}) [${err.model || '-'}]: ${err.message}`);
+    return res.status(status).json({
+      error: {
+        message: err.message,
+        code: err.code,
+        provider: 'gemini',
+        model: err.model || null,
+      },
+    });
+  }
+
   console.error('[ERROR]', err.message);
   const status = err.status || 500;
+  const isProd = process.env.NODE_ENV === 'production';
+  // Always include a `code` in errors so the Flutter side can decide
+  // between "show a generic toast" and "highlight the model-name
+  // field in Settings" without needing string-matching heuristics.
   res.status(status).json({
-    error: process.env.NODE_ENV === 'production' ? 'Internal server error' : err.message,
+    error: {
+      message: isProd ? 'Internal server error' : (err.message || 'Unknown error'),
+      code: err.code || 'INTERNAL',
+    },
   });
 });
 
@@ -5363,6 +5540,28 @@ async function _initTablesWithRetry(maxRetries = 3) {
   try {
     await _initTablesWithRetry(3);
     await discoverLiteLLMModels();
+
+    // ── Startup sanity check: confirm GOOGLE_API_KEY is usable ──
+    //
+    // The direct-Gemini transport is the primary path for every AI
+    // feature now (rephrase, coach, news summarize, dictionary,
+    // smart-parse, …). If the key is missing or unsubstituted
+    // (`${GOOGLE_API_KEY}` placeholder, common with bare-node
+    // startups), we surface ONE loud warning here so the operator
+    // sees it instead of waiting for the first user complaint.
+    // We do NOT crash — the legacy LiteLLM/xGrok path can still
+    // service requests for non-Gemini models.
+    try {
+      const probe = await listGeminiModels({ force: true });
+      console.log(`[Gemini] ✓ Direct API usable — ${probe.models.length} models accessible to GOOGLE_API_KEY`);
+      tg.i('Gemini', `Direct API ✓ ${probe.models.length} models, primary=${probe.primary || 'none'}`);
+    } catch (e) {
+      const msg = e?.code === 'CONFIG'
+        ? '⚠️  GOOGLE_API_KEY missing or unsubstituted — Gemini direct path WILL FAIL on every request. Set a valid key in backend/.env and restart.'
+        : `⚠️  Gemini /models probe failed (${e?.code || 'unknown'}): ${String(e?.message || e).slice(0, 200)}`;
+      console.warn(msg);
+      tg.e('Gemini', msg, e);
+    }
 
     // ── Register LLM providers for plug-and-play news ingestion ──
     registerProvider('litellm', {

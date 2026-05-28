@@ -2,6 +2,13 @@ const { createHash } = require('crypto');
 const fs = require('fs');
 const path = require('path');
 const { tg } = require('./telegram');
+const {
+  geminiComplete,
+  isGeminiModel,
+  stripGeminiPrefix,
+  GeminiDirectError,
+  ERROR_CODES: GEMINI_ERROR_CODES,
+} = require('./gemini-direct');
 
 const CONFIG_PATH = fs.existsSync(path.resolve(__dirname, '../../news_rss_feeds.json'))
   ? path.resolve(__dirname, '../../news_rss_feeds.json')
@@ -290,15 +297,154 @@ function appendSourceLink(summary, url, source) {
     : url.includes('marktechpost') ? '🤖' : url.includes('machinelearningmastery') ? '🧠'
     : url.includes('towardsai') ? '🚀' : url.includes('towardsdatascience') ? '📊'
     : url.includes('kdnuggets') ? '💎' : url.includes('the-ken') ? '🔍'
-    : url.includes('venturebeat') ? '⚡' : '🔗';
+    : url.includes('venturebeat') ? '⚡' : url.includes('techcrunch') ? '📰'
+    : url.includes('lensmen') ? '🎬' : '🔗';
 
   return `${summary.trim()}\n\n---\n\n## ${srcIcon} Read Original Article\n\n> **Want to dive deeper?** Access the full article with original charts, images, and detailed analysis.\n\n**[📖 Read Full Article on ${srcName} →](${url})**\n`.trim();
 }
 
-function fallbackSummary(title, content, url, source) {
-  const excerpt = normalizeWhitespace(content || '').slice(0, 650).trim();
-  const base = `# ${title}\n\n## Article Preview\n\n${excerpt || 'Summary generation was unavailable for this article.'}\n`;
+// ─────────────────────────────────────────────────────────────────────────
+// FULL-CONTENT FORMATTER (skip_summary feeds)
+// ─────────────────────────────────────────────────────────────────────────
+//
+// For feeds with `skip_summary: true` we DO NOT run the article through any
+// LLM. Instead, we take the deep-extracted plain-text content and convert
+// it into clean, readable Markdown the Flutter detail screen can render
+// with its existing `_SummaryMarkdown` widget. The goal is "newspaper-grade
+// readability" — proper paragraph breaks, sensible heading detection, and
+// no junk leftover from the source HTML strip.
+//
+// The output is intentionally structured the SAME way an AI summary would
+// be (title-less, paragraphs + optional section headings, ends with a
+// "Read Original Article" link) so every downstream consumer — markdown
+// renderer, TTS extractor, follow-up grounder — works without any
+// branching on category.
+// ─────────────────────────────────────────────────────────────────────────
+
+function splitParagraphs(text) {
+  if (!text) return [];
+  const normalised = String(text)
+    .replace(/\r\n/g, '\n')
+    .replace(/\r/g, '\n')
+    // Collapse any 3+ newlines to a clean paragraph break.
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+
+  // First pass: split on existing double newlines.
+  const explicit = normalised.split(/\n{2,}/).map((p) => p.trim()).filter(Boolean);
+  if (explicit.length >= 3) return explicit;
+
+  // Fall-back: a single huge blob (Zyte / direct-fetch routes often return
+  // one long line). Sentence-segment then group into ~3-sentence paragraphs
+  // so the article is actually readable instead of a 12 000-char wall.
+  const oneLine = normalised.replace(/\n+/g, ' ').replace(/\s+/g, ' ').trim();
+  if (!oneLine) return [];
+  const sentences = oneLine.match(/[^.!?]+[.!?]+(?:["')\]]+)?/g) || [oneLine];
+  const groups = [];
+  let buf = [];
+  let bufLen = 0;
+  for (const raw of sentences) {
+    const s = raw.trim();
+    if (!s) continue;
+    buf.push(s);
+    bufLen += s.length;
+    // Cap paragraphs around ~600 chars OR 3 sentences for mobile reading.
+    if (buf.length >= 3 || bufLen >= 600) {
+      groups.push(buf.join(' '));
+      buf = [];
+      bufLen = 0;
+    }
+  }
+  if (buf.length > 0) groups.push(buf.join(' '));
+  return groups;
+}
+
+// Lightweight heading detector: an all-caps short line, or a line that ends
+// without sentence punctuation and is followed by long body text. Used very
+// conservatively — getting it wrong is uglier than rendering the line as a
+// regular paragraph, so we bias towards "treat as paragraph" unless the
+// signal is unambiguous.
+function looksLikeHeading(line) {
+  const t = line.trim();
+  if (t.length < 3 || t.length > 90) return false;
+  if (/[.!?:;…]$/.test(t)) return false;
+  if (/^[A-Z0-9][^a-z]{2,}$/.test(t)) return true; // ALL CAPS
+  if (/^[#*]+\s+/.test(t)) return true;            // existing md heading
+  return false;
+}
+
+function escapeMd(s) {
+  return String(s || '').replace(/([*_`~])/g, '\\$1');
+}
+
+function buildFullContentMarkdown({ content, url, source }) {
+  const paragraphs = splitParagraphs(content);
+  if (paragraphs.length === 0) {
+    // CAREFUL: the prose here must NOT contain the literal substring
+    // "Read Original Article" or "Read Full Article" — `appendSourceLink`
+    // uses those as "link already present" sentinels and would early-return
+    // without attaching the actual source-link block. Phrased neutrally so
+    // the appended link below it always renders.
+    return appendSourceLink(
+      `> _The article body could not be extracted at fetch time. Open the source link below to view the full piece on ${source || 'the source site'}._`,
+      url,
+      source,
+    );
+  }
+
+  const mdBlocks = [];
+  for (const para of paragraphs) {
+    const firstNl = para.indexOf('\n');
+    const head = firstNl >= 0 ? para.slice(0, firstNl) : para;
+    const rest = firstNl >= 0 ? para.slice(firstNl + 1).trim() : '';
+    if (rest && looksLikeHeading(head)) {
+      mdBlocks.push(`## ${escapeMd(head.replace(/^[#*]+\s+/, '').trim())}`);
+      mdBlocks.push(rest);
+    } else {
+      mdBlocks.push(para);
+    }
+  }
+
+  return appendSourceLink(mdBlocks.join('\n\n').trim(), url, source);
+}
+
+function buildFullContentExcerpt(content) {
+  const paras = splitParagraphs(content);
+  const src = (paras[0] || content || '').replace(/\s+/g, ' ').trim();
+  if (!src) return 'New article available.';
+  if (src.length <= 240) return src;
+  const t = src.slice(0, 237);
+  const sp = t.lastIndexOf(' ');
+  return `${(sp > 140 ? t.slice(0, sp) : t).trim()}…`;
+}
+
+// Sentinel emitted when the LLM call could not produce a summary for an
+// article (model id not found, rate limited, blocked, …). Kept short
+// and visually distinct from a real summary so the user immediately
+// recognises it as a failure marker rather than mistaking the leading
+// chunk of the article body for "the AI summary".
+//
+// Detection helpers downstream (the `news/clear-fallbacks` SQL clean-up,
+// the Flutter detail screen's banner) match the `[summary-unavailable]`
+// HTML comment marker so they don't have to depend on cosmetic copy.
+const SUMMARY_UNAVAILABLE_MARKER = '<!-- summary-unavailable -->';
+
+function fallbackSummary(title, content, url, source, reason) {
+  const safeReason = reason ? String(reason).slice(0, 200) : '';
+  const lines = [
+    SUMMARY_UNAVAILABLE_MARKER,
+    `> **Summary couldn't be generated for this article.**`,
+    safeReason
+      ? `> _Reason: ${safeReason}_`
+      : `> _The AI service was unavailable. Tap "Read Original Article" below to view the full piece._`,
+  ];
+  const base = lines.join('\n');
   return appendSourceLink(base, url, source);
+}
+
+function isFallbackSummary(md) {
+  if (!md || typeof md !== 'string') return false;
+  return md.includes(SUMMARY_UNAVAILABLE_MARKER);
 }
 
 let _modelPriorityCache = null;
@@ -341,15 +487,26 @@ async function _callLiteLLMOnce(model, messages, opts) {
 async function callLiteLLM(model, messages, opts = {}) {
   const t0 = Date.now();
   const priority = _getModelPriority();
-  const modelsToTry = model
-    ? [model]
-    : priority && priority.length > 0
-      ? [...priority]
-      : [];
+
+  // Build the candidate list. If the caller specified a Gemini model,
+  // try that one first and use any other Gemini ids from the priority
+  // list as automatic fallbacks (handles "user typed a bad model name"
+  // gracefully so news summaries never silently degrade to the
+  // "# title / ## Article Preview" fallback marker).
+  const callerModel = typeof model === 'string' ? model.trim() : '';
+  let modelsToTry;
+  if (callerModel) {
+    const fallbacks = (priority || []).filter((m) => m && m !== callerModel);
+    modelsToTry = [callerModel, ...fallbacks];
+  } else if (priority && priority.length > 0) {
+    modelsToTry = [...priority];
+  } else {
+    modelsToTry = [];
+  }
 
   if (modelsToTry.length === 0) {
-    tg.e('NEWS-LLM', 'No models available — _LITELLM_MODEL_PRIORITY empty');
-    throw new Error('No LiteLLM models available — _LITELLM_MODEL_PRIORITY is empty');
+    tg.e('NEWS-LLM', 'No models available — caller did not pass a model and _LITELLM_MODEL_PRIORITY is empty');
+    throw new Error('No LLM models available — set a Gemini model in Settings or wait for LiteLLM discovery to complete');
   }
 
   tg.d('NEWS-LLM', `Calling models=[${modelsToTry.join(',')}]`);
@@ -357,23 +514,30 @@ async function callLiteLLM(model, messages, opts = {}) {
   let lastError;
   for (let i = 0; i < modelsToTry.length; i++) {
     const m = modelsToTry[i];
-    const maxRetries = i === modelsToTry.length - 1 ? 3 : 2;
+    const isLast = i === modelsToTry.length - 1;
+    const maxRetries = isLast ? 3 : 2;
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       try {
         if (attempt > 0) {
           tg.w('NEWS-LLM', `Retry ${attempt + 1}/${maxRetries} model=${m}`);
-          await new Promise(r => setTimeout(r, 500 * Math.pow(2, attempt)));
+          await new Promise((r) => setTimeout(r, 500 * Math.pow(2, attempt)));
         }
-        const result = await _callLiteLLMOnce(m, messages, opts);
-        tg.i('NEWS-LLM', `✓ model=${m} ${Date.now() - t0}ms`);
+        const result = await _callOne(m, messages, opts);
+        tg.i('NEWS-LLM', `✓ model=${m} ${Date.now() - t0}ms${i > 0 ? ' (fallback)' : ''}`);
         return result;
       } catch (e) {
         lastError = e;
-        if (!_isRetryable(e.message) || attempt >= maxRetries - 1) {
+        const retryable = _isRetryableInThisLayer(e);
+
+        // Non-retryable inside this model — break and try the next
+        // candidate in the outer loop (don't burn the retry budget).
+        if (!retryable || attempt >= maxRetries - 1) {
           if (modelsToTry.length > 1) {
-            console.warn(`[NEWS-LLM] ${m} exhausted (${attempt + 1} attempts): ${e.message.slice(0, 100)}`);
-            tg.w('NEWS-LLM', `${m} exhausted after ${attempt + 1} attempts`, e);
+            console.warn(
+              `[NEWS-LLM] ${m} exhausted (${attempt + 1} attempts): ${(e.message || '').slice(0, 100)}`,
+            );
+            tg.w('NEWS-LLM', `${m} exhausted after ${attempt + 1} attempts → trying next candidate`, e);
           }
           break;
         }
@@ -381,13 +545,62 @@ async function callLiteLLM(model, messages, opts = {}) {
     }
   }
   console.error(`[NEWS-LLM] All models exhausted: ${modelsToTry.join(', ')}`);
-  tg.e('NEWS-LLM', `All models exhausted: ${modelsToTry.join(', ')} ${Date.now() - t0}ms`, lastError);
+  tg.e(
+    'NEWS-LLM',
+    `All models exhausted: ${modelsToTry.join(', ')} ${Date.now() - t0}ms`,
+    lastError,
+  );
   throw lastError;
+}
+
+// Single-call dispatcher: Gemini ids go direct to Google's REST API,
+// everything else falls back to the legacy LiteLLM proxy. This keeps
+// xGrok / Groq routing intact while letting a freshly-released Gemini
+// model work without redeploying the proxy.
+async function _callOne(modelId, messages, opts) {
+  const bare = stripGeminiPrefix(modelId);
+  if (isGeminiModel(modelId)) {
+    const result = await geminiComplete({
+      model: bare,
+      messages,
+      temperature: opts.temperature ?? 0.35,
+      maxTokens: opts.max_tokens ?? opts.maxTokens ?? 2500,
+      jsonOutput: !!opts.jsonOutput,
+      timeoutMs: opts.timeoutMs ?? 30_000,
+    });
+    return result.content || '';
+  }
+  return _callLiteLLMOnce(modelId, messages, opts);
+}
+
+function _isRetryableInThisLayer(err) {
+  if (err instanceof GeminiDirectError) {
+    return (
+      err.code === GEMINI_ERROR_CODES.RATE_LIMIT ||
+      err.code === GEMINI_ERROR_CODES.SERVER ||
+      err.code === GEMINI_ERROR_CODES.NETWORK ||
+      err.code === GEMINI_ERROR_CODES.TIMEOUT
+    );
+  }
+  return _isRetryable(err.message);
 }
 
 function preferredModel() {
   const priority = _getModelPriority();
   return priority?.[0] || null;
+}
+
+// Compact, user-facing error reason for the `summary-unavailable`
+// fallback. We slice + sanitise so it stays one line in the article
+// detail screen ("Reason: …") and never leaks a stack trace.
+function _shortErrorReason(err) {
+  if (!err) return '';
+  if (err instanceof GeminiDirectError) {
+    const code = err.code ? `[${err.code}] ` : '';
+    return `${code}${String(err.message || '').slice(0, 160)}`;
+  }
+  const raw = String(err.message || err);
+  return raw.slice(0, 200);
 }
 
 function fillTemplate(tpl, title, content) {
@@ -520,35 +733,80 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   }
 
   const t0 = Date.now();
-  console.log(`[NEWS] Processing: "${title.slice(0, 60)}" from ${source} (${feed.prompt_key || 'summary_prompt'}) content=${contentText.length}ch${feed.deep_extract ? ' [deep]' : ''}`);
+  const skipSummary = feed.skip_summary === true;
+  console.log(
+    `[NEWS] Processing: "${title.slice(0, 60)}" from ${source} ` +
+    `(${skipSummary ? 'full-content' : feed.prompt_key || 'summary_prompt'}) ` +
+    `content=${contentText.length}ch${feed.deep_extract ? ' [deep]' : ''}` +
+    `${skipSummary ? ' [skip-summary]' : ''}`,
+  );
 
-  let summary = await summaryLimiter(async () => {
-    const gen = await generateSummary({
-      title,
-      content: contentText,
-      imageUrl: item.image,
-      promptKey: feed.prompt_key,
-      settings,
-      config,
-      completeFn,
-      fallbackCompleteFn,
-      liteModel,
-      xgrokLiteModel,
-    });
-    if (settings.api_delay_seconds > 0) await sleep(settings.api_delay_seconds * 1000);
-    return gen;
-  });
+  let summary;
+  let summaryErrorReason = null;
 
-  if (!summary) {
-    summary = fallbackSummary(title, contentText, item.link, source);
+  if (skipSummary) {
+    // Full-content feeds (Movies / General): never call the LLM. We just
+    // format the deep-extracted plain text into clean Markdown so the
+    // existing detail-view renderer can display it as-if it were an AI
+    // summary. The follow-up chat still uses the LLM — that path is
+    // unaffected because it's a separate endpoint.
+    try {
+      summary = buildFullContentMarkdown({
+        content: contentText,
+        url: item.link,
+        source,
+      });
+      tg.i(
+        'NEWS/full-content',
+        `✓ ${feed.id} ${Date.now() - t0}ms ${contentText.length}ch → ${summary.length}ch md "${title.slice(0, 50)}"`,
+      );
+    } catch (e) {
+      summaryErrorReason = _shortErrorReason(e);
+      tg.e('NEWS/full-content', `Format FAILED ${feed.id} "${title.slice(0, 40)}"`, e);
+      summary = fallbackSummary(title, contentText, item.link, source, summaryErrorReason);
+    }
   } else {
-    summary = cleanSummaryArtifacts(summary);
-    summary = appendSourceLink(summary, item.link, source);
+    summary = await summaryLimiter(async () => {
+      try {
+        const gen = await generateSummary({
+          title,
+          content: contentText,
+          imageUrl: item.image,
+          promptKey: feed.prompt_key,
+          settings,
+          config,
+          completeFn,
+          fallbackCompleteFn,
+          liteModel,
+          xgrokLiteModel,
+        });
+        if (settings.api_delay_seconds > 0) await sleep(settings.api_delay_seconds * 1000);
+        return gen;
+      } catch (e) {
+        summaryErrorReason = _shortErrorReason(e);
+        return null;
+      }
+    });
+
+    if (!summary) {
+      summary = fallbackSummary(title, contentText, item.link, source, summaryErrorReason);
+    } else {
+      summary = cleanSummaryArtifacts(summary);
+      summary = appendSourceLink(summary, item.link, source);
+    }
   }
 
   const { v4: uuidv4 } = require('uuid');
   const id = `news-${uuidv4()}`;
   const now = new Date().toISOString();
+
+  // When the LLM call failed we don't want the news list to show
+  // "Summary couldn't be generated for this article…" as the preview
+  // — that's only useful inside the detail view (where the banner
+  // explains the failure). For the list excerpt, fall through to a
+  // stripped chunk of the original RSS content so the user can still
+  // judge whether to open the article.
+  const excerptSummary = isFallbackSummary(summary) ? '' : summary;
 
   await pool.query(
     `INSERT INTO news_articles (
@@ -563,7 +821,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     [
       id, title, feed.app_category || 'Technology', feed.category || null,
       readTime(summary), fmtTimeAgo(pubDate), fmtDate(pubDate), item.image || '',
-      buildExcerpt(summary, contentText), source,
+      buildExcerpt(excerptSummary, contentText), source,
       false, JSON.stringify({ sourceId: feed.id, originalUrl: item.link || '', publishedAt: pubDate.toISOString() }),
       false, false, item.guid, item.link || '', summary,
       pubDate.toISOString(), now, now,
@@ -798,4 +1056,17 @@ function startScheduler(pool, { getProviderFn, getLiteModelFn, getXGrokLiteModel
   }, intervalMs);
 }
 
-module.exports = { syncNewsFeeds, getSyncState, startScheduler };
+module.exports = {
+  syncNewsFeeds,
+  getSyncState,
+  startScheduler,
+  isFallbackSummary,
+  SUMMARY_UNAVAILABLE_MARKER,
+  // Exposed for unit tests — the full-content (skip_summary) pipeline.
+  // Pure functions; safe to import without bootstrapping the scheduler.
+  splitParagraphs,
+  looksLikeHeading,
+  buildFullContentMarkdown,
+  buildFullContentExcerpt,
+  appendSourceLink,
+};
