@@ -141,8 +141,21 @@
       "app_category": "Movies",
       "enabled": true,
       "skip_summary": true,
-      "deep_extract": true,
-      "description": "Movie reviews — full original article content (no AI summary)"
+      "extraction_strategy": "clean",
+      "max_age_days": 10,
+      "description": "Movie reviews — clean trafilatura-style extraction; RSS lacks pubDate so date is extracted from the article page"
+    },
+    {
+      "id": "sudhir_film_reviews",
+      "name": "Sudhir Srinivasan — Film Reviews",
+      "url": "https://sudhir-srinivasan.com/category/film-reviews/feed/",
+      "category": "movies",
+      "app_category": "Movies",
+      "enabled": true,
+      "skip_summary": true,
+      "extraction_strategy": "clean",
+      "max_age_days": 30,
+      "description": "Tamil/Indian film reviews by Sudhir Srinivasan — clean WordPress entry-content extraction; 30-day window because reviews are posted roughly 2–4 times per month"
     },
     {
       "id": "techcrunch_ai",
@@ -152,8 +165,23 @@
       "app_category": "General",
       "enabled": true,
       "skip_summary": true,
-      "deep_extract": true,
-      "description": "TechCrunch AI section — full original article content (no AI summary)"
+      "extraction_strategy": "clean",
+      "description": "TechCrunch AI section — clean trafilatura-style extraction; RSS today-only filter applies"
+    },
+    {
+      "id": "gizbot_reviews",
+      "name": "Gizbot Reviews",
+      "url": "https://www.gizbot.com/reviews/",
+      "category": "general",
+      "app_category": "General",
+      "enabled": true,
+      "skip_summary": true,
+      "source_type": "listing",
+      "extraction_strategy": "clean",
+      "listing_link_pattern": "https?://(?:www\\.)?gizbot\\.com/.*/reviews?/.*\\.html$",
+      "max_listing_links": 25,
+      "max_age_days": 12,
+      "description": "Gizbot gadget reviews — listing-page scrape (no RSS) + structured rating/pros/cons extraction"
     }
   ],
   "settings": {

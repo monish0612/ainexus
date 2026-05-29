@@ -9,6 +9,18 @@ const {
   GeminiDirectError,
   ERROR_CODES: GEMINI_ERROR_CODES,
 } = require('./gemini-direct');
+// Trafilatura-grade clean extraction for `extraction_strategy: 'clean'`
+// feeds (Movies / General) and the Gizbot listing scraper. Imported
+// directly — no DI — because `news-extract.js` has no upstream deps on
+// us. See `news-extract.js` for the public surface.
+const {
+  cleanExtract,
+  fetchHtml,
+  scrapeListingPage,
+  extractGizbotProsConsRating,
+  buildReviewMetaMarkdown,
+  extractDateFromHtml,
+} = require('./news-extract');
 
 const CONFIG_PATH = fs.existsSync(path.resolve(__dirname, '../../news_rss_feeds.json'))
   ? path.resolve(__dirname, '../../news_rss_feeds.json')
@@ -298,7 +310,8 @@ function appendSourceLink(summary, url, source) {
     : url.includes('towardsai') ? '🚀' : url.includes('towardsdatascience') ? '📊'
     : url.includes('kdnuggets') ? '💎' : url.includes('the-ken') ? '🔍'
     : url.includes('venturebeat') ? '⚡' : url.includes('techcrunch') ? '📰'
-    : url.includes('lensmen') ? '🎬' : '🔗';
+    : url.includes('lensmen') ? '🎬' : url.includes('sudhir-srinivasan') ? '🎬'
+    : url.includes('gizbot') ? '📱' : '🔗';
 
   return `${summary.trim()}\n\n---\n\n## ${srcIcon} Read Original Article\n\n> **Want to dive deeper?** Access the full article with original charts, images, and detailed analysis.\n\n**[📖 Read Full Article on ${srcName} →](${url})**\n`.trim();
 }
@@ -710,12 +723,78 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   if (deleted.rows.length > 0) return false;
 
   const title = item.title || 'Untitled';
-  const pubDate = parseDate(item.pubRaw);
+  let pubDate = parseDate(item.pubRaw);
+  const hadRssPubDate = !!item.pubRaw;
   const source = feed.name || feed.id;
   let contentText = item.text || cleanHtml(item.html || '');
 
-  // Deep extraction for paywalled / subscription-only feeds
-  if (feed.deep_extract && typeof deepExtractFn === 'function' && item.link) {
+  // Structured review metadata (Gizbot only — set by clean-extract branch).
+  let reviewMeta = null;
+  let extractedTitle = '';
+
+  // ── Extraction dispatch ────────────────────────────────────────────────
+  //   • extraction_strategy: 'clean' → trafilatura-grade cheerio extractor
+  //     (TechCrunch / Lensmen / Gizbot). Also surfaces a parsed publication
+  //     date and the raw HTML — which we feed into the Gizbot pros/cons
+  //     extractor when feed.id === 'gizbot_reviews'.
+  //   • feed.deep_extract (legacy) → multi-stage Zyte/grounding fallback
+  //     for paywalled sites. Still used by Finance/AI News.
+  //   • Otherwise → trust the RSS body verbatim.
+  const useCleanExtract = feed.extraction_strategy === 'clean' && item.link;
+
+  if (useCleanExtract) {
+    const _ce0 = Date.now();
+    const _logTag = `NEWS/${feed.id}`;
+    try {
+      const extracted = await cleanExtract(item.link, { logTag: _logTag });
+      if (extracted.content && extracted.content.length >= 200) {
+        const rssLen = contentText.length;
+        contentText = extracted.content;
+        if (extracted.title) extractedTitle = extracted.title;
+        // Late-discovered publication date — used by feeds whose RSS
+        // doesn't carry pubDate (Lensmen) and as a sanity check for the
+        // rest. We never DOWNGRADE to RSS if the page disagrees because
+        // structured page-level dates are higher signal than RSS feeds
+        // that lie about pubDate (looking at you, Lensmen).
+        if (extracted.date instanceof Date && !isNaN(extracted.date.getTime())) {
+          pubDate = extracted.date;
+        }
+        tg.i(
+          _logTag,
+          `Clean extract ✓ ${Date.now() - _ce0}ms method=${extracted.extractionMethod} ${contentText.length}ch (RSS had ${rssLen}ch) date=${pubDate.toISOString().slice(0, 10)} "${title.slice(0, 50)}"`,
+        );
+      } else {
+        tg.w(
+          _logTag,
+          `Clean extract empty ${Date.now() - _ce0}ms (${extracted.extractionMethod || 'unknown'}) — falling back to RSS for "${title.slice(0, 40)}"`,
+        );
+      }
+
+      // Gizbot-only: parse the raw HTML for rating + pros + cons. We do
+      // this even when the main-content fetch was short, because the
+      // structured fields can survive odd page templates that defeat the
+      // generic extractor.
+      if (feed.id === 'gizbot_reviews' && extracted.rawHtml) {
+        try {
+          const meta = extractGizbotProsConsRating(extracted.rawHtml);
+          if (meta && (meta.rating || meta.pros.length || meta.cons.length)) {
+            reviewMeta = meta;
+            tg.d(
+              _logTag,
+              `Review meta: rating="${meta.rating || '-'}" pros=${meta.pros.length} cons=${meta.cons.length}`,
+            );
+          }
+        } catch (rmErr) {
+          tg.w(_logTag, `Review meta extraction failed: ${rmErr.message?.slice(0, 80)}`);
+        }
+      }
+    } catch (ceErr) {
+      tg.w(
+        `NEWS/${feed.id}`,
+        `Clean extract FAILED ${Date.now() - _ce0}ms "${title.slice(0, 40)}": ${ceErr.message?.slice(0, 80)} — using RSS content`,
+      );
+    }
+  } else if (feed.deep_extract && typeof deepExtractFn === 'function' && item.link) {
     const _dt0 = Date.now();
     const _logTag = `NEWS/${feed.id}`;
     try {
@@ -732,13 +811,43 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     }
   }
 
+  // ── Late date filter ──────────────────────────────────────────────────
+  // For feeds whose RSS lacks pubDate (Lensmen) or that bypass the RSS
+  // today-filter entirely (listing-source feeds like Gizbot), we evaluate
+  // the freshness cutoff HERE — after extraction has resolved a real
+  // publication date. `feed.max_age_days` lets a feed opt into a wider
+  // window than today-only (Lensmen + Gizbot publish < 1 article/day).
+  const maxAgeDays = Math.max(0, Number(feed.max_age_days || 0));
+  if (maxAgeDays > 0) {
+    const cutoff = new Date();
+    cutoff.setUTCHours(0, 0, 0, 0);
+    cutoff.setUTCDate(cutoff.getUTCDate() - maxAgeDays);
+    if (pubDate < cutoff) {
+      tg.d(
+        `NEWS/${feed.id}`,
+        `Skip stale article (${pubDate.toISOString().slice(0, 10)} < ${cutoff.toISOString().slice(0, 10)}, max_age=${maxAgeDays}d) "${title.slice(0, 50)}"`,
+      );
+      return false;
+    }
+  } else if (!hadRssPubDate && feed.source_type !== 'listing') {
+    // Strict default: any feed that didn't ship pubDate AND didn't opt
+    // into max_age_days falls back to "must be today".
+    if (!isPublishedToday(pubDate)) {
+      tg.d(`NEWS/${feed.id}`, `Skip non-today article (date=${pubDate.toISOString().slice(0, 10)}) "${title.slice(0, 40)}"`);
+      return false;
+    }
+  }
+
+  // Use the extracted page title if RSS / listing title was thin.
+  const finalTitle = (title === 'Untitled' || title.length < 8) && extractedTitle ? extractedTitle : title;
+
   const t0 = Date.now();
   const skipSummary = feed.skip_summary === true;
   console.log(
-    `[NEWS] Processing: "${title.slice(0, 60)}" from ${source} ` +
+    `[NEWS] Processing: "${finalTitle.slice(0, 60)}" from ${source} ` +
     `(${skipSummary ? 'full-content' : feed.prompt_key || 'summary_prompt'}) ` +
-    `content=${contentText.length}ch${feed.deep_extract ? ' [deep]' : ''}` +
-    `${skipSummary ? ' [skip-summary]' : ''}`,
+    `content=${contentText.length}ch${feed.deep_extract ? ' [deep]' : ''}${useCleanExtract ? ' [clean]' : ''}` +
+    `${skipSummary ? ' [skip-summary]' : ''}${reviewMeta ? ' [review-meta]' : ''}`,
   );
 
   let summary;
@@ -756,20 +865,30 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
         url: item.link,
         source,
       });
+      // Gizbot-only: prepend a structured Rating / Pros / Cons header
+      // block ABOVE the full body. Keeping it in the same summaryMarkdown
+      // means the Flutter detail view renders it through the same
+      // MarkdownBody pipeline — no schema changes required.
+      if (reviewMeta) {
+        const metaMd = buildReviewMetaMarkdown(reviewMeta);
+        if (metaMd) {
+          summary = `${metaMd}\n\n${summary}`;
+        }
+      }
       tg.i(
         'NEWS/full-content',
-        `✓ ${feed.id} ${Date.now() - t0}ms ${contentText.length}ch → ${summary.length}ch md "${title.slice(0, 50)}"`,
+        `✓ ${feed.id} ${Date.now() - t0}ms ${contentText.length}ch → ${summary.length}ch md "${finalTitle.slice(0, 50)}"`,
       );
     } catch (e) {
       summaryErrorReason = _shortErrorReason(e);
-      tg.e('NEWS/full-content', `Format FAILED ${feed.id} "${title.slice(0, 40)}"`, e);
-      summary = fallbackSummary(title, contentText, item.link, source, summaryErrorReason);
+      tg.e('NEWS/full-content', `Format FAILED ${feed.id} "${finalTitle.slice(0, 40)}"`, e);
+      summary = fallbackSummary(finalTitle, contentText, item.link, source, summaryErrorReason);
     }
   } else {
     summary = await summaryLimiter(async () => {
       try {
         const gen = await generateSummary({
-          title,
+          title: finalTitle,
           content: contentText,
           imageUrl: item.image,
           promptKey: feed.prompt_key,
@@ -789,7 +908,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     });
 
     if (!summary) {
-      summary = fallbackSummary(title, contentText, item.link, source, summaryErrorReason);
+      summary = fallbackSummary(finalTitle, contentText, item.link, source, summaryErrorReason);
     } else {
       summary = cleanSummaryArtifacts(summary);
       summary = appendSourceLink(summary, item.link, source);
@@ -819,7 +938,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
       $18, $19, $20
     )`,
     [
-      id, title, feed.app_category || 'Technology', feed.category || null,
+      id, finalTitle, feed.app_category || 'Technology', feed.category || null,
       readTime(summary), fmtTimeAgo(pubDate), fmtDate(pubDate), item.image || '',
       buildExcerpt(excerptSummary, contentText), source,
       false, JSON.stringify({ sourceId: feed.id, originalUrl: item.link || '', publishedAt: pubDate.toISOString() }),
@@ -834,42 +953,38 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
 async function processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }) {
   const feedT0 = Date.now();
   try {
-    let xml;
-    const maxFeedRetries = 2;
-    for (let attempt = 0; attempt <= maxFeedRetries; attempt++) {
-      const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 20_000);
-      try {
-        const res = await fetch(feed.url, {
-          signal: controller.signal,
-          headers: { Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8', 'User-Agent': 'Nexus-AI-News/1.0' },
-        });
-        if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
-        xml = await res.text();
-        break;
-      } catch (fetchErr) {
-        clearTimeout(timeout);
-        if (attempt < maxFeedRetries) {
-          const delay = (attempt + 1) * 2000;
-          console.warn(`[NEWS] Feed ${feed.id} fetch failed (attempt ${attempt + 1}/${maxFeedRetries + 1}), retrying in ${delay}ms`);
-          await new Promise((r) => setTimeout(r, delay));
-          continue;
-        }
-        throw fetchErr;
-      } finally {
-        clearTimeout(timeout);
-      }
+    // Listing-source feeds (e.g. Gizbot reviews — no RSS) take a separate
+    // ingestion path that scrapes a category page for article URLs. The
+    // rest of the pipeline (dedup → fetch → clean extract → store) is
+    // identical to RSS once we have a list of items.
+    let allItems;
+    if (feed.source_type === 'listing') {
+      allItems = await _fetchListingItems(feed);
+    } else {
+      allItems = await _fetchRssItems(feed);
     }
 
-    const allItems = parseFeedItems(xml);
-    const todayItems = allItems.filter((item) => {
-      const pubDate = parseDate(item.pubRaw);
-      return isPublishedToday(pubDate);
-    });
-    const items = todayItems.slice(0, settings.max_articles_per_feed);
+    // Date filter strategy:
+    //   • Strict "today only" for the legacy RSS feeds we trust pubDate on
+    //   • Defer to processItem for feeds with `max_age_days` (Lensmen/Gizbot
+    //     don't ship a usable RSS date; we extract from the page itself)
+    //   • Defer for listing-source feeds (no RSS pubDate at all)
+    const deferDateFilter =
+      feed.source_type === 'listing' ||
+      (typeof feed.max_age_days === 'number' && feed.max_age_days > 0);
 
-    if (allItems.length > 0 && items.length === 0) {
-      console.log(`[NEWS] ${feed.id}: ${allItems.length} items found but none from today (${todayIST()})`);
+    let items;
+    if (deferDateFilter) {
+      items = allItems.slice(0, settings.max_articles_per_feed);
+    } else {
+      const todayItems = allItems.filter((item) => {
+        const pubDate = parseDate(item.pubRaw);
+        return isPublishedToday(pubDate);
+      });
+      items = todayItems.slice(0, settings.max_articles_per_feed);
+      if (allItems.length > 0 && items.length === 0) {
+        console.log(`[NEWS] ${feed.id}: ${allItems.length} items found but none from today (${todayIST()})`);
+      }
     }
 
     const results = await Promise.all(
@@ -892,6 +1007,82 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
     tg.e('NEWS/feed', `Feed failed: ${feed.id} (${elapsed}ms)`, e);
     return 0;
   }
+}
+
+// ─── Per-source-type loaders ───────────────────────────────────────────
+
+async function _fetchRssItems(feed) {
+  let xml;
+  const maxFeedRetries = 2;
+  for (let attempt = 0; attempt <= maxFeedRetries; attempt++) {
+    const controller = new AbortController();
+    const timeout = setTimeout(() => controller.abort(), 20_000);
+    try {
+      const res = await fetch(feed.url, {
+        signal: controller.signal,
+        headers: { Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8', 'User-Agent': 'Nexus-AI-News/1.0' },
+      });
+      if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
+      xml = await res.text();
+      break;
+    } catch (fetchErr) {
+      clearTimeout(timeout);
+      if (attempt < maxFeedRetries) {
+        const delay = (attempt + 1) * 2000;
+        console.warn(`[NEWS] Feed ${feed.id} fetch failed (attempt ${attempt + 1}/${maxFeedRetries + 1}), retrying in ${delay}ms`);
+        await new Promise((r) => setTimeout(r, delay));
+        continue;
+      }
+      throw fetchErr;
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  return parseFeedItems(xml);
+}
+
+/**
+ * Listing-page loader for sites without an RSS feed (Gizbot reviews).
+ *
+ * Pulls the category index page, extracts article links matching the
+ * configured pattern, then synthesises feed-item shapes so the rest of
+ * the pipeline (dedup → processItem → clean-extract → store) treats
+ * them identically to RSS items.
+ *
+ * The publication date is intentionally left blank — `processItem` will
+ * derive it from the article page during clean extraction. The dedup
+ * GUID is a stable SHA1 over the canonical article URL, so re-running
+ * the scraper any number of times never produces duplicates.
+ */
+async function _fetchListingItems(feed) {
+  const t0 = Date.now();
+  const logTag = `NEWS/${feed.id}`;
+  let html;
+  try {
+    html = await fetchHtml(feed.url, { timeoutMs: 20_000, retries: 2, logTag });
+  } catch (e) {
+    tg.e(logTag, `Listing fetch failed: ${e.message?.slice(0, 120)}`, e);
+    throw e;
+  }
+
+  const rawItems = scrapeListingPage(html, {
+    baseUrl: feed.url,
+    linkPattern: feed.listing_link_pattern || '.*',
+    max: Math.max(20, (feed.max_listing_links || 20)),
+  });
+
+  const items = rawItems.map((raw) => ({
+    title: raw.title || 'Untitled',
+    link: raw.link,
+    guid: stableGuid('', raw.link, raw.title),
+    pubRaw: '', // resolved during clean extraction
+    html: '',
+    text: '',
+    image: raw.image || '',
+  }));
+
+  tg.d(logTag, `Listing scrape ✓ ${Date.now() - t0}ms ${items.length} link(s) found`);
+  return items;
 }
 
 async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn } = {}) {
