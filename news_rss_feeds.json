@@ -169,6 +169,17 @@
       "description": "TechCrunch AI section — clean trafilatura-style extraction; RSS today-only filter applies"
     },
     {
+      "id": "ai_news_artificialintelligence",
+      "name": "Artificial Intelligence News",
+      "url": "https://www.artificialintelligence-news.com/feed/",
+      "category": "general",
+      "app_category": "General",
+      "enabled": true,
+      "skip_summary": true,
+      "extraction_strategy": "clean",
+      "description": "Artificial Intelligence News (artificialintelligence-news.com) — WordPress Gutenberg content; content:encoded is full-body so cleanExtract gets a fast hit, with page-fetch fallback for thin entries"
+    },
+    {
       "id": "gizbot_reviews",
       "name": "Gizbot Reviews",
       "url": "https://www.gizbot.com/reviews/",

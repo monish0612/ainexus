@@ -86,6 +86,19 @@ const SITE_SELECTORS = {
     'div.post-content',
     'article',
   ],
+  'artificialintelligence-news.com': [
+    // Standard WordPress Gutenberg site — the `content:encoded` block in
+    // the RSS feed already ships the full article body wrapped in
+    // `wp-block-paragraph` / `wp-block-heading` elements, so 99% of the
+    // time `cleanExtract` never needs to hit the live page. These
+    // selectors are the safety net for the rare "RSS body too short"
+    // path that triggers a fetch-and-extract (long-form features that
+    // exceed the feed's truncation budget).
+    'div.entry-content',
+    'div.wp-block-post-content',
+    'article .entry-content',
+    'article',
+  ],
   'gizbot.com': [
     // Real production selector observed on review pages — wraps the
     // entire body including section.overview-section blocks.

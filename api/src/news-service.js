@@ -310,6 +310,7 @@ function appendSourceLink(summary, url, source) {
     : url.includes('towardsai') ? '🚀' : url.includes('towardsdatascience') ? '📊'
     : url.includes('kdnuggets') ? '💎' : url.includes('the-ken') ? '🔍'
     : url.includes('venturebeat') ? '⚡' : url.includes('techcrunch') ? '📰'
+    : url.includes('artificialintelligence-news') ? '✨'
     : url.includes('lensmen') ? '🎬' : url.includes('sudhir-srinivasan') ? '🎬'
     : url.includes('gizbot') ? '📱' : '🔗';
 
