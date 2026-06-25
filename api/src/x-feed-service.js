@@ -20,9 +20,10 @@ const {
 
 // ── Constants ───────────────────────────────────────────────────────────
 
+// Single daily run — 8 AM IST. The window since the previous run (~24h)
+// naturally covers the entire prior day's posts, so one run is all we need.
 const SCHEDULE_TIMES_IST = [
-  { hour: 8, minute: 0 },   // 8 AM IST — morning digest
-  { hour: 21, minute: 0 },  // 9 PM IST — evening digest
+  { hour: 8, minute: 0 }, // 8 AM IST — daily digest
 ];
 const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
 
@@ -43,7 +44,7 @@ const FETCH_TIMEOUT_MS = 120_000;
 const SUMMARIZE_TIMEOUT_MS = 90_000;
 const RETRY_BASE_DELAY_MS = 1000;
 const RETRY_MAX_DELAY_MS = 10_000;
-const CATCHUP_THRESHOLD_MS = 10 * 60 * 60 * 1000; // 10h — less than the smallest trigger gap (11h)
+const CATCHUP_THRESHOLD_MS = 10 * 60 * 60 * 1000; // 10h — fire a startup catch-up if we missed the daily 8 AM run
 
 const VISION_TIMEOUT_MS = 60_000;
 const VISION_CONCURRENCY = 3;
@@ -59,13 +60,14 @@ let _lastRunResult = null;
 
 // ── Time-slot helpers (morning vs evening) ──────────────────────────────
 
-function getCurrentSlot() {
-  const istHour = nowIST().getUTCHours();
-  return istHour < 14 ? 'morning' : 'evening';
-}
+// One digest per day → a single, time-independent dedup key. Using a constant
+// (instead of a morning/evening split) guarantees that the scheduled 8 AM run,
+// a server-restart catch-up, and a manual /x-feed/sync all map to the SAME
+// article for the day instead of creating a second one.
+const DAILY_SLOT = 'daily';
 
-function slotLabel(slot) {
-  return slot === 'morning' ? 'Morning Brief' : 'Evening Brief';
+function getCurrentSlot() {
+  return DAILY_SLOT;
 }
 
 // ── Retry / utility helpers ─────────────────────────────────────────────
@@ -165,10 +167,13 @@ function formatDateShort(dateStr) {
   }).format(d);
 }
 
-function startOfTodayISTasUTC() {
-  const ist = nowIST();
-  ist.setUTCHours(0, 0, 0, 0);
-  return new Date(ist.getTime() - IST_OFFSET_MS).toISOString();
+// Window start = the cursor from the last successful run. With no cursor
+// (first run ever, or after the state row was cleared) fall back to 24h ago so
+// the very first daily digest still captures a full prior day — i.e. yesterday's
+// posts — instead of only the few hours since IST midnight.
+function computeWindowStart(state, nowMs = Date.now()) {
+  if (state && state.last_window_end) return state.last_window_end;
+  return new Date(nowMs - 24 * 60 * 60 * 1000).toISOString();
 }
 
 function buildWindowLabels(sinceISO, untilISO) {
@@ -640,50 +645,62 @@ function buildSummarizerPrompts(handleConfig, dateLong, dateShort, postsContent,
     '• Every paragraph must answer: "So what? Why should a normal person care?"',
     '• Connect global events to everyday Indian life — prices, jobs, EMIs, petrol, groceries',
     '• Every sentence must add value — no filler, no fluff',
-    '• Use markdown formatting for clean readability',
+    '',
+    'FORMATTING RULES (render target is a mobile markdown reader — follow EXACTLY):',
+    '• Use the section headers shown below VERBATIM, including the emoji and the heading level (##).',
+    '• Keep paragraphs SHORT — 2 to 4 sentences max. White space is your friend on a phone.',
+    '• **Bold every important number, percentage, and proper noun** so the eye can scan it.',
+    '• Use "- " bullet lists for facts and figures (never long run-on paragraphs of numbers).',
+    '• Use a "> " blockquote ONLY for the one-line TL;DR callout.',
+    '• Use "---" horizontal rules exactly where shown to separate the masthead and the footer.',
+    '• DO NOT use HTML, tables, or images. Plain markdown only (headings, bold, italics, bullets, blockquote, links).',
     '',
     'You MUST return a JSON object with this EXACT structure:',
     '{',
     '  "title": "<compelling title, 60-80 chars, e.g. Kobeissi Brief: Fed Signals, PCE Data & Tariff Shock>",',
     '  "excerpt": "<1-2 sentence summary in plain language, max 200 chars>",',
-    '  "article": "<full markdown article — see structure below>",',
+    '  "article": "<full markdown article — follow the structure below EXACTLY>",',
     '  "stats": [{"value": "<number/pct>", "label": "<what it measures in plain words>"}],',
     '  "key_topics": ["topic1", "topic2", "topic3"]',
     '}',
     '',
-    'ARTICLE MARKDOWN STRUCTURE (inside "article" field):',
+    'ARTICLE MARKDOWN STRUCTURE (return inside the "article" field, following it EXACTLY):',
     '',
-    '# 📊 The Kobeissi Letter',
+    `# 📊 ${handleConfig.displayName}`,
+    `**Daily Markets Brief · ${dateLong}**`,
     '',
-    `### Daily Markets Brief — ${dateLong}`,
-    '',
-    '> One-line theme of today\'s market story in plain English',
+    '> 💡 **TL;DR —** One punchy, plain-English sentence capturing today\'s single most important market story.',
     '',
     '---',
     '',
     '## 🔑 Key Takeaways',
-    '- Plain-language bullet 1 (what happened + why it matters)',
-    '- Plain-language bullet 2',
-    '- Plain-language bullet 3',
+    '- **<the key number or fact, bolded>** — the short, plain-English consequence',
+    '- **<...>** — ...',
+    '- **<...>** — ...',
     '',
-    '## 🗣️ The Simple Version',
-    'A 3-5 sentence paragraph explaining the ENTIRE story as if talking to a friend over chai.',
-    'No jargon at all. Just: what happened, why it happened, and what it means for regular people.',
+    '## 🗣️ In Plain English',
+    'A warm 3–5 sentence paragraph that explains the WHOLE story as if talking to a friend over chai.',
+    'No jargon at all — just what happened, why it happened, and why a normal person should care.',
     '',
-    '## 📈 Detailed Analysis',
-    '### <Sub-topic heading in plain words>',
-    '<Clear explanation with numbers — explain every concept simply>',
+    '## 📈 What Actually Happened',
+    '### <Plain-words sub-topic heading>',
+    '<2–4 short sentences. **Bold every key number.** Always explain what each number MEANS in real terms.>',
     '',
-    '### <Sub-topic heading in plain words>',
-    '<Clear explanation with numbers — explain every concept simply>',
+    '### <Plain-words sub-topic heading>',
+    '<2–4 short sentences, same approach.>',
+    '',
+    '## 📊 By the Numbers',
+    '- **<number / %>** — <what it measures, in plain words>',
+    '- **<number / %>** — <...>',
+    '- **<number / %>** — <...>',
     '',
     '## 💡 What This Means For You',
-    '<How this affects everyday life in India — your groceries, petrol, EMIs, savings, job market.',
-    'Written for someone who has never opened a trading app.>',
+    '<How this touches everyday life in India — groceries, petrol, EMIs, savings, jobs. Written for',
+    'someone who has never opened a trading app. 3–5 short sentences.>',
     '',
     '---',
     '',
-    `*Daily digest from [@${handleConfig.handle}](https://x.com/${handleConfig.handle}) on X — ${dateShort}*`,
+    `*Source: [@${handleConfig.handle} on X](https://x.com/${handleConfig.handle}) · ${dateShort}*`,
   ].join('\n');
 
   const user = [
@@ -697,13 +714,15 @@ function buildSummarizerPrompts(handleConfig, dateLong, dateShort, postsContent,
     '1. Cover EVERY major point from the posts — do not skip anything',
     '2. Explain EVERYTHING in extremely simple language — imagine the reader is a 20-year-old',
     '   arts student who has never read a finance article before',
-    '3. Highlight all key numbers, percentages, and market data — but always explain what they MEAN',
-    '   in real terms (e.g. "stocks fell 4% — that means if you had ₹1 lakh invested, you lost ₹4,000")',
+    '3. **Bold** all key numbers, percentages, and market data — and always explain what they MEAN',
+    '   in real terms (e.g. "stocks fell **4%** — if you had ₹1 lakh invested, you lost **₹4,000**")',
     '4. For every development, explain the CAUSE (why it happened) and the EFFECT (what it means for regular people)',
-    '5. Include 3-5 stat items with the most important numbers — use plain labels',
-    '6. When "📊 IMAGE/CHART DATA" sections are present, INCORPORATE these data points into the article',
-    '7. MUST include "## 🗣️ The Simple Version" section — this is the most important section',
-    '   for non-finance readers. Write it like you are texting a friend.',
+    '5. Fill the "## 📊 By the Numbers" section with the 3–5 most important figures as a bullet list,',
+    '   and ALSO mirror those same figures in the "stats" JSON array with plain labels',
+    '6. When "📊 IMAGE/CHART DATA" sections are present, INCORPORATE those data points into the article',
+    '7. MUST include the "## 🗣️ In Plain English" section — it is the most important section for',
+    '   non-finance readers. Write it like you are texting a friend.',
+    '8. Keep every paragraph short (2–4 sentences) and use the EXACT section headers shown — this is a mobile reader.',
     '',
     'Return ONLY the JSON object. No other text.',
   ].join('\n');
@@ -828,7 +847,7 @@ async function processHandle(handleConfig) {
   }
 
   const state = await getSyncState(handle);
-  const windowStart = state?.last_window_end || startOfTodayISTasUTC();
+  const windowStart = computeWindowStart(state);
   const windowEnd = new Date().toISOString();
   const { sinceLabel, untilLabel } = buildWindowLabels(windowStart, windowEnd);
 
@@ -934,7 +953,7 @@ async function processHandle(handleConfig) {
 
     const articleId = await insertDigestArticle({
       handle, dateStr: dateShort, slot, title: digest.title, excerpt: digest.excerpt,
-      category, tag: slotLabel(slot), source: displayName, image: defaultImage,
+      category, tag, source: displayName, image: defaultImage,
       readTime: readTimeVal, summaryMarkdown: digest.article,
       publishedAt, contentMeta,
     });
@@ -1105,4 +1124,15 @@ module.exports = {
   stopXFeedScheduler,
   manualXFeedSync,
   getXFeedStatus,
+  // Exposed for unit tests (pure helpers — no I/O):
+  SCHEDULE_TIMES_IST,
+  X_FEED_HANDLES,
+  getCurrentSlot,
+  buildGuid,
+  buildArticleId,
+  computeWindowStart,
+  msUntilNextRun,
+  buildSummarizerPrompts,
+  extractDigestJSON,
+  extractJSON,
 };

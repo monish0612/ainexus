@@ -24,6 +24,8 @@ const {
   buildFullContentMarkdown,
   buildFullContentExcerpt,
   appendSourceLink,
+  looksPreformatted,
+  collapseBlanksPreservingCode,
 } = require('../src/news-service');
 
 // ─── splitParagraphs ───────────────────────────────────────────
@@ -270,6 +272,46 @@ test('buildFullContentMarkdown: never invokes any AI fallback marker', () => {
 });
 
 // ─── buildFullContentExcerpt ───────────────────────────────────
+
+test('looksPreformatted: detects images / code / headings / lists', () => {
+  assert.equal(looksPreformatted('![a](http://x/y.png)\n\nbody'), true);
+  assert.equal(looksPreformatted('```js\ncode\n```'), true);
+  assert.equal(looksPreformatted('## Heading\n\nbody'), true);
+  assert.equal(looksPreformatted('- one\n- two'), true);
+  assert.equal(looksPreformatted('> quote'), true);
+  assert.equal(looksPreformatted('Just a plain prose paragraph with no markdown.'), false);
+});
+
+test('buildFullContentMarkdown: passes rich markdown through (image preserved)', () => {
+  const content = '![Chart](https://cdn.example.com/chart.png)\n\nThe market rallied today on strong earnings.\n\n## Why it matters\n\nMore context here.';
+  const md = buildFullContentMarkdown({
+    content,
+    url: 'https://thedailybrief.zerodha.com/p/x',
+    source: 'The Daily Brief',
+  });
+  assert.ok(md.includes('![Chart](https://cdn.example.com/chart.png)'), 'image survives');
+  assert.ok(md.includes('## Why it matters'), 'heading survives');
+  assert.ok(md.includes('Read Original Article'), 'source link appended');
+});
+
+test('buildFullContentMarkdown: fenced code block survives intact (blank lines inside)', () => {
+  const content = 'Intro paragraph about the code.\n\n```python\ndef f(x):\n\n    return x + 1\n```\n\nClosing paragraph.';
+  const md = buildFullContentMarkdown({
+    content,
+    url: 'https://towardsdatascience.com/p/x',
+    source: 'Towards Data Science',
+  });
+  assert.ok(md.includes('```python\ndef f(x):\n\n    return x + 1\n```'),
+    `code fence intact: ${md.slice(0, 200)}`);
+  const fenceCount = (md.match(/```/g) || []).length;
+  assert.equal(fenceCount, 2, 'exactly one fenced block (open+close)');
+});
+
+test('collapseBlanksPreservingCode: collapses prose blanks but not code interior', () => {
+  const out = collapseBlanksPreservingCode('a\n\n\n\nb\n\n```\nx\n\n\ny\n```');
+  assert.ok(out.includes('a\n\nb'), 'prose blanks collapsed');
+  assert.ok(out.includes('```\nx\n\n\ny\n```'), 'code interior preserved');
+});
 
 test('buildFullContentExcerpt: empty content → friendly default', () => {
   assert.equal(buildFullContentExcerpt(''), 'New article available.');

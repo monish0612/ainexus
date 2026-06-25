@@ -9,7 +9,8 @@
       "category": "finance",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Daily finance news simplified"
     },
     {
@@ -19,7 +20,8 @@
       "category": "finance",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Daily stories on Indian markets and global business"
     },
     {
@@ -29,7 +31,8 @@
       "category": "markets",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Daily market closing summary and analysis"
     },
     {
@@ -39,7 +42,8 @@
       "category": "finance",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Deep dives into money, markets, and investing"
     },
     {
@@ -49,7 +53,8 @@
       "category": "finance",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Conversations and insights from Zerodha"
     },
     {
@@ -59,19 +64,9 @@
       "category": "education",
       "app_category": "Finance",
       "enabled": true,
-      "prompt_key": "summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Stock market education and learning"
-    },
-    {
-      "id": "the_ken",
-      "name": "The Ken",
-      "url": "https://the-ken.com/feed",
-      "category": "business",
-      "app_category": "Finance",
-      "enabled": true,
-      "prompt_key": "summary_prompt",
-      "description": "In-depth business journalism and analysis",
-      "deep_extract": true
     },
     {
       "id": "marktechpost",
@@ -80,7 +75,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "AI and machine learning news, tutorials, and research"
     },
     {
@@ -90,7 +86,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "ML tutorials, guides, and best practices for practitioners"
     },
     {
@@ -100,7 +97,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "AI research, tutorials, and engineering deep dives"
     },
     {
@@ -110,7 +108,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Data science, ML, and AI engineering articles"
     },
     {
@@ -120,7 +119,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Data science, AI, and analytics resources and tutorials"
     },
     {
@@ -130,7 +130,8 @@
       "category": "technology",
       "app_category": "AI News",
       "enabled": true,
-      "prompt_key": "tech_summary_prompt",
+      "skip_summary": true,
+      "extraction_strategy": "clean",
       "description": "Transformative AI and enterprise technology coverage"
     },
     {

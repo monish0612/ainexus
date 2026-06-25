@@ -20,6 +20,8 @@ const {
   extractGizbotProsConsRating,
   buildReviewMetaMarkdown,
   extractDateFromHtml,
+  htmlToRichMarkdown,
+  visibleTextLen,
 } = require('./news-extract');
 
 const CONFIG_PATH = fs.existsSync(path.resolve(__dirname, '../../news_rss_feeds.json'))
@@ -391,7 +393,39 @@ function escapeMd(s) {
   return String(s || '').replace(/([*_`~])/g, '\\$1');
 }
 
+// True when `content` already carries markdown block structure (rich
+// extraction output: images, fenced code, headings, lists, blockquotes).
+// Such content must NOT go through the sentence-grouping paragraph
+// splitter — that would shatter fenced code blocks at blank lines and
+// re-run heading detection on image lines. We pass it through verbatim.
+function looksPreformatted(content) {
+  if (!content) return false;
+  return (
+    content.includes('```') ||
+    /(^|\n)!\[[^\]]*\]\(/.test(content) ||
+    /(^|\n)#{1,3}\s/.test(content) ||
+    /(^|\n)>\s/.test(content) ||
+    /(^|\n)[-*]\s+\S/.test(content)
+  );
+}
+
+// Collapse 3+ blank lines to a single paragraph break WITHOUT touching the
+// interior of fenced code blocks (where blank lines are significant).
+function collapseBlanksPreservingCode(md) {
+  return String(md)
+    .split(/(```[\s\S]*?```)/g)
+    .map((seg, i) => (i % 2 === 1 ? seg : seg.replace(/\n{3,}/g, '\n\n')))
+    .join('')
+    .trim();
+}
+
 function buildFullContentMarkdown({ content, url, source }) {
+  // Fast path: rich markdown from the extractor already has the right
+  // block structure — just tidy blank lines and pin the source link.
+  if (looksPreformatted(content)) {
+    return appendSourceLink(collapseBlanksPreservingCode(content), url, source);
+  }
+
   const paragraphs = splitParagraphs(content);
   if (paragraphs.length === 0) {
     // CAREFUL: the prose here must NOT contain the literal substring
@@ -727,7 +761,15 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   let pubDate = parseDate(item.pubRaw);
   const hadRssPubDate = !!item.pubRaw;
   const source = feed.name || feed.id;
-  let contentText = item.text || cleanHtml(item.html || '');
+  // Rich markdown straight from the RSS body (`content:encoded`). Preserves
+  // the images / headings / lists / code that the plain-text `item.text`
+  // drops. This is the base — and the fallback when live-page clean
+  // extraction comes back empty (Substack / WordPress feeds that already
+  // ship the full body in the feed, e.g. the Zerodha newsletters).
+  const rssRichMarkdown = item.html
+    ? htmlToRichMarkdown(item.html, { baseUrl: item.link })
+    : '';
+  let contentText = rssRichMarkdown || item.text || cleanHtml(item.html || '');
 
   // Structured review metadata (Gizbot only — set by clean-extract branch).
   let reviewMeta = null;
@@ -748,7 +790,13 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     const _logTag = `NEWS/${feed.id}`;
     try {
       const extracted = await cleanExtract(item.link, { logTag: _logTag });
-      if (extracted.content && extracted.content.length >= 200) {
+      // Prefer the live-page extraction ONLY when it actually has MORE
+      // visible text than the rich RSS body we already hold. This stops a
+      // thin page (Substack cover-image + paywall teaser) from clobbering a
+      // full `content:encoded` body, while still upgrading feeds whose RSS
+      // ships only a teaser (Lensmen, TechCrunch, Towards Data Science).
+      const extractedText = visibleTextLen(extracted.content || '');
+      if (extracted.content && extractedText >= 200 && extractedText >= visibleTextLen(contentText)) {
         const rssLen = contentText.length;
         contentText = extracted.content;
         if (extracted.title) extractedTitle = extracted.title;
@@ -942,7 +990,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
       id, finalTitle, feed.app_category || 'Technology', feed.category || null,
       readTime(summary), fmtTimeAgo(pubDate), fmtDate(pubDate), item.image || '',
       buildExcerpt(excerptSummary, contentText), source,
-      false, JSON.stringify({ sourceId: feed.id, originalUrl: item.link || '', publishedAt: pubDate.toISOString() }),
+      false, JSON.stringify({ sourceId: feed.id, originalUrl: item.link || '', publishedAt: pubDate.toISOString(), isFullContent: skipSummary }),
       false, false, item.guid, item.link || '', summary,
       pubDate.toISOString(), now, now,
     ],
@@ -978,13 +1026,27 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
     if (deferDateFilter) {
       items = allItems.slice(0, settings.max_articles_per_feed);
     } else {
-      const todayItems = allItems.filter((item) => {
-        const pubDate = parseDate(item.pubRaw);
-        return isPublishedToday(pubDate);
-      });
-      items = todayItems.slice(0, settings.max_articles_per_feed);
-      if (allItems.length > 0 && items.length === 0) {
-        console.log(`[NEWS] ${feed.id}: ${allItems.length} items found but none from today (${todayIST()})`);
+      // Sort newest-first so both the today-filter and the past-article
+      // backfill below pick the freshest entries.
+      const sorted = [...allItems].sort(
+        (a, b) => parseDate(b.pubRaw) - parseDate(a.pubRaw),
+      );
+      const todayItems = sorted.filter((item) => isPublishedToday(parseDate(item.pubRaw)));
+
+      if (todayItems.length > 0) {
+        items = todayItems.slice(0, settings.max_articles_per_feed);
+      } else if (sorted.length > 0) {
+        // Nothing fresh today — backfill the most-recent past article(s) so
+        // the feed is never empty (low-cadence sources, weekends, holidays).
+        // `processItem` dedups by guid, so already-stored pieces are skipped
+        // and this only fills genuine gaps rather than re-adding old news.
+        items = sorted.slice(0, Math.min(settings.max_articles_per_feed, 2));
+        console.log(
+          `[NEWS] ${feed.id}: no items from today (${todayIST()}) — backfilling ${items.length} most-recent past article(s)`,
+        );
+        tg.d('NEWS/feed', `${feed.id}: no today items — backfilling ${items.length} recent past article(s)`);
+      } else {
+        items = [];
       }
     }
 
@@ -1261,4 +1323,6 @@ module.exports = {
   buildFullContentMarkdown,
   buildFullContentExcerpt,
   appendSourceLink,
+  looksPreformatted,
+  collapseBlanksPreservingCode,
 };

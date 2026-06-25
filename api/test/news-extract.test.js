@@ -34,6 +34,8 @@ const {
   buildReviewMetaMarkdown,
   hostOf,
   selectorsForUrl,
+  htmlToRichMarkdown,
+  visibleTextLen,
 } = require('../src/news-extract');
 
 // ─── extractCleanArticle ───────────────────────────────────────────────
@@ -505,6 +507,108 @@ describe('buildReviewMetaMarkdown', () => {
     assert.ok(md.includes('- Solo'));
     assert.ok(!md.includes('Rating:'));
     assert.ok(!md.includes('#### ❌ Cons'));
+  });
+});
+
+// ─── rich markdown: images + code (the "beautify" pipeline) ────────────
+
+describe('extractCleanArticle — rich images & code', () => {
+  test('preserves inline <img> as markdown with absolutised src', () => {
+    const html = `
+      <html><body><article><div class="entry-content">
+        <p>Lead paragraph long enough to clear the minimum body character threshold the extractor enforces so the block is kept as real content.</p>
+        <figure><img src="/wp-content/photo.jpg" alt="A test photo" /></figure>
+        <p>Second paragraph that also carries plenty of prose so the density heuristic has ample signal to score this block above any boilerplate.</p>
+      </div></article></body></html>`;
+    const r = extractCleanArticle(html, 'https://lensmenreviews.com/x');
+    assert.ok(r.content.includes('![A test photo](https://lensmenreviews.com/wp-content/photo.jpg)'),
+      `image markdown with absolute url: ${r.content.slice(0, 300)}`);
+  });
+
+  test('preserves <pre> code with whitespace + language hint', () => {
+    const html = `
+      <html><body><article>
+        <p>Intro paragraph padded to clear the minimum body character threshold the extractor enforces on candidate content blocks here.</p>
+        <pre><code class="language-python">def add(a, b):
+    return a + b</code></pre>
+        <p>Trailing paragraph that pads the block with enough additional prose to satisfy the density heuristic comfortably.</p>
+      </article></body></html>`;
+    const r = extractCleanArticle(html, 'https://unknown.example/');
+    assert.ok(r.content.includes('```python'), `fenced w/ lang: ${r.content.slice(0, 300)}`);
+    assert.ok(r.content.includes('def add(a, b):\n    return a + b'),
+      'code newlines + indentation preserved');
+  });
+
+  test('drops tracking-pixel / data-uri images', () => {
+    const html = `
+      <html><body><article><div class="entry-content">
+        <p>Body paragraph padded out so the candidate block clears the minimum body character threshold the extractor enforces here.</p>
+        <img src="https://example.com/tracking/pixel.gif" width="1" height="1" />
+        <img src="data:image/gif;base64,R0lGOD" />
+        <p>Another padded paragraph to give the density heuristic plenty of text to score this block above any boilerplate noise.</p>
+      </div></article></body></html>`;
+    const r = extractCleanArticle(html, 'https://lensmenreviews.com/x');
+    assert.ok(!r.content.includes('pixel.gif'), 'tracking pixel dropped');
+    assert.ok(!r.content.includes('data:image'), 'data-uri dropped');
+  });
+
+  test('image-only block does NOT pass the visible-text gate', () => {
+    // A lone cover image whose URL is >200 chars must not masquerade as
+    // real body content (regression: long Substack CDN urls).
+    const longUrl = `https://cdn.example.com/${'a'.repeat(260)}.jpg`;
+    const html = `<html><body><article><div class="entry-content"><figure><img src="${longUrl}" alt="cover" /></figure></div></article></body></html>`;
+    const r = extractCleanArticle(html, 'https://unknown.example/');
+    assert.equal(r.content, '', 'image-only block yields no extracted content');
+  });
+});
+
+describe('htmlToRichMarkdown', () => {
+  test('converts an RSS content:encoded fragment to rich markdown', () => {
+    const html = `
+      <div class="captioned-image-container"><img src="https://cdn.x/cover.png" alt="Cover" /></div>
+      <p>First real paragraph of the newsletter body.</p>
+      <h2>Section One</h2>
+      <p>Second paragraph with more detail.</p>
+      <ul><li>Point A</li><li>Point B</li></ul>`;
+    const md = htmlToRichMarkdown(html, { baseUrl: 'https://x.substack.com/p/post' });
+    assert.ok(md.includes('![Cover](https://cdn.x/cover.png)'));
+    assert.ok(md.includes('## Section One'));
+    assert.ok(md.includes('- Point A'));
+    assert.ok(md.includes('First real paragraph'));
+  });
+
+  test('returns empty string on empty/invalid input', () => {
+    assert.equal(htmlToRichMarkdown(''), '');
+    assert.equal(htmlToRichMarkdown(null), '');
+  });
+
+  test('strips stray tag-like tokens that leaked into prose text', () => {
+    const html = '<p>The new model &lt;image&gt; pipeline is faster than before and ships today.</p>';
+    const md = htmlToRichMarkdown(html, { baseUrl: 'https://x/y' });
+    assert.ok(!md.includes('<image>'), `no literal tag leak: ${md}`);
+    assert.ok(md.includes('pipeline is faster'));
+  });
+
+  test('percent-encodes parentheses in image URLs so markdown stays intact', () => {
+    const html = '<figure><img src="https://cdn.x/img_(1).png" alt="p" /></figure><p>Body text long enough to matter here.</p>';
+    const md = htmlToRichMarkdown(html, { baseUrl: 'https://x/y' });
+    assert.ok(md.includes('img_%281%29.png'), `parens encoded: ${md}`);
+    assert.ok(!/\(https:\/\/cdn\.x\/img_\(/.test(md), 'no raw paren breaking the link');
+  });
+
+  test('caps output at maxChars on a paragraph boundary', () => {
+    const para = `<p>${'word '.repeat(60).trim()}.</p>`; // ~300 chars each
+    const md = htmlToRichMarkdown(para.repeat(50), { baseUrl: 'https://x/y', maxChars: 1000 });
+    assert.ok(md.length <= 1000, `expected <= 1000, got ${md.length}`);
+    assert.ok(!md.endsWith('word'), 'trimmed at a boundary, not mid-word');
+  });
+});
+
+describe('visibleTextLen', () => {
+  test('excludes image markdown from the count', () => {
+    const withImg = '![alt](https://cdn.example.com/' + 'a'.repeat(300) + '.jpg)';
+    assert.ok(visibleTextLen(withImg) < 5, `image-only ≈ 0 text, got ${visibleTextLen(withImg)}`);
+    assert.ok(visibleTextLen('Hello world') >= 11);
   });
 });
 

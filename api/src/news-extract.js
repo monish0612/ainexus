@@ -134,7 +134,11 @@ const BOILERPLATE_SELECTORS = [
 ];
 
 const MIN_BODY_CHARS = 200; // a "good" main-content block must clear this
-const MAX_BODY_CHARS = 18000; // upstream LLM context cap; trim hard here
+// Full-content (skip_summary) feeds never hit the LLM, so we can keep a
+// generous body budget for comfortable long-form reading. Trimmed at a
+// paragraph boundary (see extractCleanArticle) so image/code markdown is
+// never cut mid-token.
+const MAX_BODY_CHARS = 45000;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -169,49 +173,192 @@ function _shortErr(e) {
  * hits the explicit-blank-line path (≥ 3 paras) rather than the
  * sentence-grouped fallback.
  */
-function _flattenMainBlock($, mainEl) {
-  const paragraphs = [];
+// Resolve the best image URL from an <img>, accounting for the dozen
+// lazy-load conventions in the wild (data-src, data-lazy-src, srcset, …).
+// Returns '' when nothing usable is present.
+function _resolveImgSrc($img) {
+  const srcset = $img.attr('srcset') || $img.attr('data-srcset') || '';
+  const fromSrcset = srcset
+    ? srcset.split(',').pop().trim().split(/\s+/)[0] // last (largest) candidate
+    : '';
+  return (
+    $img.attr('data-src') ||
+    $img.attr('data-lazy-src') ||
+    $img.attr('data-original') ||
+    fromSrcset ||
+    $img.attr('src') ||
+    ''
+  ).trim();
+}
+
+// Tracking pixels, sprites, avatars, emoji, ad/beacon images, and inline
+// data-URIs add zero value to a reader and bloat the markdown — drop them.
+const _JUNK_IMG_RE =
+  /(?:^data:|sprite|spacer|s\.gif|pixel|1x1|blank\.|transparent\.|tracking|beacon|gravatar|\/avatars?\/|emoji|doubleclick|facebook\.com\/tr|googlesyndication|loading\.gif|lazy[-_.])/i;
+
+function _isJunkImage(src, $img) {
+  if (!src) return true;
+  if (_JUNK_IMG_RE.test(src)) return true;
+  const w = parseInt($img.attr('width') || '0', 10);
+  const h = parseInt($img.attr('height') || '0', 10);
+  if ((w > 0 && w <= 8) || (h > 0 && h <= 8)) return true; // tracking-pixel size
+  return false;
+}
+
+// Pull a syntax-highlight language hint from a <pre>/<code> class list.
+// Covers the common conventions: `language-python`, `lang-js`,
+// `highlight-source-rust`, prism's `brush:js`, hljs `hljs python`.
+function _codeLangFrom($pre) {
+  const cls = `${$pre.attr('class') || ''} ${$pre.find('code').first().attr('class') || ''}`;
+  const m = cls.match(/(?:language|lang|highlight-source|brush)[-:\s]([a-z0-9+#]+)/i);
+  if (m) return m[1].toLowerCase().replace(/^source$/, '');
+  return '';
+}
+
+function _imgAlt(raw) {
+  return String(raw || '')
+    .replace(/[\[\]]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 140);
+}
+
+// Visible-text length of a markdown string, EXCLUDING image syntax. Image
+// URLs (especially Substack/CDN resize wrappers) can run 200+ chars, so a
+// cover-image-only block would otherwise clear MIN_BODY_CHARS and beat the
+// real article body. Gating + density scoring use this so an image-only
+// block is correctly treated as "no real content".
+function visibleTextLen(md) {
+  return String(md || '')
+    .replace(/!\[[^\]]*\]\([^)]*\)/g, '') // drop image markdown entirely
+    .replace(/\s+/g, ' ')
+    .trim().length;
+}
+
+/**
+ * Walks a content root and emits RICH markdown — paragraphs, headings,
+ * lists, blockquotes, fenced code (whitespace PRESERVED), and inline
+ * images (`![alt](abs-src)`) — so the Flutter detail view renders a
+ * modern, interactive article instead of a plain-text wall.
+ *
+ * `baseUrl` is used to absolutise relative / protocol-relative image
+ * srcs. Images are de-duped by resolved URL and filtered for tracking
+ * pixels / sprites / avatars.
+ */
+function _flattenMainBlock($, mainEl, baseUrl = '') {
+  const out = [];
+  const seenImg = new Set();
 
   mainEl.find(BOILERPLATE_SELECTORS.join(',')).remove();
   mainEl.find('br').replaceWith('\n');
 
-  // Walk direct + nested block-level descendants in document order.
-  // We intentionally ignore raw spans / inline text outside p/h*/li/blockquote
-  // because those are 99% nav glue, byline rows, or pagination hints.
-  mainEl.find('h1, h2, h3, h4, p, li, blockquote, pre').each((_, el) => {
-    const $el = $(el);
-    const tag = el.tagName.toLowerCase();
-    const raw = $el.text().replace(/\u00A0/g, ' ').replace(/\s+/g, ' ').trim();
-    if (!raw) return;
-    if (raw.length < 2) return;
-
-    if (tag === 'h1' || tag === 'h2') {
-      paragraphs.push(`## ${raw}`);
-    } else if (tag === 'h3' || tag === 'h4') {
-      paragraphs.push(`### ${raw}`);
-    } else if (tag === 'blockquote') {
-      paragraphs.push(`> ${raw}`);
-    } else if (tag === 'li') {
-      paragraphs.push(`- ${raw}`);
-    } else if (tag === 'pre') {
-      // Preserve as fenced block; this is rare in news content but TC + Gizbot
-      // occasionally embed code snippets.
-      paragraphs.push('```\n' + raw + '\n```');
-    } else {
-      paragraphs.push(raw);
+  const pushImage = ($img) => {
+    let src = _resolveImgSrc($img);
+    if (!src) return;
+    try {
+      src = new URL(src, baseUrl || undefined).toString();
+    } catch {
+      if (src.startsWith('//')) src = `https:${src}`;
     }
-  });
+    if (_isJunkImage(src, $img)) return;
+    if (seenImg.has(src)) return;
+    seenImg.add(src);
+    // Parentheses in a URL would prematurely terminate the `![](...)`
+    // markdown — percent-encode them so the image link stays intact.
+    const safeSrc = src.replace(/\(/g, '%28').replace(/\)/g, '%29');
+    out.push(`![${_imgAlt($img.attr('alt'))}](${safeSrc})`);
+  };
+
+  // Walk block-level descendants in document order. `figure`/`img` are in
+  // the set so inline imagery is preserved at the right position; `pre`
+  // keeps its raw whitespace; everything else is collapsed to a single
+  // line. Inline spans/text outside these tags are 99% nav/byline glue.
+  mainEl
+    .find('h1, h2, h3, h4, h5, p, li, blockquote, pre, figure, img, hr')
+    .each((_, el) => {
+      const $el = $(el);
+      const tag = el.tagName.toLowerCase();
+
+      if (tag === 'hr') {
+        out.push('---');
+        return;
+      }
+      if (tag === 'figure') {
+        const $img = $el.find('img').first();
+        if ($img.length) pushImage($img);
+        return;
+      }
+      if (tag === 'img') {
+        // Skip imgs wrapped in <figure> — handled above so we keep order.
+        if ($el.closest('figure').length) return;
+        pushImage($el);
+        return;
+      }
+      if (tag === 'pre') {
+        const code = $el
+          .text()
+          .replace(/\u00A0/g, ' ')
+          .replace(/^\n+/, '')
+          .replace(/\s+$/, '');
+        if (!code.trim() || code.trim().length < 2) return;
+        const lang = _codeLangFrom($el);
+        out.push('```' + lang + '\n' + code + '\n```');
+        return;
+      }
+
+      const raw = $el
+        .text()
+        .replace(/\u00A0/g, ' ')
+        // Strip stray HTML-tag-like tokens that survived as TEXT (e.g. a
+        // leaked `<image>` / `<source>` from a malformed feed body) so they
+        // don't render as literal "<image>" in the reader.
+        .replace(/<\/?[a-z][a-z0-9-]*(?:\s[^>]*)?>/gi, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+      if (!raw || raw.length < 2) return;
+
+      if (tag === 'blockquote') out.push(`> ${raw}`);
+      else if (tag === 'li') out.push(`- ${raw}`);
+      else if (tag === 'h1' || tag === 'h2') out.push(`## ${raw}`);
+      else if (tag === 'h3' || tag === 'h4' || tag === 'h5') out.push(`### ${raw}`);
+      else out.push(raw);
+    });
 
   // Collapse adjacent identical lines that some themes emit (e.g. heading
   // duplicated as <h2> AND <p><strong>...</strong></p>).
   const deduped = [];
-  for (const p of paragraphs) {
+  for (const p of out) {
     if (deduped.length === 0 || deduped[deduped.length - 1] !== p) {
       deduped.push(p);
     }
   }
 
   return deduped.join('\n\n').trim();
+}
+
+/**
+ * Convert an arbitrary HTML fragment (e.g. an RSS `content:encoded` body)
+ * into rich reader markdown. Used by the news pipeline when the live-page
+ * clean extraction comes back empty (Substack / WordPress feeds whose
+ * full body already ships in the feed) so we still preserve their images,
+ * headings, lists, and code rather than flattening to plain text.
+ */
+function htmlToRichMarkdown(html, { baseUrl = '', maxChars = MAX_BODY_CHARS } = {}) {
+  if (!html || typeof html !== 'string') return '';
+  let $;
+  try {
+    $ = cheerio.load(html);
+  } catch {
+    return '';
+  }
+  const $root = $('body').length ? $('body') : $.root();
+  let md = _flattenMainBlock($, $root, baseUrl);
+  if (maxChars > 0 && md.length > maxChars) {
+    // Trim at a paragraph boundary so we never cut an image/code block in half.
+    const cut = md.lastIndexOf('\n\n', maxChars);
+    md = md.slice(0, cut > MIN_BODY_CHARS ? cut : maxChars).trim();
+  }
+  return md;
 }
 
 // ─── extractCleanArticle ────────────────────────────────────────────────
@@ -266,8 +413,8 @@ function extractCleanArticle(html, url = '') {
   for (const sel of selectorsForUrl(url)) {
     const el = $(sel).first();
     if (el.length === 0) continue;
-    const flat = _flattenMainBlock($, el);
-    if (flat.length >= MIN_BODY_CHARS) {
+    const flat = _flattenMainBlock($, el, url);
+    if (visibleTextLen(flat) >= MIN_BODY_CHARS) {
       content = flat;
       break;
     }
@@ -282,12 +429,14 @@ function extractCleanArticle(html, url = '') {
       const $el = $(el);
       // Skip obvious wrappers
       if ($el.find('article, main').length > 0) return;
-      const flat = _flattenMainBlock($, $el);
-      if (flat.length < MIN_BODY_CHARS) return;
-      // Density = text length ÷ (link char count + 1) — penalises link
-      // farms / nav menus that survived boilerplate stripping.
+      const flat = _flattenMainBlock($, $el, url);
+      const textLen = visibleTextLen(flat);
+      if (textLen < MIN_BODY_CHARS) return;
+      // Density = visible-text length ÷ (link char count + 1) — penalises
+      // link farms / nav menus that survived boilerplate stripping. Uses
+      // text (not raw markdown) so long image URLs don't inflate the score.
       const linkChars = $el.find('a').text().length || 0;
-      const score = flat.length / (linkChars + 1);
+      const score = textLen / (linkChars + 1);
       if (score > bestScore) {
         bestScore = score;
         bestText = flat;
@@ -297,7 +446,10 @@ function extractCleanArticle(html, url = '') {
   }
 
   if (content.length > MAX_BODY_CHARS) {
-    content = content.slice(0, MAX_BODY_CHARS);
+    // Trim at a paragraph boundary so we never cut a markdown image or
+    // fenced-code block in half (which would render as broken syntax).
+    const cut = content.lastIndexOf('\n\n', MAX_BODY_CHARS);
+    content = content.slice(0, cut > MIN_BODY_CHARS ? cut : MAX_BODY_CHARS).trim();
   }
 
   return {
@@ -804,7 +956,7 @@ async function cleanExtract(url, { logTag = 'NEWS/clean-extract', timeoutMs = 15
   }
 
   const r = extractCleanArticle(html, url);
-  const method = r.content
+  const method = visibleTextLen(r.content) >= MIN_BODY_CHARS
     ? selectorsForUrl(url).length > 0
       ? 'clean-site'
       : 'clean-generic'
@@ -875,6 +1027,8 @@ module.exports = {
   extractDateFromHtml,
   extractGizbotProsConsRating,
   buildReviewMetaMarkdown,
+  htmlToRichMarkdown,
+  visibleTextLen,
   // Internals exposed for tests
   hostOf,
   selectorsForUrl,

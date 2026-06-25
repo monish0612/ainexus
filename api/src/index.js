@@ -1414,6 +1414,13 @@ function mapArticleRow(row) {
     isRead: !!row.read,
     originalUrl: row.original_url || meta.originalUrl || '',
     publishedAt: row.published_at || meta.publishedAt || null,
+    // `isFullContent` tells the Flutter detail view to render the article
+    // body verbatim and expose the on-demand "AI Summarize" button instead
+    // of treating `summaryMarkdown` as a pre-baked AI summary. Set at write
+    // time from the feed's `skip_summary` flag (see news-service.js). Older
+    // rows persisted before this field shipped fall back to `false`, so
+    // genuine AI summaries keep their existing behaviour.
+    isFullContent: meta.isFullContent === true,
     summaryMarkdown: _cleanArticleMarkdown(row.summary_markdown || ''),
   };
 }
@@ -3647,6 +3654,151 @@ aiRouter.post('/categorize', async (req, res, next) => {
   }
 });
 
+// ── POST /api/v1/ai/expense-query ───────────────────────────────
+// Natural-language → STRUCTURED expense query translator.
+//
+// The client (Flutter) sends a free-text question ("today's expenses",
+// "highest spend", "swiggy orders with comments", "food this month"), the
+// device's current local time, and the list of categories in use. Gemini
+// returns a small JSON "query spec" — date range, category, free-text search,
+// sort and mode. The app then runs that spec against its LOCAL Drift DB
+// (indexed, paginated) so results are exact, complete and fully editable, and
+// scale to very large histories. No expense rows ever leave the device — only
+// the question + schema hints are sent, so this stays fast and private and is
+// strictly superior to embedding/RAG for precise/aggregate queries.
+const AIExpenseQuerySchema = z.object({
+  question: z.string().min(1).max(500),
+  now: z.string().max(40).optional(),
+  categories: z.array(z.string().max(40)).max(60).optional(),
+  liteModel: z.string().max(200).optional(),
+});
+
+function buildExpenseQueryPrompt(nowIso, categories) {
+  const cats = (categories && categories.length)
+    ? categories.join(', ')
+    : 'Food, Grocery, Transport, Fuel, Travel, Entertainment, Subscription, Shopping, Electronics, Fashion, Bills, Rent, Insurance, Loan, Health, Medical, Education, Family, Friends, Personal, Investment, Gifts, Charity, Donation, Pets, Others';
+  return [
+    'You convert a user\'s natural-language question about THEIR OWN logged expenses into a strict JSON query specification. Expenses are stored locally with a naive LOCAL wall-clock timestamp (no timezone suffix).',
+    `The user\'s current local date-time is: ${nowIso}. Treat this as "now" for relative ranges (today, yesterday, this week, last month, etc.). "Today" = from 00:00:00 of the current day (inclusive) to 00:00:00 of the next day (exclusive).`,
+    `Known expense categories: ${cats}.`,
+    '',
+    'Return ONLY a JSON object (no markdown, no prose) with EXACTLY these keys:',
+    '{',
+    '  "title": string,        // <=40 chars, a short heading for the result screen, e.g. "Kodaikanal trip"',
+    '  "answer": string,       // <=160 chars, a friendly one-line description of what you are showing',
+    '  "startIso": string|null,// inclusive lower bound as naive local ISO "YYYY-MM-DDTHH:mm:ss", or null for no lower bound',
+    '  "endIso": string|null,  // EXCLUSIVE upper bound as naive local ISO, or null',
+    '  "category": string|null,// one of the known categories EXACTLY, or null if the question is not category-specific',
+    '  "search": string|null,  // ONE distinctive keyword to match against description/category/comments (a merchant like "swiggy" or a place like "kodaikanal"), or null',
+    '  "searchAny": string[],  // SEMANTIC EXPANSION: concrete keywords related to a fuzzy/conceptual ask. A row matches if it contains ANY of them. Empty [] when not needed.',
+    '  "sort": string,         // one of: "date_desc", "date_asc", "amount_desc", "amount_asc"',
+    '  "limit": number,        // max rows to return, 1..500 (use 500 for broad listings)',
+    '  "mode": string,         // "summary" for aggregate questions (total/how much/average/highest/lowest); "chart" when the user asks to visualize/graph/plot/show a breakdown; otherwise "list"',
+    '  "chartType": string,     // when mode is "chart", one of: "category" (spend per category), "daily" (spend per day), "monthly" (spend per month). Otherwise "none".',
+    '  "topic": string          // "salary" when the question is about the user\'s monthly SALARY / income / take-home / pay / hike / raise / how much they earn / how much they saved this month; otherwise "expenses".',
+    '}',
+    '',
+    'Rules:',
+    '- For "highest"/"most expensive" use sort "amount_desc"; for "lowest"/"cheapest" use "amount_asc". For superlative single-item questions you may set limit to a small number (e.g. 5) but keep mode "summary".',
+    '- Map merchant/brand words (swiggy, zomato, amazon, uber, netflix...) AND place/trip names (kodaikanal, goa, manali...) to the "search" field as a SINGLE most-distinctive keyword, NOT category, unless the user explicitly names a category. For trip/cost questions, extract the place name into "search" and set mode "summary" so the total is highlighted.',
+    '- SEMANTIC SEARCH: when the ask is fuzzy/conceptual ("anything related to my car", "health stuff", "food delivery", "things for the house"), populate "searchAny" with 4-12 concrete, real-world keywords that would literally appear in an expense description/comment/category for that concept. Examples: car → ["car","fuel","petrol","diesel","garage","service","tyre","insurance","parking","toll","uber","ola"]; food delivery → ["swiggy","zomato","ubereats","dominos","kfc","mcdonald"]. Use lowercase single words. You MAY also set "category" if one category clearly dominates. Leave "searchAny" as [] for precise questions.',
+    '- If the user names a category concept (food, travel, bills...), set "category" to the closest known category.',
+    '- VISUALIZE: if the user says visualize/visualise/graph/chart/plot/breakdown/distribution/"show me a chart", set mode "chart". Pick chartType "daily" for a short window (<= ~45 days, e.g. "last month"), "monthly" for long windows (multiple months / a year), and "category" when they want a split by category. Still set the date range / filters as usual so the chart reflects exactly that slice.',
+    '- If the question is generic ("show my expenses", "everything"), set startIso/endIso/category/search to null, searchAny [], sort "date_desc", mode "list", chartType "none".',
+    '- SALARY/INCOME: set "topic" to "salary" when the user asks about their salary, in-hand/take-home pay, income, monthly earnings, a raise/hike/increment, salary history, or "how much did I save this month". The app then shows the dedicated salary stats screen (it has the real numbers). For salary questions write a generic "answer" like "Here\'s your salary overview." and keep the other fields at their generic defaults. For all other questions set "topic" to "expenses".',
+    '',
+    'CRITICAL — NEVER HALLUCINATE: You ONLY produce this query specification. You do NOT have the user\'s data and you NEVER state, estimate, or invent any specific amount, total, count, date, merchant, or expense in the "answer" or "title". The "answer" must be a generic description of WHAT will be shown (e.g. "Here are your car-related expenses.") with NO numbers — all totals/counts are computed by the app from the database. Never invent timestamps outside reasonable bounds. Output valid JSON only.',
+  ].join('\n');
+}
+
+aiRouter.post('/expense-query', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const val = validate(AIExpenseQuerySchema, req.body);
+    if (!val.ok) return res.status(400).json({ error: val.error });
+
+    const { question } = val.data;
+    const nowIso = (val.data.now && val.data.now.trim()) || new Date().toISOString().slice(0, 19);
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
+    console.log('[AI] expense-query →', question);
+    tg.d('AI/expense-query', `q="${question.slice(0, 80)}", model=${pickedModel || '(default)'}`);
+
+    const result = await callLiteLLM({
+      model: pickedModel || undefined,
+      messages: [
+        { role: 'system', content: buildExpenseQueryPrompt(nowIso, val.data.categories) },
+        { role: 'user', content: question },
+      ],
+      temperature: 0.1,
+      maxTokens: 500,
+      jsonOutput: true,
+    });
+
+    console.log('[AI] expense-query raw:', result.content);
+
+    let parsed;
+    try {
+      parsed = parseJsonContent(result.content);
+    } catch {
+      return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
+    }
+
+    const allowedSort = ['date_desc', 'date_asc', 'amount_desc', 'amount_asc'];
+    const sort = allowedSort.includes(parsed.sort) ? parsed.sort : 'date_desc';
+    let limit = Number(parsed.limit);
+    if (!Number.isFinite(limit)) limit = 500;
+    limit = Math.max(1, Math.min(500, Math.round(limit)));
+    const allowedModes = ['list', 'summary', 'chart'];
+    const mode = allowedModes.includes(parsed.mode) ? parsed.mode : 'list';
+    const allowedCharts = ['category', 'daily', 'monthly', 'none'];
+    let chartType = allowedCharts.includes(parsed.chartType) ? parsed.chartType : 'none';
+    // A chart request must have a concrete chart type; default to category.
+    if (mode === 'chart' && chartType === 'none') chartType = 'category';
+    if (mode !== 'chart') chartType = 'none';
+    const allowedTopics = ['expenses', 'salary'];
+    const topic = allowedTopics.includes(parsed.topic) ? parsed.topic : 'expenses';
+    const str = (v) => (typeof v === 'string' && v.trim()) ? v.trim() : null;
+
+    // Semantic expansion terms: keep clean, deduped, capped — defensive against
+    // a noisy model. These only ever become literal SQL search terms client-side.
+    const searchAny = [];
+    if (Array.isArray(parsed.searchAny)) {
+      const seen = new Set();
+      for (const t of parsed.searchAny) {
+        if (typeof t !== 'string') continue;
+        const v = t.trim();
+        if (!v || v.length > 40) continue;
+        const key = v.toLowerCase();
+        if (seen.has(key)) continue;
+        seen.add(key);
+        searchAny.push(v);
+        if (searchAny.length >= 12) break;
+      }
+    }
+
+    tg.i('AI/expense-query', `✓ model=${result.model_used} ${Date.now() - _t0}ms, sort=${sort} mode=${mode} chart=${chartType} topic=${topic} terms=${searchAny.length}`);
+    res.json({
+      title: str(parsed.title) || 'Results',
+      answer: str(parsed.answer) || '',
+      startIso: str(parsed.startIso),
+      endIso: str(parsed.endIso),
+      category: str(parsed.category),
+      search: str(parsed.search),
+      searchAny,
+      sort,
+      limit,
+      mode,
+      chartType,
+      topic,
+      model: result.model_used,
+      usage: result.usage,
+    });
+  } catch (err) {
+    tg.e('AI/expense-query', `Failed ${Date.now() - _t0}ms`, err);
+    next(err);
+  }
+});
+
 // POST /api/v1/ai/summarize-history — condensed summary of conversation history
 aiRouter.post('/summarize-history', async (req, res, next) => {
   const _t0 = Date.now();
@@ -4892,6 +5044,7 @@ expensesRouter.get('/', async (_req, res, next) => {
       cardType: r.card_type,
       date: r.date,
       isManualCategory: !!r.is_manual_category,
+      comments: r.comments || '',
     })));
   } catch (err) {
     next(err);
@@ -4901,14 +5054,14 @@ expensesRouter.get('/', async (_req, res, next) => {
 // POST create/upsert expense
 expensesRouter.post('/', async (req, res, next) => {
   try {
-    const { id, amount, description, category, bank, cardType, date, isManualCategory } = req.body;
+    const { id, amount, description, category, bank, cardType, date, isManualCategory, comments } = req.body;
     if (!id || amount == null) {
       return res.status(400).json({ error: 'id and amount are required' });
     }
 
     await pool.query(
-      `INSERT INTO expenses (id, amount, description, category, bank, card_type, date, is_manual_category)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+      `INSERT INTO expenses (id, amount, description, category, bank, card_type, date, is_manual_category, comments)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
        ON CONFLICT (id) DO UPDATE SET
          amount = EXCLUDED.amount,
          description = EXCLUDED.description,
@@ -4917,8 +5070,9 @@ expensesRouter.post('/', async (req, res, next) => {
          card_type = EXCLUDED.card_type,
          date = EXCLUDED.date,
          is_manual_category = EXCLUDED.is_manual_category,
+         comments = EXCLUDED.comments,
          updated_at = NOW()`,
-      [id, amount, description || '', category || '', bank || '', cardType || '', date || '', !!isManualCategory],
+      [id, amount, description || '', category || '', bank || '', cardType || '', date || '', !!isManualCategory, comments || ''],
     );
 
     console.log('[EXPENSES] Upserted:', id, description, amount);
@@ -5011,6 +5165,79 @@ budgetRouter.delete('/history', async (_req, res, next) => {
 });
 
 app.use('/api/v1/budget', budgetRouter);
+
+// ═══════════════════════════════════════════════════════════════
+//  SALARY  (monthly in-hand income — one entry per 'YYYY-MM')
+// ═══════════════════════════════════════════════════════════════
+
+const salaryRouter = express.Router();
+
+// GET full salary history (newest month first)
+salaryRouter.get('/history', async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query(
+      'SELECT * FROM salary_entries ORDER BY month DESC',
+    );
+    res.json(rows.map(r => ({
+      id: r.id,
+      month: r.month,
+      amount: parseFloat(r.amount),
+      setAt: r.set_at,
+    })));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST upsert a month's salary (keyed by month so re-entry overwrites)
+salaryRouter.post('/', async (req, res, next) => {
+  try {
+    const { id, month, amount, setAt } = req.body;
+    if (!id || !month || amount == null) {
+      return res
+        .status(400)
+        .json({ error: 'id, month and amount are required' });
+    }
+    if (!/^\d{4}-\d{2}$/.test(String(month))) {
+      return res.status(400).json({ error: "month must be 'YYYY-MM'" });
+    }
+    const amt = Number(amount);
+    if (!Number.isFinite(amt) || amt < 0) {
+      return res
+        .status(400)
+        .json({ error: 'amount must be a non-negative finite number' });
+    }
+
+    await pool.query(
+      `INSERT INTO salary_entries (id, month, amount, set_at, updated_at)
+       VALUES ($1, $2, $3, $4, NOW())
+       ON CONFLICT (month) DO UPDATE SET
+         id = EXCLUDED.id,
+         amount = EXCLUDED.amount,
+         set_at = EXCLUDED.set_at,
+         updated_at = NOW()`,
+      [id, month, amt, setAt || new Date().toISOString()],
+    );
+
+    console.log('[SALARY] Upserted:', month, amt);
+    res.json({ ok: true, id, month });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE all salary history (easter egg clear)
+salaryRouter.delete('/history', async (_req, res, next) => {
+  try {
+    const result = await pool.query('DELETE FROM salary_entries');
+    console.log('[SALARY] Cleared history:', result.rowCount, 'rows deleted');
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use('/api/v1/salary', salaryRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  CATEGORY LEARNINGS
@@ -5123,6 +5350,7 @@ const _REQUIRED_TABLES = [
   'users', 'categories', 'transactions', 'ai_conversations', 'sync_log',
   'news_articles', 'deleted_guids', 'article_chat_messages',
   'article_chat_summaries', 'saved_words', 'expenses', 'budget_entries',
+  'salary_entries',
   'category_learnings', 'ai_response_cache', 'app_settings',
   'user_preferences', 'x_feed_sync_state',
   'saved_searches', 'saved_search_chat_messages',
@@ -5304,10 +5532,16 @@ async function initTables() {
       card_type TEXT NOT NULL DEFAULT '',
       date TEXT NOT NULL DEFAULT '',
       is_manual_category BOOLEAN NOT NULL DEFAULT FALSE,
+      comments TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ DEFAULT NOW(),
       updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `));
+
+  // Back-fill column for pre-existing expenses tables.
+  await _runSafe('expenses.comments', () =>
+    pool.query("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comments TEXT NOT NULL DEFAULT ''"),
+  );
 
   await _runSafe('budget_entries', () => pool.query(`
     CREATE TABLE IF NOT EXISTS budget_entries (
@@ -5315,6 +5549,19 @@ async function initTables() {
       amount DECIMAL(12,2) NOT NULL,
       set_at TEXT NOT NULL DEFAULT '',
       created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `));
+
+  // Monthly in-hand salary — one row per 'YYYY-MM' (month is unique so the
+  // user's monthly re-entry/"reset" upserts cleanly).
+  await _runSafe('salary_entries', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS salary_entries (
+      id TEXT PRIMARY KEY,
+      month TEXT NOT NULL UNIQUE,
+      amount DECIMAL(12,2) NOT NULL,
+      set_at TEXT NOT NULL DEFAULT '',
+      created_at TIMESTAMPTZ DEFAULT NOW(),
+      updated_at TIMESTAMPTZ DEFAULT NOW()
     )
   `));
 
