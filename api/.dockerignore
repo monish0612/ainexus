@@ -1,0 +1,24 @@
+# CRITICAL: never copy the host node_modules into the image. The Dockerfile
+# runs `npm ci` inside Alpine to build the correct linuxmusl native binaries
+# (notably `sharp`). A host node_modules (e.g. built on Windows/macOS) would
+# overwrite those with the wrong-platform binaries and crash the container at
+# runtime ("Could not load the sharp module").
+node_modules
+npm-debug.log*
+
+# Secrets must not be baked into the image layer.
+.env
+.env.*
+
+# VCS + Docker meta (not needed inside the image).
+.git
+.gitignore
+.dockerignore
+Dockerfile
+
+# Dev-only test files and logs (not used by the running service).
+test
+test-*.js
+test-image.png
+*.log
+coverage
