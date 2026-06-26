@@ -67,6 +67,10 @@ const {
   mapErrorToHttp: mapGeminiErrorToHttp,
 } = require('./gemini-direct');
 const { tg } = require('./telegram');
+const {
+  buildExpenseInsightPrompt,
+  sanitizeInsightResponse,
+} = require('./expense-insight');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -3795,6 +3799,72 @@ aiRouter.post('/expense-query', async (req, res, next) => {
     });
   } catch (err) {
     tg.e('AI/expense-query', `Failed ${Date.now() - _t0}ms`, err);
+    next(err);
+  }
+});
+
+// ── POST /api/v1/ai/expense-insight ─────────────────────────────
+// GENERATIVE, GROUNDED expense recommendation composer.
+//
+// The client computes deterministic FACTS in code (totals, top category,
+// month-over-month deltas, etc. — every number is real) and sends ONLY those
+// pre-computed tokens plus the user's first name. The model's single job is to
+// PHRASE and ARRANGE a short, dynamic, personalized recommendation — it never
+// originates a number. To reference any value it must emit a {{token}}
+// placeholder that the app binds to the real figure; any bare digit is
+// rejected client-side by the grounding validator (which then falls back to a
+// deterministic template). So the response is fully dynamic yet structurally
+// impossible to hallucinate. No raw expense rows ever leave the device.
+const AIExpenseInsightSchema = z.object({
+  question: z.string().min(1).max(500),
+  firstName: z.string().max(60).optional(),
+  // The computed token map: { tokenName: { display: string, value?: number } }.
+  facts: z.record(z.any()).optional(),
+  liteModel: z.string().max(200).optional(),
+});
+
+aiRouter.post('/expense-insight', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const val = validate(AIExpenseInsightSchema, req.body);
+    if (!val.ok) return res.status(400).json({ error: val.error });
+
+    const { question } = val.data;
+    const firstName = (val.data.firstName && val.data.firstName.trim()) || 'there';
+    const facts = (val.data.facts && typeof val.data.facts === 'object' && !Array.isArray(val.data.facts))
+      ? val.data.facts
+      : {};
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
+    console.log('[AI] expense-insight →', question);
+    tg.d('AI/expense-insight', `q="${question.slice(0, 60)}", name=${firstName}, tokens=${Object.keys(facts).length}, model=${pickedModel || '(default)'}`);
+
+    const result = await callLiteLLM({
+      model: pickedModel || undefined,
+      messages: [
+        { role: 'system', content: buildExpenseInsightPrompt(firstName, facts) },
+        { role: 'user', content: question },
+      ],
+      temperature: 0.45,
+      maxTokens: 600,
+      jsonOutput: true,
+    });
+
+    let parsed;
+    try {
+      parsed = parseJsonContent(result.content);
+    } catch {
+      return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
+    }
+
+    const clean = sanitizeInsightResponse(parsed);
+    tg.i('AI/expense-insight', `✓ model=${result.model_used} ${Date.now() - _t0}ms tone=${clean.tone} chips=${clean.chips.length}`);
+    res.json({
+      ...clean,
+      model: result.model_used,
+      usage: result.usage,
+    });
+  } catch (err) {
+    tg.e('AI/expense-insight', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
