@@ -4229,6 +4229,67 @@ appSettingsRouter.put('/', async (req, res, next) => {
 app.use('/api/v1/app-settings', appSettingsRouter);
 
 // ═══════════════════════════════════════════════════════════════
+//  ROUTES — DATA RESET EPOCH  /api/v1/data-reset
+//
+//  Global cross-device "nuke" propagation. A nuke POSTs here to bump
+//  a generation counter; every device GETs it on launch/resume and
+//  wipes its LOCAL copy when the server generation is newer than the
+//  one it last applied. Two independent monotonic counters so the
+//  scopes never interfere regardless of ordering:
+//    • full_gen    — full-app reset (wipe every local table)
+//    • expense_gen — expense-domain reset (clear financial tables)
+//  A full reset implicitly subsumes an expense reset on the client.
+// ═══════════════════════════════════════════════════════════════
+
+const dataResetRouter = express.Router();
+
+function _resetRow(r) {
+  return {
+    fullGen: Number(r.full_gen) || 0,
+    expenseGen: Number(r.expense_gen) || 0,
+    resetAt: r.reset_at ? new Date(r.reset_at).toISOString() : null,
+  };
+}
+
+// GET current reset epoch.
+dataResetRouter.get('/', async (_req, res, next) => {
+  try {
+    const { rows } = await pool.query('SELECT * FROM data_reset WHERE id = 1');
+    if (rows.length === 0) {
+      return res.json({ fullGen: 0, expenseGen: 0, resetAt: null });
+    }
+    res.json(_resetRow(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// POST a reset — bumps the generation for { scope: 'full' | 'expense' }.
+dataResetRouter.post('/', async (req, res, next) => {
+  try {
+    const scope = (req.body && req.body.scope) === 'expense' ? 'expense' : 'full';
+    const fullDelta = scope === 'full' ? 1 : 0;
+    const expenseDelta = scope === 'expense' ? 1 : 0;
+    const { rows } = await pool.query(
+      `INSERT INTO data_reset (id, full_gen, expense_gen, reset_at)
+       VALUES (1, $1, $2, NOW())
+       ON CONFLICT (id) DO UPDATE SET
+         full_gen    = data_reset.full_gen + $1,
+         expense_gen = data_reset.expense_gen + $2,
+         reset_at    = NOW()
+       RETURNING *`,
+      [fullDelta, expenseDelta],
+    );
+    console.log(`[DATA_RESET] scope=${scope} →`, _resetRow(rows[0]));
+    res.json(_resetRow(rows[0]));
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use('/api/v1/data-reset', dataResetRouter);
+
+// ═══════════════════════════════════════════════════════════════
 //  ROUTES — USER PREFERENCES  /api/v1/user-preferences
 //
 //  Cross-device settings sync. Stores user-facing preferences
@@ -4555,6 +4616,18 @@ savedWordsRouter.post('/', async (req, res, next) => {
 
     console.log('[SAVED_WORDS] Upserted:', id, word);
     res.json({ ok: true, id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+// DELETE all saved words (full-reset "nuke" — bulk clear). Declared BEFORE the
+// '/:id' route so Express matches the bare collection path here, not as an id.
+savedWordsRouter.delete('/', async (_req, res, next) => {
+  try {
+    const result = await pool.query('DELETE FROM saved_words');
+    console.log('[SAVED_WORDS] Cleared all:', result.rowCount, 'rows deleted');
+    res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
   }
@@ -4907,6 +4980,31 @@ savedSearchesRouter.get('/:id', async (req, res, next) => {
 //   2. Cascade-delete chat messages → summaries → parent row, in that
 //      order, so we never leave child rows pointing at a missing parent
 //      (FK-shaped cleanup, even though we don't enforce real FKs here).
+// DELETE /api/v1/saved-searches — full-reset "nuke" bulk clear. Declared BEFORE
+// the '/:id' route so the bare collection path matches here. Mirrors the per-id
+// semantics across every row: tombstone EVERY current id first (so other
+// devices sync the deletions), then cascade-delete chat messages → summaries →
+// rows. Tombstoning before deleting keeps cross-device sync correct even if a
+// later statement fails.
+savedSearchesRouter.delete('/', async (_req, res, next) => {
+  try {
+    await pool.query(
+      `INSERT INTO deleted_saved_searches (id, deleted_at)
+       SELECT id, NOW() FROM saved_searches
+       ON CONFLICT (id) DO UPDATE SET deleted_at = NOW()`,
+    );
+    await pool.query('DELETE FROM saved_search_chat_messages');
+    await pool.query('DELETE FROM saved_search_chat_summaries');
+    const result = await pool.query('DELETE FROM saved_searches');
+    console.log(
+      `[SAVED_SEARCHES] Cleared all: ${result.rowCount} rows deleted | tombstones written`,
+    );
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
 savedSearchesRouter.delete('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
@@ -5366,6 +5464,17 @@ learningsRouter.post('/batch', async (req, res, next) => {
   }
 });
 
+// DELETE all category learnings (full-reset "nuke" — bulk clear).
+learningsRouter.delete('/', async (_req, res, next) => {
+  try {
+    const result = await pool.query('DELETE FROM category_learnings');
+    console.log('[LEARNINGS] Cleared all:', result.rowCount, 'rows deleted');
+    res.json({ ok: true, deleted: result.rowCount });
+  } catch (err) {
+    next(err);
+  }
+});
+
 app.use('/api/v1/category-learnings', learningsRouter);
 
 // ═══════════════════════════════════════════════════════════════
@@ -5658,6 +5767,23 @@ async function initTables() {
       value TEXT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
+  `));
+
+  // Single-row global "data reset" epoch. A nuke on any device bumps the
+  // relevant generation; every device compares it on launch/resume and wipes
+  // its LOCAL copy when the server generation is newer than the one it last
+  // applied. This is what makes a nuke propagate across devices even though the
+  // per-domain pulls are additive (insert-only) and don't delete on their own.
+  await _runSafe('data_reset', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS data_reset (
+      id          INT PRIMARY KEY DEFAULT 1,
+      full_gen    BIGINT NOT NULL DEFAULT 0,
+      expense_gen BIGINT NOT NULL DEFAULT 0,
+      reset_at    TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+  await _runSafe('seed data_reset', () => pool.query(`
+    INSERT INTO data_reset (id) VALUES (1) ON CONFLICT (id) DO NOTHING
   `));
 
   await _runSafe('user_preferences', () => pool.query(`
