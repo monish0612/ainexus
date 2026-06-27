@@ -1561,11 +1561,28 @@ newsRouter.post('/:id/save', async (req, res, next) => {
 newsRouter.post('/:id/read', async (req, res, next) => {
   try {
     const { id } = req.params;
-    const cur = await pool.query('SELECT * FROM news_articles WHERE id = $1', [id]);
+    const cur = await pool.query('SELECT guid, saved FROM news_articles WHERE id = $1', [id]);
     if (cur.rows.length === 0) return res.status(404).json({ error: 'Article not found' });
-    await pool.query('UPDATE news_articles SET read = TRUE, updated_at = NOW() WHERE id = $1', [id]);
-    const updated = await pool.query('SELECT * FROM news_articles WHERE id = $1', [id]);
-    res.json({ article: mapArticleRow(updated.rows[0]) });
+
+    // Saved articles are retained — reading one only records the flag so it
+    // stops surfacing as a "new" alert while staying in the Saved tab.
+    if (cur.rows[0].saved) {
+      await pool.query('UPDATE news_articles SET read = TRUE, updated_at = NOW() WHERE id = $1', [id]);
+      const updated = await pool.query('SELECT * FROM news_articles WHERE id = $1', [id]);
+      return res.json({ article: mapArticleRow(updated.rows[0]) });
+    }
+
+    // Unsaved + read = consumed → delete permanently and tombstone the guid so
+    // the RSS feed sync never re-imports it (and it disappears from the web,
+    // which reads this table directly). Mirrors DELETE /news/:id.
+    if (cur.rows[0].guid) {
+      await pool.query(
+        'INSERT INTO deleted_guids (guid) VALUES ($1) ON CONFLICT (guid) DO NOTHING',
+        [cur.rows[0].guid],
+      );
+    }
+    await pool.query('DELETE FROM news_articles WHERE id = $1', [id]);
+    res.json({ deleted: true, id });
   } catch (err) {
     next(err);
   }
@@ -1574,10 +1591,12 @@ newsRouter.post('/:id/read', async (req, res, next) => {
 // ─────────────────────────────────────────────────────────────────────────
 // POST /api/v1/news/mark-all-read
 //
-// Bulk mark-as-read for the For You "Clear All" / summary "Done" flows.
-// Idempotent: takes an explicit id list (max 500) and only updates rows that
+// Bulk delete for the For You "Clear All" / summary "Done" flows. Despite the
+// legacy route name, a cleared article is consumed and removed for good:
+// idempotent, takes an explicit id list (max 500) and only deletes rows that
 // are NOT saved (saved=TRUE rows are never touched, matching the UX promise
-// that the Saved tab is preserved end-to-end).
+// that the Saved tab is preserved end-to-end). Each deleted row's `guid` is
+// tombstoned so the RSS sync can't re-import it and it leaves the website too.
 // ─────────────────────────────────────────────────────────────────────────
 newsRouter.post('/mark-all-read', async (req, res, next) => {
   const _t0 = Date.now();
@@ -1589,21 +1608,60 @@ newsRouter.post('/mark-all-read', async (req, res, next) => {
     }
 
     const { ids } = v.data;
-    tg.d('News/mark-all-read', `▶ ${ids.length} ids`);
-    const result = await pool.query(
-      'UPDATE news_articles SET read = TRUE, updated_at = NOW() WHERE id = ANY($1::text[]) AND saved = FALSE',
+    tg.d('News/mark-all-read', `▶ delete ${ids.length} ids`);
+
+    // Tombstone the guids of the unsaved rows we're about to delete, then
+    // hard-delete them. Saved rows are excluded from both steps.
+    await pool.query(
+      `INSERT INTO deleted_guids (guid)
+       SELECT guid FROM news_articles
+       WHERE id = ANY($1::text[]) AND saved = FALSE AND guid IS NOT NULL
+       ON CONFLICT (guid) DO NOTHING`,
       [ids],
     );
-    // Bumped d→i so the daily Telegram digest shows when the For You /
-    // catch-up clear-out fires in production. Saved-row protection is
-    // surfaced explicitly (requested - updated = saved-or-missing rows).
+    const result = await pool.query(
+      'DELETE FROM news_articles WHERE id = ANY($1::text[]) AND saved = FALSE',
+      [ids],
+    );
+    // i-level so the daily Telegram digest shows when the catch-up clear-out
+    // fires in production. Saved-row protection is surfaced explicitly
+    // (requested - deleted = saved-or-missing rows).
     tg.i(
       'News/mark-all-read',
-      `✓ requested=${ids.length} updated=${result.rowCount} skipped=${ids.length - result.rowCount} ${Date.now() - _t0}ms`,
+      `✓ deleted requested=${ids.length} removed=${result.rowCount} kept=${ids.length - result.rowCount} ${Date.now() - _t0}ms`,
     );
-    res.json({ requested: ids.length, updated: result.rowCount, ok: true });
+    // `updated` retained for backward-compat with any un-upgraded client.
+    res.json({ requested: ids.length, deleted: result.rowCount, updated: result.rowCount, ok: true });
   } catch (err) {
     tg.e('News/mark-all-read', `FATAL ${Date.now() - _t0}ms ids=${req.body?.ids?.length || 0}: ${err.message?.slice(0, 200)}`, err);
+    next(err);
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────────
+// POST /api/v1/news/nuke
+//
+// Easter-egg "nuke": permanently deletes EVERY article — INCLUDING saved ones
+// (no `saved = FALSE` guard, unlike mark-all-read). Every guid is tombstoned
+// first so the RSS/X schedulers can't immediately re-import the same items.
+// This does NOT re-trigger a feed sync — the user asked for a clean slate.
+// ─────────────────────────────────────────────────────────────────────────
+newsRouter.post('/nuke', async (_req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    await pool.query(
+      `INSERT INTO deleted_guids (guid)
+       SELECT guid FROM news_articles WHERE guid IS NOT NULL
+       ON CONFLICT (guid) DO NOTHING`,
+    );
+    const result = await pool.query('DELETE FROM news_articles');
+    tg.w(
+      'News/nuke',
+      `☢️ deleted ALL ${result.rowCount} article(s) incl. saved ${Date.now() - _t0}ms`,
+    );
+    res.json({ deleted: result.rowCount, ok: true });
+  } catch (err) {
+    tg.e('News/nuke', `FATAL ${Date.now() - _t0}ms: ${err.message?.slice(0, 200)}`, err);
     next(err);
   }
 });

@@ -1227,13 +1227,35 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
       ),
     );
 
-    // cleanup old articles — keep saved and read articles
+    // Cleanup — keep ONLY saved + still-unread articles.
+    //
+    //   • read + unsaved  → consumed; delete regardless of age. (New flow
+    //     already deletes these at the read/clear endpoints; this is the
+    //     backstop AND the one-time sweep that clears the legacy clog of
+    //     read rows that older builds left behind.)
+    //   • unread + unsaved older than the retention window → age out, using
+    //     created_at as a fallback when published_at is NULL so undated rows
+    //     can't linger forever.
+    //   • saved → never purged.
+    //
+    // Tombstone the guids of consumed (read, unsaved) rows first so the feed
+    // sync can't re-import something the user already cleared.
     const cutoffDate = new Date();
     cutoffDate.setDate(cutoffDate.getDate() - (settings.article_retention_days || 30));
+    await pool.query(
+      `INSERT INTO deleted_guids (guid)
+       SELECT guid FROM news_articles
+       WHERE saved = FALSE AND read = TRUE AND guid IS NOT NULL
+       ON CONFLICT (guid) DO NOTHING`,
+    );
     const { rowCount: purged } = await pool.query(
       `DELETE FROM news_articles
-       WHERE published_at < $1
-         AND saved = FALSE AND read = FALSE`,
+       WHERE saved = FALSE
+         AND (
+           read = TRUE
+           OR (published_at IS NOT NULL AND published_at < $1)
+           OR (published_at IS NULL AND created_at < $1)
+         )`,
       [cutoffDate.toISOString()],
     );
 
