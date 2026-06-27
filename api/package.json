@@ -6,15 +6,17 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "node --test test/gemini-direct.test.js test/news-full-content.test.js test/news-extract.test.js test/x-feed-service.test.js test/smart-parse-prompt.test.js test/expense-insight.test.js"
+    "test": "node --test test/gemini-direct.test.js test/news-full-content.test.js test/news-extract.test.js test/x-feed-service.test.js test/smart-parse-prompt.test.js test/expense-insight.test.js test/cloud-service.test.js test/cloud-service-resumable.test.js test/cloud-resumable-http.test.js test/app-auth.test.js test/app-auth-http.test.js test/route-auth-wiring.test.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",
+    "busboy": "^1.6.0",
     "cheerio": "^1.2.0",
     "cors": "^2.8.5",
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
+    "googleapis": "^144.0.0",
     "helmet": "^8.0.0",
     "jsonwebtoken": "^9.0.2",
     "pg": "^8.13.1",

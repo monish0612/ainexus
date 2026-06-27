@@ -71,6 +71,13 @@ const {
   buildExpenseInsightPrompt,
   sanitizeInsightResponse,
 } = require('./expense-insight');
+const {
+  checkAppCredentials,
+  makeAppToken,
+  requireApp,
+  isAppAuthRequired,
+  buildClientLog,
+} = require('./app-auth');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -133,6 +140,10 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later' },
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+  // A single large file becomes many sequential chunk PUTs; exempt the
+  // resumable-upload subtree so big uploads don't trip the per-minute cap.
+  skip: (req) =>
+    /\/api\/v1\/cloud\/upload\/resumable\//.test(req.originalUrl || req.url || ''),
 });
 app.use('/api/', apiLimiter);
 
@@ -1103,7 +1114,63 @@ authRouter.get('/profile', authenticate, async (req, res, next) => {
   }
 });
 
+// ── Single-user app login → JWT for the shared data API ──────────────────────
+// The clients gate themselves with a client-side credential check; this issues
+// the server-signed token they attach to data requests. Brute-force-throttled
+// independently of the global limiter.
+const appLoginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 20,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts, please try again later' },
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+});
+
+authRouter.post('/app-login', appLoginLimiter, (req, res) => {
+  const { username, password } = req.body || {};
+  if (!checkAppCredentials(username, password)) {
+    tg.w('AUTH', `app-login failed from ${req.ip || 'unknown'}`);
+    return res.status(401).json({ error: 'Invalid credentials' });
+  }
+  try {
+    const token = makeAppToken();
+    tg.i('AUTH', `app-login ok (${String(username).trim().toLowerCase()})`);
+    return res.json({ token, enforced: isAppAuthRequired() });
+  } catch (err) {
+    tg.e('AUTH', 'app-login token sign failed', err);
+    return res.status(500).json({ error: 'Could not issue token' });
+  }
+});
+
 app.use('/api/v1/auth', authRouter);
+
+// ── Browser client-log relay → Telegram ──────────────────────────────────────
+// Lets the website funnel runtime errors to the same Telegram channel as the
+// backend WITHOUT ever shipping the bot token to the browser. Unauthenticated
+// (so it can capture pre-/login errors) but tightly rate-limited and fully
+// size-capped so it can never flood Telegram or be used for abuse.
+const clientLogLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 40,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many logs' },
+  keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
+});
+
+app.post('/api/v1/client-log', clientLogLimiter, (req, res) => {
+  try {
+    const { level, tag, message, line } = buildClientLog(req.body);
+    if (!message) return res.status(204).end();
+    if (level === 'warn' || level === 'warning') tg.w(tag, line);
+    else if (level === 'info') tg.i(tag, line);
+    else tg.e(tag, line);
+  } catch {
+    // Logging must never fail the caller.
+  }
+  return res.status(204).end();
+});
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — FINANCE  /api/v1/finance
@@ -1624,7 +1691,7 @@ newsRouter.get('/x-feed/status', async (_req, res, next) => {
   }
 });
 
-app.use('/api/v1/news', newsRouter);
+app.use('/api/v1/news', requireApp, newsRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — AI  /api/v1/ai
@@ -2418,6 +2485,98 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
     });
   } catch (err) {
     tg.e('AI/smart-parse', `Failed ${Date.now() - _t0}ms`, err);
+    next(err);
+  }
+});
+
+// POST /api/v1/ai/smart-parse-image
+//
+// Vision variant of /smart-parse for the web app's receipt/bill scanning.
+// The Android app does on-device OCR (ML Kit) then calls /smart-parse with the
+// extracted text; browsers can't do that, so this endpoint accepts the image
+// (base64) directly, runs it through the same image-preprocess pipeline, and
+// asks the user's Gemini lite model to extract the expense fields using the
+// EXACT same SMART_PARSE_SYSTEM_PROMPT. Response shape is identical to
+// /smart-parse so the client maps it the same way. Additive — the Android app
+// never calls this.
+const AISmartParseImageSchema = z.object({
+  image: z.string().min(8), // raw base64 (no data: prefix) or data URL
+  imageMediaType: z.string().max(100).optional(),
+  liteModel: z.string().max(200).optional(),
+  deepModel: z.string().max(200).optional(),
+});
+
+aiRouter.post('/smart-parse-image', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const val = validate(AISmartParseImageSchema, req.body);
+    if (!val.ok) return res.status(400).json({ error: val.error });
+
+    if (!isGroundingAvailable()) {
+      tg.w('AI/smart-parse-image', 'No GOOGLE_API_KEY — vision receipt parse unavailable');
+      return res.status(503).json({ error: 'Vision parsing is not configured on the server' });
+    }
+
+    const { image, imageMediaType, liteModel, deepModel } = val.data;
+    const validation = _validateImagePayloadShared(image, imageMediaType);
+    if (!validation.ok) {
+      tg.d('AI/smart-parse-image', `400 validation: ${validation.error}`);
+      return res.status(400).json({ error: validation.error });
+    }
+
+    const prep = await preprocessForVision(validation.base64, validation.mediaType);
+    const visionModel = resolveGroundingMode('lite', deepModel, liteModel);
+
+    tg.d('AI/smart-parse-image',
+      `model=${visionModel || '(default)'} media=${prep.mediaType} bytes=${(prep.processedBytes / 1024).toFixed(0)}KB`);
+
+    const result = await geminiComplete({
+      model: visionModel,
+      messages: [
+        { role: 'system', content: SMART_PARSE_SYSTEM_PROMPT },
+        {
+          role: 'user',
+          content: [
+            {
+              type: 'image_url',
+              image_url: { url: `data:${prep.mediaType};base64,${prep.base64}` },
+            },
+            {
+              type: 'text',
+              text: 'This is a receipt, bill, or payment screenshot. Extract the single expense '
+                + '(pick the LARGEST grand-total, use the merchant name as description) and return ONLY the JSON object.',
+            },
+          ],
+        },
+      ],
+      temperature: 0.1,
+      maxTokens: 500,
+      jsonOutput: true,
+    });
+
+    let parsed;
+    try {
+      parsed = parseJsonContent(result.content);
+    } catch {
+      return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
+    }
+
+    tg.i('AI/smart-parse-image', `✓ model=${result.model_used || visionModel} ${Date.now() - _t0}ms, category=${parsed.category || 'Others'}`);
+    res.json({
+      amount: typeof parsed.amount === 'number' ? parsed.amount : parseFloat(parsed.amount) || 0,
+      description: parsed.description || '',
+      bank: parsed.bank || '',
+      cardType: parsed.cardType || parsed.card_type || '',
+      category: parsed.category || 'Others',
+      model: result.model_used || visionModel,
+      usage: result.usage,
+    });
+  } catch (err) {
+    if (err && (err.name === 'GeminiDirectError')) {
+      tg.e('AI/smart-parse-image', `FATAL ${Date.now() - _t0}ms [${err.code}]`, err);
+      return res.status(err.status || 500).json({ error: err.message, code: err.code });
+    }
+    tg.e('AI/smart-parse-image', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });
@@ -3953,7 +4112,7 @@ aiRouter.get('/models', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/ai', aiRouter);
+app.use('/api/v1/ai', requireApp, aiRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — LLM  /api/v1/llm
@@ -4146,7 +4305,7 @@ llmRouter.post('/correct', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/llm', llmRouter);
+app.use('/api/v1/llm', requireApp, llmRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — APP SETTINGS  /api/v1/app-settings
@@ -4226,7 +4385,7 @@ appSettingsRouter.put('/', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/app-settings', appSettingsRouter);
+app.use('/api/v1/app-settings', requireApp, appSettingsRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — DATA RESET EPOCH  /api/v1/data-reset
@@ -4287,7 +4446,7 @@ dataResetRouter.post('/', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/data-reset', dataResetRouter);
+app.use('/api/v1/data-reset', requireApp, dataResetRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — USER PREFERENCES  /api/v1/user-preferences
@@ -4421,7 +4580,7 @@ userPreferencesRouter.put('/batch', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/user-preferences', userPreferencesRouter);
+app.use('/api/v1/user-preferences', requireApp, userPreferencesRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — SYNC  /api/v1/sync
@@ -4566,7 +4725,7 @@ syncRouter.post('/pull', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/sync', syncRouter);
+app.use('/api/v1/sync', requireApp, syncRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  SAVED WORDS
@@ -4645,7 +4804,7 @@ savedWordsRouter.delete('/:id', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/saved-words', savedWordsRouter);
+app.use('/api/v1/saved-words', requireApp, savedWordsRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  ARTICLE CHAT MESSAGES
@@ -4783,7 +4942,7 @@ articleChatsRouter.delete('/:articleId/summary', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/article-chats', articleChatsRouter);
+app.use('/api/v1/article-chats', requireApp, articleChatsRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  SAVED SEARCHES (InsightAI bookmarked searches + chat history)
@@ -5189,7 +5348,7 @@ savedSearchesRouter.delete('/:id/summary', async (req, res, next) => {
   }
 });
 
-app.use('/api/v1/saved-searches', savedSearchesRouter);
+app.use('/api/v1/saved-searches', requireApp, savedSearchesRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  EXPENSES
@@ -5213,7 +5372,54 @@ expensesRouter.get('/', async (_req, res, next) => {
       date: r.date,
       isManualCategory: !!r.is_manual_category,
       comments: r.comments || '',
+      updatedAt:
+        r.updated_at instanceof Date
+          ? r.updated_at.toISOString()
+          : (r.updated_at ? String(r.updated_at) : null),
     })));
+  } catch (err) {
+    next(err);
+  }
+});
+
+// GET /api/v1/expenses/tombstones — incremental delete log for cross-device
+// delete sync. When any device deletes an expense, the row is removed AND a
+// tombstone (id, deleted_at) is written into deleted_expenses. Other devices
+// pull this with ?since=<iso watermark> on launch/resume and apply the deletes
+// locally. Wire shape: Array<{ id: string, deletedAt: ISO-8601 }>.
+//
+// MUST be registered before any '/:id' route so Express doesn't parse
+// 'tombstones' as an :id param.
+expensesRouter.get('/tombstones', async (req, res, next) => {
+  try {
+    const since = req.query.since;
+    const params = [];
+    let where = '';
+    if (typeof since === 'string' && since.length > 0) {
+      const d = new Date(since);
+      if (Number.isNaN(d.getTime())) {
+        return res.status(400).json({ error: 'invalid since timestamp' });
+      }
+      params.push(d.toISOString());
+      where = 'WHERE deleted_at > $1';
+    }
+    const { rows } = await pool.query(
+      `SELECT id, deleted_at
+         FROM deleted_expenses
+         ${where}
+        ORDER BY deleted_at ASC
+        LIMIT 1000`,
+      params,
+    );
+    res.json(
+      rows.map((r) => ({
+        id: r.id,
+        deletedAt:
+          r.deleted_at instanceof Date
+            ? r.deleted_at.toISOString()
+            : String(r.deleted_at || ''),
+      })),
+    );
   } catch (err) {
     next(err);
   }
@@ -5227,9 +5433,9 @@ expensesRouter.post('/', async (req, res, next) => {
       return res.status(400).json({ error: 'id and amount are required' });
     }
 
-    await pool.query(
-      `INSERT INTO expenses (id, amount, description, category, bank, card_type, date, is_manual_category, comments)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+    const upserted = await pool.query(
+      `INSERT INTO expenses (id, amount, description, category, bank, card_type, date, is_manual_category, comments, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NOW())
        ON CONFLICT (id) DO UPDATE SET
          amount = EXCLUDED.amount,
          description = EXCLUDED.description,
@@ -5239,12 +5445,23 @@ expensesRouter.post('/', async (req, res, next) => {
          date = EXCLUDED.date,
          is_manual_category = EXCLUDED.is_manual_category,
          comments = EXCLUDED.comments,
-         updated_at = NOW()`,
+         updated_at = NOW()
+       RETURNING updated_at`,
       [id, amount, description || '', category || '', bank || '', cardType || '', date || '', !!isManualCategory, comments || ''],
     );
 
+    // Clear any tombstone for this id so a re-created/edited expense is not
+    // re-deleted on other devices when they next pull /tombstones.
+    await pool.query('DELETE FROM deleted_expenses WHERE id = $1', [id]);
+
+    const ua = upserted.rows[0] && upserted.rows[0].updated_at;
+    const updatedAt =
+      ua instanceof Date ? ua.toISOString() : (ua ? String(ua) : null);
+
     console.log('[EXPENSES] Upserted:', id, description, amount);
-    res.json({ ok: true, id });
+    // Return the server-assigned updatedAt so the client can store it and keep
+    // cross-device last-write-wins anchored to a single (server) clock.
+    res.json({ ok: true, id, updatedAt });
   } catch (err) {
     next(err);
   }
@@ -5261,19 +5478,32 @@ expensesRouter.delete('/', async (_req, res, next) => {
   }
 });
 
-// DELETE expense
+// DELETE expense — hard delete + write a tombstone so other devices can sync
+// the deletion on their next /tombstones pull. The tombstone is written FIRST
+// (idempotent upsert) so cross-device delete sync stays correct even if a later
+// step fails.
 expensesRouter.delete('/:id', async (req, res, next) => {
   try {
     const { id } = req.params;
+    // Truncate to milliseconds so the stored value exactly matches the
+    // millisecond-precision ISO string the /tombstones GET emits — this keeps
+    // the client's `?since=<watermark>` cursor strict (a tombstone is never
+    // re-shipped to a device that has already applied it).
+    await pool.query(
+      `INSERT INTO deleted_expenses (id, deleted_at)
+       VALUES ($1, date_trunc('milliseconds', NOW()))
+       ON CONFLICT (id) DO UPDATE SET deleted_at = date_trunc('milliseconds', NOW())`,
+      [id],
+    );
     const result = await pool.query('DELETE FROM expenses WHERE id = $1', [id]);
-    console.log('[EXPENSES] Deleted:', id, '| rows:', result.rowCount);
+    console.log('[EXPENSES] Deleted:', id, '| rows:', result.rowCount, '| tombstone written');
     res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
   }
 });
 
-app.use('/api/v1/expenses', expensesRouter);
+app.use('/api/v1/expenses', requireApp, expensesRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  BUDGET
@@ -5332,7 +5562,7 @@ budgetRouter.delete('/history', async (_req, res, next) => {
   }
 });
 
-app.use('/api/v1/budget', budgetRouter);
+app.use('/api/v1/budget', requireApp, budgetRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  SALARY  (monthly in-hand income — one entry per 'YYYY-MM')
@@ -5405,7 +5635,7 @@ salaryRouter.delete('/history', async (_req, res, next) => {
   }
 });
 
-app.use('/api/v1/salary', salaryRouter);
+app.use('/api/v1/salary', requireApp, salaryRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  CATEGORY LEARNINGS
@@ -5475,7 +5705,168 @@ learningsRouter.delete('/', async (_req, res, next) => {
   }
 });
 
-app.use('/api/v1/category-learnings', learningsRouter);
+app.use('/api/v1/category-learnings', requireApp, learningsRouter);
+
+// ═══════════════════════════════════════════════════════════════
+//  ROUTES — CLOUD  /api/v1/cloud   (Google Drive proxy for the web app)
+// ═══════════════════════════════════════════════════════════════
+
+const cloudService = require('./cloud-service');
+const Busboy = require('busboy');
+
+const cloudRouter = express.Router();
+
+function ensureDrive(res) {
+  if (!cloudService.isDriveAvailable()) {
+    res.status(503).json({
+      error: 'Cloud storage is not configured on the server (GOOGLE_DRIVE_SA_JSON).',
+    });
+    return false;
+  }
+  return true;
+}
+
+cloudRouter.get('/files', async (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const result = await cloudService.listFiles({
+      pageToken: req.query.pageToken,
+      pageSize: req.query.pageSize,
+      q: req.query.q,
+    });
+    res.json(result);
+  } catch (err) {
+    tg.e('Cloud/files', `list failed: ${err.message}`, err);
+    next(err);
+  }
+});
+
+cloudRouter.get('/quota', async (_req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    res.json(await cloudService.getQuota());
+  } catch (err) {
+    next(err);
+  }
+});
+
+// Streamed multipart upload → Drive (no full-file buffering).
+cloudRouter.post('/upload', (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  let busboy;
+  try {
+    busboy = Busboy({ headers: req.headers, limits: { files: 1 } });
+  } catch (err) {
+    return res.status(400).json({ error: 'Invalid upload request' });
+  }
+
+  let handled = false;
+  let uploadPromise = null;
+
+  busboy.on('file', (_name, fileStream, info) => {
+    handled = true;
+    const { filename, mimeType } = info;
+    uploadPromise = cloudService
+      .uploadStream({
+        name: filename || `upload-${Date.now()}`,
+        mimeType,
+        body: fileStream,
+      })
+      .catch((err) => {
+        fileStream.resume(); // drain
+        throw err;
+      });
+  });
+
+  busboy.on('close', async () => {
+    if (!handled || !uploadPromise) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+    try {
+      const file = await uploadPromise;
+      res.status(201).json({ file });
+    } catch (err) {
+      tg.e('Cloud/upload', `upload failed: ${err.message}`, err);
+      next(err);
+    }
+  });
+
+  busboy.on('error', (err) => {
+    tg.e('Cloud/upload', `busboy error: ${err.message}`, err);
+    next(err);
+  });
+
+  req.pipe(busboy);
+});
+
+// ── Resumable (chunked) upload — large files / unreliable office networks ──
+// Routes live in ./cloud-resumable so the full lifecycle is unit-testable.
+const { attachResumableRoutes } = require('./cloud-resumable');
+attachResumableRoutes(cloudRouter, { cloudService, ensureDrive, tg });
+
+cloudRouter.get('/files/:id/download', async (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const meta = await cloudService.getFileMeta(req.params.id);
+    const driveRes = await cloudService.downloadStream(req.params.id);
+    const inline = req.query.inline === '1';
+    res.setHeader('Content-Type', meta.mimeType);
+    if (meta.size) res.setHeader('Content-Length', String(meta.size));
+    res.setHeader(
+      'Content-Disposition',
+      `${inline ? 'inline' : 'attachment'}; filename="${encodeURIComponent(meta.name)}"`,
+    );
+    driveRes.data.on('error', (err) => {
+      tg.e('Cloud/download', `stream error: ${err.message}`);
+      if (!res.headersSent) res.status(500).end();
+      else res.end();
+    });
+    driveRes.data.pipe(res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+cloudRouter.get('/files/:id/thumbnail', async (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const size = Math.min(Math.max(Number(req.query.size) || 320, 32), 1024);
+    const thumb = await cloudService.fetchThumbnail(req.params.id, size);
+    if (!thumb) return res.status(404).end();
+    res.setHeader('Content-Type', thumb.contentType);
+    res.setHeader('Cache-Control', 'private, max-age=3600');
+    res.end(thumb.buffer);
+  } catch (err) {
+    next(err);
+  }
+});
+
+cloudRouter.delete('/files/:id', async (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    await cloudService.deleteFile(req.params.id);
+    res.json({ ok: true, id: req.params.id });
+  } catch (err) {
+    next(err);
+  }
+});
+
+cloudRouter.post('/files/:id/star', async (req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    let starred = req.body?.starred;
+    if (typeof starred !== 'boolean') {
+      const cur = await cloudService.getFileMeta(req.params.id);
+      starred = !cur.starred;
+    }
+    const file = await cloudService.setStar(req.params.id, starred);
+    res.json({ file, starred: file.starred });
+  } catch (err) {
+    next(err);
+  }
+});
+
+app.use('/api/v1/cloud', requireApp, cloudRouter);
 
 // ═══════════════════════════════════════════════════════════════
 //  404 + ERROR HANDLER
@@ -5534,6 +5925,7 @@ const _REQUIRED_TABLES = [
   'user_preferences', 'x_feed_sync_state',
   'saved_searches', 'saved_search_chat_messages',
   'saved_search_chat_summaries', 'deleted_saved_searches',
+  'deleted_expenses',
 ];
 
 async function _runSafe(label, fn) {
@@ -5721,6 +6113,19 @@ async function initTables() {
   await _runSafe('expenses.comments', () =>
     pool.query("ALTER TABLE expenses ADD COLUMN IF NOT EXISTS comments TEXT NOT NULL DEFAULT ''"),
   );
+  await _runSafe('expenses.updated_at', () =>
+    pool.query('ALTER TABLE expenses ADD COLUMN IF NOT EXISTS updated_at TIMESTAMPTZ DEFAULT NOW()'),
+  );
+
+  // Cross-device delete sync for expenses — a tombstone is written here on
+  // every per-id DELETE; other devices pull the delta with ?since=<watermark>
+  // and apply the deletes locally so web→phone deletions propagate.
+  await _runSafe('deleted_expenses', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS deleted_expenses (
+      id TEXT PRIMARY KEY,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
 
   await _runSafe('budget_entries', () => pool.query(`
     CREATE TABLE IF NOT EXISTS budget_entries (
@@ -5909,7 +6314,9 @@ async function initTables() {
     CREATE INDEX IF NOT EXISTS idx_news_updated ON news_articles(updated_at);
     CREATE INDEX IF NOT EXISTS idx_sscm_search ON saved_search_chat_messages(search_id);
     CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at);
-    CREATE INDEX IF NOT EXISTS idx_dss_deleted_at ON deleted_saved_searches(deleted_at)
+    CREATE INDEX IF NOT EXISTS idx_dss_deleted_at ON deleted_saved_searches(deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_expenses_updated ON expenses(updated_at);
+    CREATE INDEX IF NOT EXISTS idx_de_deleted_at ON deleted_expenses(deleted_at)
   `));
 
   // ── Seed defaults ─────────────────────────────────────────────
