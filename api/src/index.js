@@ -4789,78 +4789,10 @@ app.use('/api/v1/sync', requireApp, syncRouter);
 //  SAVED WORDS
 // ═══════════════════════════════════════════════════════════════
 
-const savedWordsRouter = express.Router();
-
-// GET all saved words
-savedWordsRouter.get('/', async (req, res, next) => {
-  try {
-    const { rows } = await pool.query(
-      'SELECT * FROM saved_words ORDER BY saved_at DESC',
-    );
-    res.json(rows);
-  } catch (err) {
-    next(err);
-  }
-});
-
-// POST create/upsert a saved word
-savedWordsRouter.post('/', async (req, res, next) => {
-  try {
-    const { id, word, definition, pronunciation, partOfSpeech, savedAt, responseJson } = req.body;
-    if (!id || !word) {
-      return res.status(400).json({ error: 'id and word are required' });
-    }
-
-    await pool.query(
-      `INSERT INTO saved_words (id, word, definition, pronunciation, part_of_speech, saved_at, response_json)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)
-       ON CONFLICT (id) DO UPDATE SET
-         word = EXCLUDED.word,
-         definition = EXCLUDED.definition,
-         pronunciation = EXCLUDED.pronunciation,
-         part_of_speech = EXCLUDED.part_of_speech,
-         response_json = EXCLUDED.response_json`,
-      [
-        id,
-        word,
-        definition || '',
-        pronunciation || '',
-        partOfSpeech || '',
-        savedAt || new Date().toISOString(),
-        responseJson || '{}',
-      ],
-    );
-
-    console.log('[SAVED_WORDS] Upserted:', id, word);
-    res.json({ ok: true, id });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DELETE all saved words (full-reset "nuke" — bulk clear). Declared BEFORE the
-// '/:id' route so Express matches the bare collection path here, not as an id.
-savedWordsRouter.delete('/', async (_req, res, next) => {
-  try {
-    const result = await pool.query('DELETE FROM saved_words');
-    console.log('[SAVED_WORDS] Cleared all:', result.rowCount, 'rows deleted');
-    res.json({ ok: true, deleted: result.rowCount });
-  } catch (err) {
-    next(err);
-  }
-});
-
-// DELETE a saved word
-savedWordsRouter.delete('/:id', async (req, res, next) => {
-  try {
-    const { id } = req.params;
-    const result = await pool.query('DELETE FROM saved_words WHERE id = $1', [id]);
-    console.log('[SAVED_WORDS] Deleted:', id, '| rows:', result.rowCount);
-    res.json({ ok: true, deleted: result.rowCount });
-  } catch (err) {
-    next(err);
-  }
-});
+// Router (incl. cross-device delete-sync tombstones) lives in ./saved-words so
+// the full lifecycle is unit-testable with a fake pool.
+const { buildSavedWordsRouter } = require('./saved-words');
+const savedWordsRouter = buildSavedWordsRouter(express, pool);
 
 app.use('/api/v1/saved-words', requireApp, savedWordsRouter);
 
@@ -5983,7 +5915,7 @@ const _REQUIRED_TABLES = [
   'user_preferences', 'x_feed_sync_state',
   'saved_searches', 'saved_search_chat_messages',
   'saved_search_chat_summaries', 'deleted_saved_searches',
-  'deleted_expenses',
+  'deleted_expenses', 'deleted_saved_words',
 ];
 
 async function _runSafe(label, fn) {
@@ -6148,6 +6080,17 @@ async function initTables() {
       saved_at TEXT NOT NULL DEFAULT '',
       response_json TEXT NOT NULL DEFAULT '{}',
       created_at TIMESTAMPTZ DEFAULT NOW()
+    )
+  `));
+
+  // Cross-device delete sync for saved words — a tombstone is written here on
+  // every per-id DELETE (and bulk clear); other devices pull the delta with
+  // ?since=<watermark> and remove the rows locally so web→phone deletions
+  // propagate (the phone's saved-words pull is otherwise insert-only).
+  await _runSafe('deleted_saved_words', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS deleted_saved_words (
+      id TEXT PRIMARY KEY,
+      deleted_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `));
 
@@ -6374,7 +6317,8 @@ async function initTables() {
     CREATE INDEX IF NOT EXISTS idx_saved_searches_updated ON saved_searches(updated_at);
     CREATE INDEX IF NOT EXISTS idx_dss_deleted_at ON deleted_saved_searches(deleted_at);
     CREATE INDEX IF NOT EXISTS idx_expenses_updated ON expenses(updated_at);
-    CREATE INDEX IF NOT EXISTS idx_de_deleted_at ON deleted_expenses(deleted_at)
+    CREATE INDEX IF NOT EXISTS idx_de_deleted_at ON deleted_expenses(deleted_at);
+    CREATE INDEX IF NOT EXISTS idx_dsw_deleted_at ON deleted_saved_words(deleted_at)
   `));
 
   // ── Seed defaults ─────────────────────────────────────────────
