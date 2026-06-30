@@ -14,7 +14,10 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 
-const { SMART_PARSE_SYSTEM_PROMPT } = require('../src/prompts');
+const {
+  SMART_PARSE_SYSTEM_PROMPT,
+  buildSmartParseSystemPrompt,
+} = require('../src/prompts');
 
 test('prompt still requests the strict 5-field JSON contract', () => {
   assert.match(
@@ -65,6 +68,64 @@ test('prompt never falls back to CASH when a real bank is named', () => {
     SMART_PARSE_SYSTEM_PROMPT,
     /NEVER fall back to CASH for these alerts/,
   );
+});
+
+// ── Bank-config awareness (cards added in Settings after release) ──────────
+
+test('default prompt (no banks) keeps the built-in bank set', () => {
+  const p = buildSmartParseSystemPrompt();
+  assert.match(p, /3\. BANK \(string\): One of "HDFC", "ICICI", "AXIS", "SCAPIA", "CASH"\./);
+  // The exported constant is the no-arg default.
+  assert.equal(p, SMART_PARSE_SYSTEM_PROMPT);
+});
+
+test('configured banks are injected into the BANK field + aliases', () => {
+  const p = buildSmartParseSystemPrompt(['HDFC', 'KOTAK', 'SCAPIA']);
+  // The newly added KOTAK card is now part of the allowed list...
+  assert.match(p, /3\. BANK \(string\): One of "HDFC", "KOTAK", "SCAPIA", "CASH"\./);
+  // ...with a lowercase alias so voice/STT maps "kotak" → "KOTAK".
+  assert.match(p, /"kotak" → "KOTAK"/);
+  // CASH is always retained as the default fallback.
+  assert.match(p, /★ CRITICAL DEFAULT: If NO bank from this list is mentioned, default to "CASH"\./);
+  // The SMS detection line also references the configured list.
+  assert.match(p, /map it to one of these: "HDFC", "KOTAK", "SCAPIA", "CASH"/);
+});
+
+test('builder sanitises dirty bank input (case, dups, empties, CASH)', () => {
+  const p = buildSmartParseSystemPrompt(['hdfc', 'HDFC', '  kotak  ', '', 'CASH', null]);
+  // Deduped + uppercased + CASH stripped from the configured part, then re-added once.
+  assert.match(p, /3\. BANK \(string\): One of "HDFC", "KOTAK", "CASH"\./);
+  // No empty / null bank tokens leak in.
+  assert.doesNotMatch(p, /"" →/);
+});
+
+test('empty / non-array banks fall back to the default set', () => {
+  for (const arg of [[], undefined, null, 'HDFC', 42]) {
+    const p = buildSmartParseSystemPrompt(arg);
+    assert.match(p, /One of "HDFC", "ICICI", "AXIS", "SCAPIA", "CASH"\./);
+  }
+});
+
+test('multi-word bank names are upper-cased and aliased verbatim', () => {
+  const p = buildSmartParseSystemPrompt(['Bank Of Baroda', 'IDFC First']);
+  assert.match(p, /One of "BANK OF BARODA", "IDFC FIRST", "CASH"\./);
+  assert.match(p, /"bank of baroda" → "BANK OF BARODA"/);
+  assert.match(p, /"idfc first" → "IDFC FIRST"/);
+});
+
+test('a large bank list still yields a valid, CASH-terminated contract', () => {
+  const many = Array.from({ length: 60 }, (_, i) => `BANK${i}`);
+  const p = buildSmartParseSystemPrompt(many);
+  // CASH is always the last entry + JSON contract intact.
+  assert.match(p, /"BANK59", "CASH"\./);
+  assert.match(
+    p,
+    /"amount": number, "description": "string", "bank": "string", "cardType": "string", "category": "string"/,
+  );
+  // Every configured bank made it into the list.
+  for (const b of ['"BANK0"', '"BANK30"', '"BANK59"']) {
+    assert.ok(p.includes(b), `${b} must be present`);
+  }
 });
 
 test('prompt includes worked examples for every sample alert template', () => {

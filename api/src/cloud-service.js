@@ -157,6 +157,36 @@ async function _accessToken() {
   return token;
 }
 
+/**
+ * Mint a short-lived Google Drive OAuth access token for a *trusted* client.
+ *
+ * This is the token-broker used by the Android app: the service-account private
+ * key never leaves the server — the app calls the (auth-gated) `/cloud/token`
+ * route, gets back this short-lived (≈1 h) token, and talks to Drive directly.
+ * Returns { accessToken, expiresAt (ISO), scope, folderId }.
+ */
+async function getAccessToken() {
+  const auth = await _getAuth();
+  const client = await auth.getClient();
+  const resp = await client.getAccessToken();
+  const token = typeof resp === 'string' ? resp : resp && resp.token;
+  if (!token) throw new Error('Failed to obtain a Drive access token');
+
+  // google-auth-library caches the absolute expiry (ms epoch) on the client
+  // after a token is fetched. Fall back to a conservative 55-min lifetime.
+  const expiryMs =
+    client.credentials && client.credentials.expiry_date
+      ? Number(client.credentials.expiry_date)
+      : Date.now() + 55 * 60 * 1000;
+
+  return {
+    accessToken: token,
+    expiresAt: new Date(expiryMs).toISOString(),
+    scope: DRIVE_SCOPE,
+    folderId: FOLDER_ID,
+  };
+}
+
 // Drive replies with e.g. `Range: bytes=0-262143`; the next offset is end + 1.
 // When no Range header is present, nothing has been committed yet → offset 0.
 function _nextOffsetFromRange(rangeHeader) {
@@ -275,6 +305,7 @@ async function fetchThumbnail(fileId, size = 320) {
 module.exports = {
   FOLDER_ID,
   isDriveAvailable,
+  getAccessToken,
   listFiles,
   getQuota,
   getFileMeta,

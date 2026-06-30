@@ -17,6 +17,7 @@ const {
   buildSummarizerSystemPrompt,
   buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
+  buildSmartParseSystemPrompt,
   CATEGORIZE_SYSTEM_PROMPT,
   IMAGE_LENS_PROMPT,
   buildVisionExpertPrompt,
@@ -2499,6 +2500,9 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
 const AISmartParseSchema = z.object({
   text: z.string().min(2).max(6000),
   liteModel: z.string().max(200).optional(),
+  // Generous bounds so a user with many cards / a long bank name never gets a
+  // hard 400 on parsing; the prompt builder sanitises the contents anyway.
+  banks: z.array(z.string().max(64)).max(100).optional(),
 });
 
 aiRouter.post('/smart-parse', async (req, res, next) => {
@@ -2507,15 +2511,15 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
     const val = validate(AISmartParseSchema, req.body);
     if (!val.ok) return res.status(400).json({ error: val.error });
 
-    const { text } = val.data;
+    const { text, banks } = val.data;
     const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
     console.log('[AI] smart-parse →', text);
-    tg.d('AI/smart-parse', `text="${text.slice(0, 60)}", model=${pickedModel || '(default)'}`);
+    tg.d('AI/smart-parse', `text="${text.slice(0, 60)}", model=${pickedModel || '(default)'}, banks=${(banks || []).length}`);
 
     const result = await callLiteLLM({
       model: pickedModel || undefined,
       messages: [
-        { role: 'system', content: SMART_PARSE_SYSTEM_PROMPT },
+        { role: 'system', content: buildSmartParseSystemPrompt(banks) },
         { role: 'user', content: text },
       ],
       temperature: 0.1,
@@ -2562,6 +2566,7 @@ const AISmartParseImageSchema = z.object({
   imageMediaType: z.string().max(100).optional(),
   liteModel: z.string().max(200).optional(),
   deepModel: z.string().max(200).optional(),
+  banks: z.array(z.string().max(64)).max(100).optional(),
 });
 
 aiRouter.post('/smart-parse-image', async (req, res, next) => {
@@ -2575,7 +2580,7 @@ aiRouter.post('/smart-parse-image', async (req, res, next) => {
       return res.status(503).json({ error: 'Vision parsing is not configured on the server' });
     }
 
-    const { image, imageMediaType, liteModel, deepModel } = val.data;
+    const { image, imageMediaType, liteModel, deepModel, banks } = val.data;
     const validation = _validateImagePayloadShared(image, imageMediaType);
     if (!validation.ok) {
       tg.d('AI/smart-parse-image', `400 validation: ${validation.error}`);
@@ -2591,7 +2596,7 @@ aiRouter.post('/smart-parse-image', async (req, res, next) => {
     const result = await geminiComplete({
       model: visionModel,
       messages: [
-        { role: 'system', content: SMART_PARSE_SYSTEM_PROMPT },
+        { role: 'system', content: buildSmartParseSystemPrompt(banks) },
         {
           role: 'user',
           content: [
@@ -5736,6 +5741,22 @@ cloudRouter.get('/quota', async (_req, res, next) => {
   try {
     res.json(await cloudService.getQuota());
   } catch (err) {
+    next(err);
+  }
+});
+
+// Token broker — hands a *trusted* (already requireApp-authenticated) client a
+// short-lived Drive access token so the Android app can talk to Drive directly
+// WITHOUT ever embedding the service-account private key in the APK.
+cloudRouter.get('/token', async (_req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const token = await cloudService.getAccessToken();
+    // Never cache a bearer token at any hop.
+    res.setHeader('Cache-Control', 'no-store');
+    res.json(token);
+  } catch (err) {
+    tg.e('Cloud/token', `mint failed: ${err.message}`, err);
     next(err);
   }
 });

@@ -9,6 +9,7 @@ const cloud = require('../src/cloud-service');
 test('cloud-service exposes the expected proxy API', () => {
   for (const fn of [
     'isDriveAvailable',
+    'getAccessToken',
     'listFiles',
     'getQuota',
     'getFileMeta',
@@ -45,6 +46,11 @@ test('isDriveAvailable parses a base64-encoded service account', () => {
 
 test('listFiles rejects clearly when Drive is not configured', async () => {
   await assert.rejects(() => cloud.listFiles({}), /not configured/i);
+});
+
+test('getAccessToken rejects clearly when Drive is not configured', async () => {
+  delete process.env.GOOGLE_DRIVE_SA_JSON;
+  await assert.rejects(() => cloud.getAccessToken(), /not configured/i);
 });
 
 test('default folder id matches the Android app', () => {

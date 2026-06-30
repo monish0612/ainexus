@@ -309,7 +309,25 @@ function buildSummarizerSystemPrompt(url) {
 
 // ── Smart Parse ─────────────────────────────────────────────────────────────
 
-const SMART_PARSE_SYSTEM_PROMPT = [
+// Builds the smart-parse system prompt. When the caller passes the user's
+// CONFIGURED bank names (synced from Settings, e.g. ['HDFC','KOTAK','SCAPIA']),
+// the BANK field is constrained to *that* list so a newly added card is
+// recognised by voice/OCR. With no banks supplied it falls back to the
+// built-in default set, preserving the original behaviour for shared SMS.
+function buildSmartParseSystemPrompt(banks = []) {
+  const cleaned = Array.isArray(banks)
+    ? [...new Set(
+        banks
+          .map((b) => String(b == null ? '' : b).trim().toUpperCase())
+          .filter((b) => b && b !== 'CASH'),
+      )]
+    : [];
+  const known = cleaned.length ? cleaned : ['HDFC', 'ICICI', 'AXIS', 'SCAPIA'];
+  const bankList = [...known, 'CASH'].map((b) => `"${b}"`).join(', ');
+  const aliasLine = known
+    .map((b) => `"${b.toLowerCase()}" → "${b}"`)
+    .join(', ');
+  return [
   'You are a highly intelligent expense parser. The user gives you freeform text describing an expense.',
   'The input can be from VOICE (speech-to-text, may have errors) or from BILL OCR (may have extra text).',
   'Your job: extract structured data with EXTREME accuracy. Think step-by-step before outputting.',
@@ -357,7 +375,7 @@ const SMART_PARSE_SYSTEM_PROMPT = [
   '      • For a person (UPI transfer "To B . KAMALAKANNAN"): produce the clean name "B. Kamalakannan".',
   '      • For a UPI VPA handle ("At paytm.s29gayk@pty", "Q089615363@ybl"): use the recognizable provider/brand — "paytm...@pty" → "Paytm", "...@ybl"/"@okhdfcbank"/"@ibl"/"@axl" are generic UPI banks so if there is no brand use "UPI Payment".',
   '      • NEVER use the card number, reference number, UPI transaction id, phone number, or any "Not You?/Block/Call/SMS/Reissue/Avl Limit" text as the description.',
-  '  - bank: detect the issuing bank name → "HDFC Bank"/"HDFC" → "HDFC", "ICICI" → "ICICI", "Axis Bank"/"AXIS" → "AXIS", "SCAPIA" → "SCAPIA". If a real bank is named, NEVER fall back to CASH for these alerts.',
+  '  - bank: detect the issuing bank name and map it to one of these: ' + bankList + ' (e.g. "HDFC Bank"/"HDFC" → "HDFC", "Axis Bank" → "AXIS", "Kotak Bank" → "KOTAK"). If a real bank is named, NEVER fall back to CASH for these alerts.',
   '  - cardType:',
   '      • Mentions "Card" / "Credit Card" / "BLOCK CC" / "CC <last4>" → "CC".',
   '      • Mentions "A/C" / "Account" / "Debit Card" / "BLOCK DC" / "DC <last4>" → "DB".',
@@ -379,10 +397,11 @@ const SMART_PARSE_SYSTEM_PROMPT = [
   '   For bills: Use the restaurant/merchant/store NAME, not individual item names.',
   '   Fix any obvious speech-to-text errors (see above).',
   '',
-  '3. BANK (string): One of "HDFC", "ICICI", "AXIS", "SCAPIA", "CASH".',
-  '   Aliases: "hdfc" → "HDFC", "icici" → "ICICI", "axis" → "AXIS", "scapia" → "SCAPIA".',
+  '3. BANK (string): One of ' + bankList + '.',
+  '   Aliases (case-insensitive): ' + aliasLine + '.',
+  '   Match the spoken/written bank to the CLOSEST name in this list (e.g. "kotak"/"kotak bank" → "KOTAK").',
   '   If the user says "cash", bank = "CASH".',
-  '   ★ CRITICAL DEFAULT: If NO bank keyword is found, default to "CASH".',
+  '   ★ CRITICAL DEFAULT: If NO bank from this list is mentioned, default to "CASH".',
   '',
   '4. CARD TYPE (string): One of "CC", "DB", "Cash".',
   '   Aliases: "cc" / "credit card" / "credit" → "CC", "dc" / "db" / "debit card" / "debit" → "DB".',
@@ -414,7 +433,10 @@ const SMART_PARSE_SYSTEM_PROMPT = [
   '',
   'Return JSON only: {"amount": number, "description": "string", "bank": "string", "cardType": "string", "category": "string"}',
   'No markdown fences. No explanation. JSON only.',
-].join('\n');
+  ].join('\n');
+}
+
+const SMART_PARSE_SYSTEM_PROMPT = buildSmartParseSystemPrompt();
 
 // ── Categorize ──────────────────────────────────────────────────────────────
 
@@ -752,6 +774,7 @@ module.exports = {
   buildSummarizerSystemPrompt,
   buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
+  buildSmartParseSystemPrompt,
   CATEGORIZE_SYSTEM_PROMPT,
   IMAGE_LENS_PROMPT,
   buildVisionExpertPrompt,

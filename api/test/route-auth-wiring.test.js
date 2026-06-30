@@ -68,6 +68,14 @@ test('app-login route exists with a dedicated rate limiter', () => {
   assert.match(SRC, /authRouter\.post\('\/app-login',\s*appLoginLimiter/);
 });
 
+test('cloud token-broker route exists on the (requireApp-gated) cloud router', () => {
+  // The whole /cloud subtree is gated by requireApp, so the token broker is
+  // auth-protected by construction. Confirm it exists and never lets a bearer
+  // token be cached at any hop.
+  assert.match(SRC, /cloudRouter\.get\('\/token'/);
+  assert.match(SRC, /res\.setHeader\('Cache-Control',\s*'no-store'\)/);
+});
+
 test('app-auth helpers are imported into index.js', () => {
   assert.match(SRC, /require\('\.\/app-auth'\)/);
   for (const fn of ['requireApp', 'checkAppCredentials', 'makeAppToken', 'buildClientLog']) {
