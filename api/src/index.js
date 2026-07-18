@@ -637,6 +637,10 @@ const AISummarizeSchema = z.object({
 
 // Batch quick-summary for the For You "catch up" pile (Gemini Flash Lite).
 // Client sends already-extracted text; server only does the LLM call.
+// `url` is optional: when the client's local copy of an article is thin
+// (headline-only feeds), the batch handler deep-extracts the real body
+// content from the URL before summarizing — see the enrichment block in
+// the /summarize-articles-batch route.
 const AISummarizeArticlesBatchSchema = z.object({
   articles: z.array(z.object({
     id: z.string().min(1).max(200),
@@ -644,6 +648,7 @@ const AISummarizeArticlesBatchSchema = z.object({
     source: z.string().max(120).optional(),
     category: z.string().max(60).optional(),
     content: z.string().max(4000),
+    url: z.string().max(2000).optional(),
   })).min(1).max(12),
   model: z.string().optional(),
   liteModel: z.string().max(200).optional(),
@@ -2404,12 +2409,48 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
 
     tg.d('AI/summarize-batch', `▶ ${articles.length} articles model=${requestedModel || '(priority-list)'}`);
 
+    // ── Thin-content enrichment ──────────────────────────────────────────
+    // Feeds ingested without full-body extraction leave the client with
+    // little more than the title, so the model can only produce a
+    // headline-shape briefing ("the summary doesn't explain anything").
+    // When the client supplies the article URL, deep-extract the real body
+    // here first. Guard rails: only articles under 350 chars of content,
+    // at most 3 per request (the on-demand reader flow sends exactly 1),
+    // each capped at 25 s so a slow site can never stall the whole batch.
+    // Any failure falls back silently to the client-provided content.
+    const enrichedContent = new Map();
+    const _thin = articles.filter((a) =>
+      (a.content || '').trim().length < 350 && /^https?:\/\//i.test(a.url || ''));
+    const _toEnrich = _thin.slice(0, 3);
+    if (_toEnrich.length > 0) {
+      const _e0 = Date.now();
+      tg.d('AI/summarize-batch', `Enrich ▶ ${_toEnrich.length}/${articles.length} thin article(s) via deep-extract`);
+      await Promise.all(_toEnrich.map(async (a) => {
+        try {
+          const extracted = await Promise.race([
+            deepExtractContent(a.url, { logTag: 'AI/summarize-batch' }),
+            new Promise((_, reject) =>
+              setTimeout(() => reject(new Error('enrich timeout (25s)')), 25000)),
+          ]);
+          const text = (extracted?.content || '').trim();
+          if (text.length >= 300) {
+            enrichedContent.set(a.id, text.slice(0, 8000));
+            tg.i('AI/summarize-batch', `Enrich ✓ id=${a.id} ${text.length}ch method=${extracted.extractionMethod} ${Date.now() - _e0}ms`);
+          } else {
+            tg.w('AI/summarize-batch', `Enrich ✗ id=${a.id} only ${text.length}ch — keeping client content`);
+          }
+        } catch (enrichErr) {
+          tg.w('AI/summarize-batch', `Enrich ✗ id=${a.id}: ${enrichErr.message?.slice(0, 100)} — keeping client content`);
+        }
+      }));
+    }
+
     const userPayload = articles.map((a) => ({
       id: a.id,
       title: a.title,
       source: a.source || '',
       category: a.category || '',
-      content: a.content,
+      content: enrichedContent.get(a.id) || a.content,
     }));
 
     const messages = [
