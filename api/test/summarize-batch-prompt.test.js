@@ -91,6 +91,36 @@ test('strict JSON envelope keyed by echoed id is unchanged', () => {
   assert.match(PROMPT, /one entry for EVERY input id/);
 });
 
+// ── 3b. Full-category coverage (rev. 6: reviews, interviews, all beats) ──
+
+test('audience adaptation covers every requested category', () => {
+  // The batch prompt is the single live path for AI news, AI-coding,
+  // CEO/founder interviews, business/finance/stocks, gadgets and movies.
+  assert.match(PROMPT, /incl\. AI-coding & dev-tools news/);
+  assert.match(PROMPT, /LEADERSHIP \/ CEO & FOUNDER INTERVIEWS/);
+  assert.match(PROMPT, /GADGETS \/ HARDWARE \/ CONSUMER-TECH PRODUCT REVIEWS/);
+  assert.match(PROMPT, /MOVIES \/ TV \/ SHOWS \/ ENTERTAINMENT REVIEWS/);
+});
+
+test('review + interview summary shapes exist alongside A–D', () => {
+  assert.match(PROMPT, /E\. REVIEW \(gadget \/ product \/ movie/);
+  assert.match(PROMPT, /F\. INTERVIEW \/ PROFILE/);
+  // Reviews stay balanced (no pure hype) and movie reviews stay spoiler-safe.
+  assert.match(PROMPT, /never\n {5}turn a mixed review into pure hype/);
+  assert.match(PROMPT, /NO spoilers of major twists or the ending/);
+});
+
+test('length target is normal-detailed (not short)', () => {
+  assert.match(PROMPT, /Acceptable range: 240–320 words/);
+  assert.match(PROMPT, /NORMAL-DETAILED depth/);
+});
+
+test('style asks for engaging+creative writing without markdown/emojis', () => {
+  assert.match(PROMPT, /Engaging and creative, but never at the cost of clarity/);
+  // The no-markdown / no-emoji guardrails the client parser relies on stay.
+  assert.match(PROMPT, /NO emojis, NO markdown formatting/);
+});
+
 // ── 4. index.js enrichment wiring ───────────────────────────────
 
 test('batch schema accepts an optional per-article url', () => {
