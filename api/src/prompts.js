@@ -124,21 +124,94 @@ const REPHRASE_PLATFORMS = {
   },
 };
 
+/** Shared hard rules appended to every rephrase system prompt. */
+const REPHRASE_HARD_RULES = [
+  'ABSOLUTE RULE — REPHRASE THE EXACT SOURCE TEXT, NEVER REPLY:',
+  '- The user will give you a piece of text THEY wrote (or plan to send). Your ONLY job is to rephrase THAT EXACT TEXT in the specified tone/style.',
+  '- Do NOT answer the text. Do NOT continue the conversation. Do NOT ask a follow-up question. Do NOT complete a dialogue turn.',
+  '- Do NOT analyze the intent behind the text. Do NOT summarize it. Do NOT invent missing details.',
+  '- Keep the SAME message, meaning, sentiment, and speech-act (a question stays a question; a request stays a request).',
+  '- Preserve named entities (Starbucks, people, places, product names) unless the tone specifically requires a light rewrite of wording around them.',
+  '- Think of it like translating between tones: same content, different voice.',
+  '',
+  'DIALECT — Indian UK English:',
+  '- Prefer British spelling (colour, favour, organise, centre, travelling) unless the source already used American spelling.',
+  '- Natural Indian UK English phrasing is welcome when it fits the chosen tone (e.g. "Shall we…", "Do let me know", "Kindly…") — never force stereotypical slang.',
+  '- Do NOT introduce Americanisms (color, favor, organize) unless they were already in the source.',
+  '',
+  'COUNTER-EXAMPLE (memorise this):',
+  '  Source: "hey can we get the lunch from starbucks?"',
+  '  Correct (Casual): "hey, fancy grabbing lunch from Starbucks?"',
+  '  WRONG (reply — NEVER do this): "Hey sure, which Starbucks do you want lunch from?"',
+].join('\n');
+
+const REPHRASE_OUTPUT_RULES = [
+  'OUTPUT RULES:',
+  '- Output ONLY the rephrased version of the user\'s text — nothing else.',
+  '- Do NOT wrap in quotes. Do NOT add explanations, commentary, or meta-text.',
+  '- Do NOT add phrases like "Here\'s the rephrased version", "Sure!", "Of course", or "Hey sure".',
+].join('\n');
+
+/** Stricter nudge used on a one-shot retry when the model produced a reply. */
+const REPHRASE_RETRY_NUDGE = [
+  'CRITICAL CORRECTION: Your previous output answered or continued the conversation instead of rephrasing the source.',
+  'Rephrase ONLY the exact source text in the requested tone. Do not reply. Do not ask questions the source did not ask.',
+  'Remember: source "hey can we get the lunch from starbucks?" → rephrase like "hey, fancy grabbing lunch from Starbucks?" — NEVER "Hey sure, which Starbucks…".',
+].join(' ');
+
+/**
+ * Detects reply-shaped model output that should be rejected and retried.
+ * Returns true when [output] looks like a conversational answer while [source]
+ * did not already start that way.
+ */
+function looksLikeReplyInsteadOfRephrase(source, output) {
+  const src = String(source || '').trim();
+  const out = String(output || '').trim();
+  // No source → nothing to compare against; never treat as a reply-shaped failure.
+  if (!src || !out) return false;
+
+  const replyStarters = [
+    /^sure[,!.\s]/i,
+    /^of course[,!.\s]/i,
+    /^hey sure[,!.\s]/i,
+    /^yeah[,!.\s]/i,
+    /^yep[,!.\s]/i,
+    /^yes[,!.\s]/i,
+    /^absolutely[,!.\s]/i,
+    /^no problem[,!.\s]/i,
+    /^happy to[,!.\s]/i,
+    /^i('d| would) (love|be happy) to[,!.\s]/i,
+    /^here('s| is) (the )?(rephrased|rewritten)/i,
+  ];
+
+  const srcLower = src.toLowerCase();
+  for (const re of replyStarters) {
+    if (re.test(out) && !re.test(src)) return true;
+  }
+
+  // Answering a question the source asked (e.g. adding "which one?") when the
+  // source was itself a question — classic reply failure mode.
+  if (/\?\s*$/.test(src) && /\bwhich\b.+\?/i.test(out) && !/\bwhich\b/i.test(src)) {
+    return true;
+  }
+
+  // Output that starts by affirming then asks a new question the source didn't.
+  if (/^(hey[,!\s]+)?(sure|ok|okay|yeah)\b/i.test(out) && !/^(hey[,!\s]+)?(sure|ok|okay|yeah)\b/i.test(srcLower)) {
+    return true;
+  }
+
+  return false;
+}
+
 function buildRephraseSystemPrompt(platformId, intent) {
   if (platformId === 'own') {
     return buildOwnRephraseSystemPrompt(intent || '');
   }
   const spec = REPHRASE_PLATFORMS[platformId] || REPHRASE_PLATFORMS.casual;
   const lines = [
-    'You are an expert communication rephraser who adapts text to different platforms and tones.',
+    'You are an expert communication rephraser who adapts text to different platforms and tones. You write in Indian UK English.',
     '',
-    'ABSOLUTE RULE — REPHRASE, NEVER REINTERPRET:',
-    '- The user will give you a piece of text. Your job is to rephrase THAT EXACT TEXT in the specified tone/style.',
-    '- Do NOT analyze the intent behind the text. Do NOT summarize it. Do NOT rewrite it into something different.',
-    '- Keep the SAME message, meaning, and sentiment — only change HOW it is said (word choice, tone, style).',
-    '- If the user says something sarcastic, keep the sarcasm but adapt the delivery for the platform.',
-    '- If the user says something emotional or opinionated, keep that emotion — just restyle the words.',
-    '- Think of it like translating between tones: same content, different voice.',
+    REPHRASE_HARD_RULES,
     '',
     `PLATFORM/TONE: ${spec.label}`,
     spec.prompt,
@@ -147,10 +220,7 @@ function buildRephraseSystemPrompt(platformId, intent) {
       ? `IMPORTANT: Hard character limit of ${spec.charLimit} characters. Do NOT exceed it.`
       : '',
     '',
-    'OUTPUT RULES:',
-    '- Output ONLY the rephrased version of the user\'s text — nothing else.',
-    '- Do NOT wrap in quotes. Do NOT add explanations, commentary, or meta-text.',
-    '- Do NOT add phrases like "Here\'s the rephrased version" or "Sure!".',
+    REPHRASE_OUTPUT_RULES,
     '',
     'Return valid JSON only:',
     `{ "platform": "${platformId}", "rephrasedText": "your rephrased text here" }`,
@@ -162,26 +232,18 @@ function buildRephraseSystemPrompt(platformId, intent) {
 function buildOwnRephraseSystemPrompt(intent) {
   const hasIntent = intent && intent.trim().length > 0;
   const intentInstruction = hasIntent
-    ? `The user wants the text rephrased to: "${intent.trim()}". Follow this instruction precisely — adapt the tone, style, verbosity, and word choice to match what the user asked for.`
-    : 'The user wants a general rephrase for clarity, naturalness, and improved communication. Make it well-written, clear, and natural-sounding.';
+    ? `The user wants the text rephrased to: "${intent.trim()}". Follow this instruction precisely — adapt the tone, style, verbosity, and word choice to match what the user asked for. Still ONLY rephrase the source text; never reply to it.`
+    : 'The user wants a general rephrase for clarity, naturalness, and improved communication. Make it well-written, clear, and natural-sounding. Still ONLY rephrase the source text; never reply to it.';
 
   return [
-    'You are an expert communication rephraser who adapts text based on the user\'s specific instruction.',
+    'You are an expert communication rephraser who adapts text based on the user\'s specific instruction. You write in Indian UK English.',
     '',
-    'ABSOLUTE RULE — REPHRASE, NEVER REINTERPRET:',
-    '- The user will give you a piece of text. Your ONLY job is to rephrase it according to their instruction.',
-    '- Do NOT analyze the intent behind the text. Do NOT summarize it. Do NOT rewrite it into something different.',
-    '- Keep the SAME core message, meaning, and sentiment — only change HOW it is said.',
-    '- If the user says something sarcastic, keep the sarcasm but adapt the delivery per the instruction.',
-    '- If the user says something emotional, keep that emotion — just restyle per the instruction.',
+    REPHRASE_HARD_RULES,
     '',
     'USER INSTRUCTION:',
     intentInstruction,
     '',
-    'OUTPUT RULES:',
-    '- Output ONLY the rephrased version of the user\'s text — nothing else.',
-    '- Do NOT wrap in quotes. Do NOT add explanations, commentary, or meta-text.',
-    '- Do NOT add phrases like "Here\'s the rephrased version" or "Sure!".',
+    REPHRASE_OUTPUT_RULES,
     '',
     'Return valid JSON only:',
     '{ "platform": "own", "rephrasedText": "your rephrased text here" }',
@@ -877,6 +939,8 @@ function buildVisionExpertPrompt(opts = {}) {
 module.exports = {
   REPHRASE_PLATFORMS,
   buildRephraseSystemPrompt,
+  looksLikeReplyInsteadOfRephrase,
+  REPHRASE_RETRY_NUDGE,
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,
   buildSummarizerSystemPrompt,

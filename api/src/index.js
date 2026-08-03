@@ -12,6 +12,8 @@ const { z } = require('zod');
 const {
   REPHRASE_PLATFORMS,
   buildRephraseSystemPrompt,
+  looksLikeReplyInsteadOfRephrase,
+  REPHRASE_RETRY_NUDGE,
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,
   buildSummarizerSystemPrompt,
@@ -1771,29 +1773,50 @@ aiRouter.post('/rephrase', async (req, res, next) => {
 
     const platformId = normalizeRephrasePlatformId(val.data.platform) || 'casual';
     const intent = asString(val.data.intent || '').trim();
+    const sourceText = asString(val.data.text || '');
     const systemPrompt = buildRephraseSystemPrompt(platformId, intent);
     const pickedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
-    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${(val.data.text || '').length}, model=${pickedModel || '(default)'}`);
+    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${sourceText.length}, model=${pickedModel || '(default)'}`);
 
-    const result = await callLiteLLM({
+    const runOnce = (extraSystem) => callLiteLLM({
       model: pickedModel || undefined,
       messages: [
-        { role: 'system', content: systemPrompt },
-        { role: 'user', content: val.data.text },
+        { role: 'system', content: extraSystem ? `${systemPrompt}\n\n${extraSystem}` : systemPrompt },
+        { role: 'user', content: sourceText },
       ],
       maxTokens: 800,
-      temperature: 0.5,
+      // Lower temp → more faithful rewrites, fewer conversational replies.
+      temperature: 0.35,
     });
 
-    const parsed = parseJsonContent(result.content);
-    const rephrasedText = asString(
+    let result = await runOnce(null);
+    let parsed = parseJsonContent(result.content);
+    let rephrasedText = asString(
       parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
     );
+
+    // One-shot retry when the model answers instead of rephrasing.
+    if (rephrasedText && looksLikeReplyInsteadOfRephrase(sourceText, rephrasedText)) {
+      tg.w('AI/rephrase', `reply-shaped output detected — retrying once (platform=${platformId})`);
+      result = await runOnce(REPHRASE_RETRY_NUDGE);
+      parsed = parseJsonContent(result.content);
+      const retryText = asString(
+        parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
+      );
+      if (retryText && !looksLikeReplyInsteadOfRephrase(sourceText, retryText)) {
+        rephrasedText = retryText;
+      } else if (retryText && looksLikeReplyInsteadOfRephrase(sourceText, retryText)) {
+        tg.w('AI/rephrase', 'retry still reply-shaped — falling back to source text');
+        rephrasedText = sourceText;
+      } else {
+        rephrasedText = retryText || sourceText;
+      }
+    }
 
     tg.i('AI/rephrase', `✓ model=${result.model_used} ${Date.now() - _t0}ms, platform=${platformId}`);
     res.json({
       platform: platformId,
-      rephrasedText: rephrasedText || val.data.text,
+      rephrasedText: rephrasedText || sourceText,
       model: result.model_used,
       usage: result.usage,
     });
