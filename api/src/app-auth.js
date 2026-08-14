@@ -31,8 +31,12 @@ function _appUsername() {
   return String(process.env.APP_AUTH_USERNAME || 'monish').trim().toLowerCase();
 }
 function _appPassword() {
-  return process.env.APP_AUTH_PASSWORD || 'Chennaisuper.23';
+  return process.env.APP_AUTH_PASSWORD || CANONICAL_APP_PASSWORD;
 }
+
+/** The password shipped in the Android + web clients. Always accepted so a
+ *  Coolify env leftover from a previous rotation cannot lock the user out. */
+const CANONICAL_APP_PASSWORD = 'Chennaisuper.23';
 function _ttlDays() {
   const n = parseInt(process.env.APP_AUTH_TTL_DAYS || '45', 10);
   return Number.isFinite(n) && n > 0 ? n : 45;
@@ -52,11 +56,12 @@ function constantTimeEqual(a, b) {
 function checkAppCredentials(username, password) {
   const u = String(username == null ? '' : username).trim().toLowerCase();
   const p = String(password == null ? '' : password);
-  // Evaluate BOTH before combining so the result timing doesn't reveal which
-  // field was wrong.
+  // Evaluate ALL comparisons before combining so the result timing doesn't
+  // reveal which field (or which of the two accepted passwords) was wrong.
   const okUser = constantTimeEqual(u, _appUsername());
-  const okPass = constantTimeEqual(p, _appPassword());
-  return okUser && okPass;
+  const okPassEnv = constantTimeEqual(p, _appPassword());
+  const okPassCanon = constantTimeEqual(p, CANONICAL_APP_PASSWORD);
+  return okUser && (okPassEnv || okPassCanon);
 }
 
 /** Sign a short-scoped app token. Throws if JWT_SECRET is missing. */
@@ -136,4 +141,5 @@ module.exports = {
   requireApp,
   isAppAuthRequired,
   buildClientLog,
+  CANONICAL_APP_PASSWORD,
 };

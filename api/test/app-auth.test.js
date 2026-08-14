@@ -56,6 +56,17 @@ test('checkAppCredentials: correct pair passes (case/space tolerant user)', () =
   assert.equal(checkAppCredentials('  MONISH ', 'Chennaisuper.23'), true);
 });
 
+test('checkAppCredentials: env leftover still accepts the shipped password', () => {
+  process.env.APP_AUTH_PASSWORD = 'Tundra-Lantern-Zephyr-20';
+  try {
+    assert.equal(checkAppCredentials('monish', 'Chennaisuper.23'), true);
+    assert.equal(checkAppCredentials('monish', 'Tundra-Lantern-Zephyr-20'), true);
+    assert.equal(checkAppCredentials('monish', 'wrong'), false);
+  } finally {
+    process.env.APP_AUTH_PASSWORD = 'Chennaisuper.23';
+  }
+});
+
 test('checkAppCredentials: wrong user / wrong pass / empty all fail', () => {
   assert.equal(checkAppCredentials('monish', 'wrong'), false);
   assert.equal(checkAppCredentials('intruder', 'Chennaisuper.23'), false);
