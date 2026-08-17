@@ -1,7 +1,10 @@
 const { createHash } = require('crypto');
+const { execFile } = require('child_process');
+const { promisify } = require('util');
 const fs = require('fs');
 const path = require('path');
 const { tg } = require('./telegram');
+const execFileP = promisify(execFile);
 const {
   geminiComplete,
   isGeminiModel,
@@ -24,9 +27,27 @@ const {
   visibleTextLen,
 } = require('./news-extract');
 
-const CONFIG_PATH = fs.existsSync(path.resolve(__dirname, '../../news_rss_feeds.json'))
-  ? path.resolve(__dirname, '../../news_rss_feeds.json')
-  : path.resolve(__dirname, '../news_rss_feeds.json');
+// Prefer the copy that ships inside the API image (`api/news_rss_feeds.json`).
+// Coolify/compose builds whose context is `./api` never see the repo-root
+// file, which used to load `{ feeds: [] }` — X/Twitter still arrived via
+// x-feed-service, but every RSS/listing article (movies, Finshots, etc.) vanished.
+function resolveConfigPath() {
+  const candidates = [
+    process.env.NEWS_FEEDS_PATH,
+    path.resolve(__dirname, '../news_rss_feeds.json'),
+    path.resolve(__dirname, '../../news_rss_feeds.json'),
+    '/app/news_rss_feeds.json',
+  ].filter(Boolean);
+  for (const p of candidates) {
+    if (fs.existsSync(p)) return p;
+  }
+  return candidates[1] || path.resolve(__dirname, '../news_rss_feeds.json');
+}
+
+const CONFIG_PATH = resolveConfigPath();
+const RSS_FETCH_TIMEOUT_MS = 45_000;
+const RSS_UA = 'Nexus-AI-News/1.0';
+const FEED_BUDGET_MS = 120_000;
 
 const DEFAULT_SETTINGS = {
   refresh_interval_minutes: 30,
@@ -47,11 +68,29 @@ let lastSyncError = null;
 
 function loadConfig() {
   try {
-    return JSON.parse(fs.readFileSync(CONFIG_PATH, 'utf8'));
+    const raw = fs.readFileSync(CONFIG_PATH, 'utf8');
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed.feeds)) parsed.feeds = [];
+    return parsed;
   } catch (err) {
-    console.error('[NEWS] Failed to load RSS config:', err.message);
+    console.error(`[NEWS] Failed to load RSS config from ${CONFIG_PATH}:`, err.message);
+    tg.e('NEWS/config', `Failed to load ${CONFIG_PATH}: ${err.message}`);
     return { feeds: [], settings: DEFAULT_SETTINGS, summary_prompt: {} };
   }
+}
+
+function enabledFeeds(config) {
+  return (config.feeds || []).filter((f) => f.enabled !== false);
+}
+
+function feedPriority(feed) {
+  // Small / date-window feeds first so a hung 2 MB Substack download cannot
+  // starve Movies / Gizbot / AI News of the 3 concurrent slots.
+  if (feed.source_type === 'listing') return 0;
+  if (Number(feed.max_age_days) > 0) return 1;
+  const cat = String(feed.app_category || '');
+  if (cat === 'General' || cat === 'AI News') return 2;
+  return 3;
 }
 
 function getSettings(config) {
@@ -1074,34 +1113,68 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
 
 // ─── Per-source-type loaders ───────────────────────────────────────────
 
-async function _fetchRssItems(feed) {
-  let xml;
-  const maxFeedRetries = 2;
-  for (let attempt = 0; attempt <= maxFeedRetries; attempt++) {
-    const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), 20_000);
+async function _fetchRssXmlViaCurl(url, timeoutMs) {
+  const seconds = Math.max(5, Math.ceil(timeoutMs / 1000));
+  const { stdout } = await execFileP('curl', [
+    '-sSL',
+    '--compressed',
+    '--max-time', String(seconds),
+    '-A', RSS_UA,
+    '-H', 'Accept: application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+    url,
+  ], {
+    maxBuffer: 32 * 1024 * 1024,
+    windowsHide: true,
+    timeout: timeoutMs + 2000,
+  });
+  const xml = stdout || '';
+  if (!xml) throw new Error('curl returned empty RSS body');
+  return xml;
+}
+
+async function _fetchRssXml(feed) {
+  const headers = {
+    Accept: 'application/rss+xml, application/atom+xml, application/xml, text/xml;q=0.9, */*;q=0.8',
+    'User-Agent': RSS_UA,
+    'Accept-Encoding': 'gzip, deflate',
+  };
+  let lastErr;
+  for (let attempt = 0; attempt <= 1; attempt++) {
     try {
       const res = await fetch(feed.url, {
-        signal: controller.signal,
-        headers: { Accept: 'application/rss+xml, application/xml, text/xml;q=0.9, */*;q=0.8', 'User-Agent': 'Nexus-AI-News/1.0' },
+        headers,
+        signal: AbortSignal.timeout(RSS_FETCH_TIMEOUT_MS),
       });
       if (!res.ok) throw new Error(`Feed HTTP ${res.status}`);
-      xml = await res.text();
-      break;
+      const xml = await res.text();
+      if (!xml || xml.length < 20) throw new Error('Feed empty body');
+      return xml;
     } catch (fetchErr) {
-      clearTimeout(timeout);
-      if (attempt < maxFeedRetries) {
-        const delay = (attempt + 1) * 2000;
-        console.warn(`[NEWS] Feed ${feed.id} fetch failed (attempt ${attempt + 1}/${maxFeedRetries + 1}), retrying in ${delay}ms`);
-        await new Promise((r) => setTimeout(r, delay));
-        continue;
+      lastErr = fetchErr;
+      if (attempt === 0) {
+        console.warn(`[NEWS] Feed ${feed.id} fetch failed (attempt 1/2), retrying`);
+        await sleep(1500);
       }
-      throw fetchErr;
-    } finally {
-      clearTimeout(timeout);
     }
   }
-  return parseFeedItems(xml);
+  try {
+    tg.d('NEWS/feed', `${feed.id}: native fetch failed — trying curl fallback`);
+    return await _fetchRssXmlViaCurl(feed.url, RSS_FETCH_TIMEOUT_MS);
+  } catch (curlErr) {
+    throw lastErr || curlErr;
+  }
+}
+
+async function _fetchRssItems(feed) {
+  const xml = await _fetchRssXml(feed);
+  const items = parseFeedItems(xml);
+  if (items.length === 0) {
+    const head = String(xml).slice(0, 120).replace(/\s+/g, ' ');
+    tg.w('NEWS/feed', `${feed.id}: RSS parsed 0 items (${xml.length}ch) head="${head}"`);
+  } else {
+    tg.d('NEWS/feed', `${feed.id}: RSS ${items.length} item(s) ${xml.length}ch`);
+  }
+  return items;
 }
 
 /**
@@ -1211,7 +1284,10 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
 
     const config = loadConfig();
     const settings = getSettings(config);
-    const feeds = (config.feeds || []).filter((f) => f.enabled !== false);
+    const feeds = enabledFeeds(config).slice().sort((a, b) => feedPriority(a) - feedPriority(b));
+    if (feeds.length === 0) {
+      tg.e('NEWS/sync', `No RSS feeds loaded from ${CONFIG_PATH} — X-feed will still work, everything else will be empty`);
+    }
     const feedLimiter = createLimiter(settings.max_concurrent_feeds);
     const summaryLimiter = createLimiter(settings.max_concurrent_summaries);
     const counts = {};
@@ -1220,9 +1296,23 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
     await Promise.all(
       feeds.map((feed) =>
         feedLimiter(async () => {
-          const n = await processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel });
-          counts[feed.id] = n;
-          total += n;
+          let timer;
+          const budget = new Promise((resolve) => {
+            timer = setTimeout(() => {
+              tg.w('NEWS/feed', `${feed.id}: exceeded ${FEED_BUDGET_MS}ms budget — not blocking the rest of the sync`);
+              resolve(0);
+            }, FEED_BUDGET_MS);
+          });
+          try {
+            const n = await Promise.race([
+              processFeed({ pool, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }),
+              budget,
+            ]);
+            counts[feed.id] = n;
+            total += n;
+          } finally {
+            clearTimeout(timer);
+          }
         }),
       ),
     );
@@ -1300,17 +1390,32 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
 }
 
 function getSyncState() {
-  return { lastSyncAt, lastSyncResult, lastSyncError, inProgress: activeSyncPromise != null };
+  let feedsConfigured = 0;
+  try { feedsConfigured = enabledFeeds(loadConfig()).length; } catch { /* ignore */ }
+  return {
+    lastSyncAt,
+    lastSyncResult,
+    lastSyncError,
+    inProgress: activeSyncPromise != null,
+    feedsConfigured,
+    configPath: CONFIG_PATH,
+  };
 }
 
 function startScheduler(pool, { getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn } = {}) {
   if (schedulerHandle) return;
-  const settings = getSettings(loadConfig());
+  const config = loadConfig();
+  const settings = getSettings(config);
+  const feedCount = enabledFeeds(config).length;
   const intervalMinutes = Math.max(5, settings.refresh_interval_minutes);
   const intervalMs = intervalMinutes * 60 * 1000;
 
-  console.log(`[NEWS] Scheduler starting: interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
-  tg.i('NEWS/scheduler', `Starting: interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
+  console.log(`[NEWS] Scheduler starting: feeds=${feedCount} config=${CONFIG_PATH} interval=${intervalMinutes}min, concurrent_feeds=${settings.max_concurrent_feeds}, concurrent_summaries=${settings.max_concurrent_summaries}`);
+  if (feedCount === 0) {
+    tg.e('NEWS/scheduler', `Starting with 0 RSS feeds (config=${CONFIG_PATH}) — only X-feed articles will appear`);
+  } else {
+    tg.i('NEWS/scheduler', `Starting: ${feedCount} feeds from ${CONFIG_PATH}, interval=${intervalMinutes}min, feeds_concurrency=${settings.max_concurrent_feeds}, summary_concurrency=${settings.max_concurrent_summaries}`);
+  }
 
   syncNewsFeeds(pool, { reason: 'startup', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn }).catch((e) => {
     console.error('[NEWS] Initial sync failed:', e.message?.slice(0, 120));
@@ -1347,4 +1452,6 @@ module.exports = {
   appendSourceLink,
   looksPreformatted,
   collapseBlanksPreservingCode,
+  parseFeedItems,
+  resolveConfigPath,
 };

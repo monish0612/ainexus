@@ -2,7 +2,9 @@ version: "3.8"
 
 services:
   api:
-    build: ./api
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: ainexus-api
     restart: unless-stopped
     ports:

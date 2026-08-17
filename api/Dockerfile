@@ -21,6 +21,10 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 
 COPY . .
+# RSS/listing feed list MUST live in this folder (`news_rss_feeds.json`).
+# Coolify builds with context `./api` never see the repo-root copy, and an
+# empty feed list is exactly how X/Twitter still arrives while movies/news
+# stay blank.
 
 EXPOSE 3000
 

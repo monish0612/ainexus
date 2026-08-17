@@ -1029,10 +1029,12 @@ app.get('/health', async (_req, res) => {
   try {
     await pool.query('SELECT 1');
     const tableCheck = await verifyTablesExist();
+    const { getSyncState } = require('./news-service');
     res.json({
       status: tableCheck.ok ? 'ok' : 'degraded',
       database: 'connected',
       tables: tableCheck.ok ? 'all present' : `missing: ${tableCheck.missing.join(', ')}`,
+      news: getSyncState(),
       timestamp: new Date().toISOString(),
     });
   } catch (err) {
@@ -1706,10 +1708,6 @@ newsRouter.post('/force-resync', async (_req, res, next) => {
     await pool.query('DELETE FROM deleted_guids');
     const del = await pool.query('DELETE FROM news_articles WHERE saved = FALSE');
     const { syncNewsFeeds } = require('./news-service');
-    const feedsPath = require('fs').existsSync(require('path').resolve(__dirname, '../../news_rss_feeds.json'))
-      ? require('path').resolve(__dirname, '../../news_rss_feeds.json')
-      : require('path').resolve(__dirname, '../news_rss_feeds.json');
-    const config = JSON.parse(require('fs').readFileSync(feedsPath, 'utf8'));
     syncNewsFeeds(pool, {
       reason: 'force-resync',
       getProviderFn: _resolveNewsProvider,
