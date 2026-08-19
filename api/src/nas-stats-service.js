@@ -271,8 +271,12 @@ async function fetchSnapshot() {
   let body;
   try {
     body = await res.json();
-  } catch {
-    return { ok: false, reason: 'bad_payload' };
+  } catch (err) {
+    // AbortSignal.timeout() can fire after headers arrive, while the body is still
+    // being read. That is a timeout, not a malformed snapshot — treating it as
+    // bad_payload made a wedged tunnel look like a daemon bug.
+    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    return { ok: false, reason: timedOut ? 'timeout' : 'bad_payload' };
   }
   if (!body || typeof body !== 'object' || typeof body.at !== 'number') {
     return { ok: false, reason: 'bad_payload' };

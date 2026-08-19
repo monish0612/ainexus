@@ -94,6 +94,7 @@ function installFetch() {
       ok: r.status >= 200 && r.status < 300,
       status: r.status,
       json: async () => {
+        if (r.jsonThrow) throw r.jsonThrow;
         if (r.invalidJson) throw new SyntaxError('Unexpected token');
         return r.body;
       },
@@ -169,6 +170,22 @@ const failures = [
     name: 'a 500 from the daemon',
     script: () => ({ status: 500, body: {} }),
     reason: 'unreachable',
+  },
+  {
+    name: 'a timeout while reading the body',
+    script: () => ({
+      status: 200,
+      jsonThrow: Object.assign(new Error('The operation was aborted'), { name: 'AbortError' }),
+    }),
+    reason: 'timeout',
+  },
+  {
+    name: 'a TimeoutError while reading the body',
+    script: () => ({
+      status: 200,
+      jsonThrow: Object.assign(new Error('The operation was aborted due to timeout'), { name: 'TimeoutError' }),
+    }),
+    reason: 'timeout',
   },
   {
     name: 'a body that is not JSON',
