@@ -5895,6 +5895,129 @@ cloudRouter.post('/upload', (req, res, next) => {
 const { attachResumableRoutes } = require('./cloud-resumable');
 attachResumableRoutes(cloudRouter, { cloudService, ensureDrive, tg });
 
+// ═══════════════════════════════════════════════════════════════
+// Cloud > the *other* destination: the home NAS
+//
+// Same tab in the app, a completely different place to put a file. These mirror the Drive
+// routes above so the app can swap destination without a second code path, and they never
+// touch Drive — ensureDrive() is deliberately absent from every one of them, because a broken
+// Google service account must not take away the destination that does not use it.
+// ═══════════════════════════════════════════════════════════════
+
+const nasFiles = require('./nas-files-service');
+
+/** Fail a mutation in the NAS's own vocabulary rather than as a generic 500. */
+function nasFail(res, reason) {
+  return res
+    .status(nasFiles.httpStatusFor(reason))
+    .json({ error: nasFiles.explain(reason), reason });
+}
+
+// Whether the app may offer the NAS as a destination at all. Always 200: "no password is
+// configured" is a state the UI renders as a disabled option with an explanation, not an error
+// it should show as a failed request.
+cloudRouter.get('/nas/status', async (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(await nasFiles.status());
+});
+
+// Also always 200. An unreachable NAS makes the Files tab an explanatory empty state, which is
+// far more use than a red toast over a blank list.
+cloudRouter.get('/nas/files', async (_req, res) => {
+  const out = await nasFiles.list();
+  res.setHeader('Cache-Control', 'no-store');
+  res.json({
+    ok: out.ok,
+    reason: out.reason ?? null,
+    message: out.ok ? null : nasFiles.explain(out.reason),
+    files: out.files,
+  });
+});
+
+// Streamed straight through to Nextcloud: the bytes never accumulate in this container, so a
+// 2 GB file costs the same memory as a 2 KB one.
+cloudRouter.post('/nas/upload', (req, res, next) => {
+  if (!nasFiles.isConfigured()) return nasFail(res, 'not_configured');
+
+  let busboy;
+  try {
+    busboy = Busboy({ headers: req.headers, limits: { files: 1 } });
+  } catch {
+    return res.status(400).json({ error: 'Invalid upload request' });
+  }
+
+  let handled = false;
+  let uploadPromise = null;
+
+  busboy.on('file', (_name, fileStream, info) => {
+    handled = true;
+    const { filename, mimeType } = info;
+    // Content-Length is the whole multipart envelope, not the file, so it is not passed on as
+    // the file's size — a wrong Content-Length on the PUT would truncate the upload.
+    uploadPromise = nasFiles
+      .upload(filename || `upload-${Date.now()}`, fileStream, { contentType: mimeType })
+      .catch((err) => {
+        fileStream.resume();   // drain, or the request socket hangs
+        throw err;
+      });
+  });
+
+  busboy.on('close', async () => {
+    if (!handled || !uploadPromise) {
+      return res.status(400).json({ error: 'No file provided' });
+    }
+    try {
+      const out = await uploadPromise;
+      if (!out.ok) return nasFail(res, out.reason);
+      res.status(201).json({ file: { name: out.name } });
+    } catch (err) {
+      tg.e('Cloud/NAS', `upload to the NAS failed: ${err.message}`, err);
+      next(err);
+    }
+  });
+
+  busboy.on('error', (err) => {
+    tg.e('Cloud/NAS', `busboy error on a NAS upload: ${err.message}`, err);
+    next(err);
+  });
+
+  req.pipe(busboy);
+});
+
+cloudRouter.get('/nas/files/:name/download', async (req, res, next) => {
+  try {
+    const out = await nasFiles.download(req.params.name);
+    if (!out.ok) return nasFail(res, out.reason);
+
+    const len = out.res.headers.get('content-length');
+    if (len) res.setHeader('Content-Length', len);
+    res.setHeader(
+      'Content-Type',
+      out.res.headers.get('content-type') || 'application/octet-stream',
+    );
+    const disposition = req.query.inline === '1' ? 'inline' : 'attachment';
+    res.setHeader(
+      'Content-Disposition',
+      `${disposition}; filename*=UTF-8''${encodeURIComponent(req.params.name)}`,
+    );
+
+    const { Readable } = require('node:stream');
+    Readable.fromWeb(out.res.body).on('error', next).pipe(res);
+  } catch (err) {
+    next(err);
+  }
+});
+
+cloudRouter.delete('/nas/files/:name', async (req, res, next) => {
+  try {
+    const out = await nasFiles.remove(req.params.name);
+    if (!out.ok) return nasFail(res, out.reason);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
+});
+
 cloudRouter.get('/files/:id/download', async (req, res, next) => {
   if (!ensureDrive(res)) return;
   try {

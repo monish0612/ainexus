@@ -33,6 +33,25 @@ services:
       - NAS_SNAPSHOT_TOKEN=${NAS_SNAPSHOT_TOKEN:-}
       - NAS_SNAPSHOT_TIMEOUT_MS=${NAS_SNAPSHOT_TIMEOUT_MS:-4000}
       - NAS_SNAPSHOT_CACHE_TTL_MS=${NAS_SNAPSHOT_CACHE_TTL_MS:-1500}
+      # NAS file storage — the Cloud tab's second upload destination, landing in
+      # /mnt/Storage/Code/Cloud Storage via Nextcloud's WebDAV over the WireGuard tunnel.
+      #
+      # NAS_WEBDAV_PASSWORD must be a Nextcloud **app password**, never the account password:
+      # generate one at cloud.monishlabs.com > Settings > Security > "Create new app password".
+      # An app password can be revoked on its own and cannot sign in to the web UI.
+      #
+      # Left unset, every /api/v1/cloud/nas/* route reports "not configured" and the app hides
+      # the NAS option with an explanation. Nothing else is affected.
+      #
+      # NAS_WEBDAV_HOST is the Host header, not the address: the connection goes direct to
+      # 10.10.10.2 over the tunnel, but Nextcloud only trusts the public hostname.
+      - NAS_WEBDAV_URL=${NAS_WEBDAV_URL:-http://10.10.10.2:30027}
+      - NAS_WEBDAV_HOST=${NAS_WEBDAV_HOST:-cloud.monishlabs.com}
+      - NAS_WEBDAV_USER=${NAS_WEBDAV_USER:-monish}
+      - NAS_WEBDAV_PASSWORD=${NAS_WEBDAV_PASSWORD:-}
+      - NAS_WEBDAV_ROOT=${NAS_WEBDAV_ROOT:-Code/Cloud Storage}
+      - NAS_WEBDAV_TIMEOUT_MS=${NAS_WEBDAV_TIMEOUT_MS:-15000}
+      - NAS_WEBDAV_UPLOAD_TIMEOUT_MS=${NAS_WEBDAV_UPLOAD_TIMEOUT_MS:-1800000}
     depends_on:
       postgres:
         condition: service_healthy
