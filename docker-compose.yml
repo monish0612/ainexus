@@ -25,6 +25,14 @@ services:
       - XGROK_API_KEY=${XGROK_API_KEY}
       - XGROK_LITE_MODEL=${XGROK_LITE_MODEL:-grok-4-1-fast-non-reasoning}
       - XGROK_DEEP_MODEL=${XGROK_DEEP_MODEL:-grok-4-0709}
+      # Live NAS stats for the app's Cloud > Stats dashboard. The token is the bearer for
+      # nas-status.py and must match STATUS_TOKEN in /mnt/Storage/proxy/health/nas-status.env
+      # on the NAS. Left unset, GET /api/v1/cloud/stats still answers 200 and simply reports
+      # the NAS as off, so nothing breaks in an environment that has no tunnel to it.
+      - NAS_SNAPSHOT_URL=${NAS_SNAPSHOT_URL:-http://10.10.10.2:8788/v1/snapshot}
+      - NAS_SNAPSHOT_TOKEN=${NAS_SNAPSHOT_TOKEN:-}
+      - NAS_SNAPSHOT_TIMEOUT_MS=${NAS_SNAPSHOT_TIMEOUT_MS:-4000}
+      - NAS_SNAPSHOT_CACHE_TTL_MS=${NAS_SNAPSHOT_CACHE_TTL_MS:-1500}
     depends_on:
       postgres:
         condition: service_healthy

@@ -5769,6 +5769,7 @@ app.use('/api/v1/category-learnings', requireApp, learningsRouter);
 // ═══════════════════════════════════════════════════════════════
 
 const cloudService = require('./cloud-service');
+const nasStatsService = require('./nas-stats-service');
 const Busboy = require('busboy');
 
 const cloudRouter = express.Router();
@@ -5805,6 +5806,23 @@ cloudRouter.get('/quota', async (_req, res, next) => {
   } catch (err) {
     next(err);
   }
+});
+
+// Live NAS + VPS metrics for the app's Stats dashboard.
+//
+// No ensureDrive() here — this has nothing to do with Google Drive; it shares the /cloud
+// prefix only because that is the tab it appears under in the app.
+//
+// Always 200. "The NAS is off" is a normal state the dashboard draws as a dull screen of
+// zeros, and it has to be distinguishable from "the phone has no signal" — which it would not
+// be if an unreachable NAS produced a 502. The service never throws, so there is no catch that
+// could turn a switched-off NAS into an error.
+cloudRouter.get('/stats', async (_req, res) => {
+  const stats = await nasStatsService.getStats();
+  // The app polls this every 2s and the service already caches upstream; letting any hop
+  // cache it would show the owner a frozen dashboard and no way to tell.
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(stats);
 });
 
 // Token broker — hands a *trusted* (already requireApp-authenticated) client a
