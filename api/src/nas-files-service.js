@@ -38,6 +38,7 @@
 
 const { tg } = require('./telegram');
 const cheerio = require('cheerio');
+const crypto = require('crypto');
 
 const DEFAULTS = {
   url: 'http://10.10.10.2:30027',
@@ -49,7 +50,18 @@ const DEFAULTS = {
   // request, and killing it at the timeout used for a directory listing would make large files
   // simply impossible rather than slow.
   uploadTimeoutMs: 30 * 60 * 1000,
+  chunkTimeoutMs: 5 * 60 * 1000,
 };
+
+/** 8 MiB — same size Drive uses, a multiple of 256 KiB, and short enough that a dropped
+ *  chunk is cheap to retry. Nextcloud requires every chunk but the last to be the same size. */
+const CHUNK_SIZE = 8 * 1024 * 1024;
+
+/** Below this, a single PUT is fewer round-trips and just as reliable. */
+const SIMPLE_THRESHOLD = 5 * 1024 * 1024;
+
+/** Hard ceiling so a mis-tapped 400 GB disk image cannot fill the pool from a phone. */
+const MAX_UPLOAD_BYTES = 32 * 1024 * 1024 * 1024;
 
 function cfg() {
   return {
@@ -61,6 +73,8 @@ function cfg() {
     timeoutMs: Number(process.env.NAS_WEBDAV_TIMEOUT_MS) || DEFAULTS.timeoutMs,
     uploadTimeoutMs:
       Number(process.env.NAS_WEBDAV_UPLOAD_TIMEOUT_MS) || DEFAULTS.uploadTimeoutMs,
+    chunkTimeoutMs:
+      Number(process.env.NAS_WEBDAV_CHUNK_TIMEOUT_MS) || DEFAULTS.chunkTimeoutMs,
   };
 }
 
@@ -142,6 +156,29 @@ function urlFor(name) {
   const base = `${c.url}/remote.php/dav/files/${encodeURIComponent(c.user)}`;
   const root = encodePath(c.root);
   return name ? `${base}/${root}/${encodeURIComponent(name)}` : `${base}/${root}/`;
+}
+
+/**
+ * Nextcloud's chunked-upload collection. Separate from the files tree, so a half-sent
+ * film cannot appear in the Cloud Storage folder until MOVE commits it.
+ */
+function uploadsUrl(id, piece) {
+  const c = cfg();
+  const base = `${c.url}/remote.php/dav/uploads/${encodeURIComponent(c.user)}/${encodeURIComponent(id)}`;
+  return piece ? `${base}/${encodeURIComponent(piece)}` : base;
+}
+
+function chunkName(index) {
+  return String(index).padStart(5, '0');
+}
+
+/**
+ * Destination for the final MOVE. The public hostname, not 10.0.1.1: Nextcloud compares this
+ * against trusted_domains, and the tunnel address is not one of them.
+ */
+function destHeader(name) {
+  const c = cfg();
+  return `https://${c.host}/remote.php/dav/files/${encodeURIComponent(c.user)}/${encodePath(c.root)}/${encodeURIComponent(name)}`;
 }
 
 function authHeader() {
@@ -389,6 +426,87 @@ async function upload(name, stream, { size, contentType } = {}) {
   return { ok: true, name: clean };
 }
 
+/**
+ * Open a Nextcloud chunked-upload collection. The id is alphanumeric so it is safe in a
+ * WebDAV path; the phone never sees the NAS, only this id.
+ */
+async function createUploadCollection() {
+  if (!isConfigured()) return { ok: false, reason: 'not_configured' };
+  const id = crypto.randomUUID().replace(/-/g, '');
+  const r = await dav('MKCOL', uploadsUrl(id), { timeoutMs: cfg().timeoutMs });
+  if (r.ok || (r.reason === 'upstream' && r.status === 405)) {
+    return { ok: true, id };
+  }
+  noteHealth(false, r.reason);
+  return { ok: false, reason: r.reason };
+}
+
+/**
+ * One chunk. `index` is 1-based and becomes the padded name Nextcloud sorts on.
+ * Chunks other than the last must be exactly CHUNK_SIZE; the last may be shorter.
+ */
+async function putUploadChunk(id, index, body, { contentType } = {}) {
+  if (!isConfigured()) return { ok: false, reason: 'not_configured' };
+  if (!id || !/^[a-z0-9]+$/i.test(id)) return { ok: false, reason: 'bad_name' };
+  if (!Number.isInteger(index) || index < 1) return { ok: false, reason: 'bad_name' };
+
+  const headers = { 'Content-Type': contentType || 'application/octet-stream' };
+  if (body && typeof body.length === 'number') {
+    headers['Content-Length'] = String(body.length);
+  }
+
+  const r = await dav('PUT', uploadsUrl(id, chunkName(index)), {
+    body,
+    headers,
+    timeoutMs: cfg().chunkTimeoutMs,
+  });
+  if (!r.ok) {
+    noteHealth(false, r.reason);
+    return { ok: false, reason: r.reason };
+  }
+  noteHealth(true);
+  return { ok: true };
+}
+
+/**
+ * Commit the chunks into the Cloud Storage folder. Until this MOVE, the file is not there.
+ */
+async function assembleUpload(id, destName, size) {
+  if (!isConfigured()) return { ok: false, reason: 'not_configured' };
+  const clean = safeName(destName);
+  if (!clean) return { ok: false, reason: 'bad_name' };
+  if (!id || !/^[a-z0-9]+$/i.test(id)) return { ok: false, reason: 'bad_name' };
+
+  const ready = await ensureRoot();
+  if (!ready.ok) {
+    noteHealth(false, ready.reason);
+    return { ok: false, reason: ready.reason };
+  }
+
+  const r = await dav('MOVE', uploadsUrl(id, '.file'), {
+    headers: {
+      Destination: destHeader(clean),
+      Overwrite: 'T',
+      'OC-Total-Length': String(size),
+    },
+    timeoutMs: cfg().uploadTimeoutMs,
+  });
+  if (!r.ok) {
+    noteHealth(false, r.reason);
+    return { ok: false, reason: r.reason };
+  }
+  noteHealth(true);
+  return { ok: true, name: clean };
+}
+
+/** Drop an unfinished collection so a cancelled film does not sit in Nextcloud's uploads tree. */
+async function abortUpload(id) {
+  if (!id || !/^[a-z0-9]+$/i.test(id)) return { ok: true };
+  const r = await dav('DELETE', uploadsUrl(id), { timeoutMs: cfg().timeoutMs });
+  if (!r.ok && r.reason !== 'not_found') return { ok: false, reason: r.reason };
+  return { ok: true };
+}
+
 /** The response object, for the route to pipe straight through to the phone. */
 async function download(name) {
   const clean = safeName(name);
@@ -429,6 +547,8 @@ function explain(reason) {
       return 'That file is no longer on the NAS.';
     case 'bad_payload':
       return 'The NAS sent a reply this app could not read.';
+    case 'too_large':
+      return 'That file is larger than NAS uploads allow.';
     default:
       return 'The NAS could not complete that just now.';
   }
@@ -439,6 +559,7 @@ function httpStatusFor(reason) {
   switch (reason) {
     case 'bad_name': return 400;
     case 'not_found': return 404;
+    case 'too_large': return 413;
     case 'insufficient_storage': return 507;
     case 'locked': return 409;
     case 'not_configured':
@@ -459,10 +580,20 @@ module.exports = {
   isConfigured,
   explain,
   httpStatusFor,
+  createUploadCollection,
+  putUploadChunk,
+  assembleUpload,
+  abortUpload,
+  CHUNK_SIZE,
+  SIMPLE_THRESHOLD,
+  MAX_UPLOAD_BYTES,
   // Exported for the tests only.
   _resetForTests,
   safeName,
   parseListing,
   urlFor,
+  uploadsUrl,
+  destHeader,
+  chunkName,
   ensureRoot,
 };

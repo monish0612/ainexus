@@ -469,3 +469,74 @@ test('no message ever carries the app password', async () => {
   const all = JSON.stringify(sent);
   assert.ok(!all.includes('super-secret-app-pw'), 'a credential must never reach Telegram');
 });
+
+// ── chunked uploads ─────────────────────────────────────────────
+
+test('chunk names are equal-width so Nextcloud sorts them in order', () => {
+  assert.equal(svc.chunkName(1), '00001');
+  assert.equal(svc.chunkName(12), '00012');
+});
+
+test('the MOVE destination uses the trusted hostname, not the tunnel address', () => {
+  reset();
+  const dest = svc.destHeader('holiday photo.mkv');
+  assert.match(dest, /^https:\/\/cloud\.monishlabs\.com\//);
+  assert.ok(!dest.includes('10.10.10.2'), 'Nextcloud would reject the tunnel IP');
+  assert.match(dest, /Cloud%20Storage/);
+  assert.match(dest, /holiday%20photo\.mkv/);
+});
+
+test('a chunked upload is MKCOL, then padded PUTs, then MOVE .file', async () => {
+  reset();
+  script = (_url, opts) => {
+    if (opts.method === 'MKCOL') return { status: 201 };
+    if (opts.method === 'PUT') return { status: 201 };
+    if (opts.method === 'MOVE') return { status: 201 };
+    return { status: 404 };
+  };
+
+  const created = await svc.createUploadCollection();
+  assert.equal(created.ok, true);
+  assert.match(created.id, /^[a-z0-9]+$/i);
+
+  const a = await svc.putUploadChunk(created.id, 1, Buffer.alloc(8, 1));
+  const b = await svc.putUploadChunk(created.id, 2, Buffer.alloc(3, 2));
+  assert.equal(a.ok, true);
+  assert.equal(b.ok, true);
+
+  const done = await svc.assembleUpload(created.id, 'film.mkv', 11);
+  assert.equal(done.ok, true);
+  assert.equal(done.name, 'film.mkv');
+
+  const mkcol = calls.filter((c) => c.method === 'MKCOL');
+  assert.ok(mkcol.some((c) => /\/dav\/uploads\//.test(c.url)));
+
+  const puts = calls.filter((c) => c.method === 'PUT');
+  assert.equal(puts.length, 2);
+  assert.match(puts[0].url, /\/00001$/);
+  assert.match(puts[1].url, /\/00002$/);
+
+  const move = calls.find((c) => c.method === 'MOVE');
+  assert.ok(move);
+  assert.match(move.url, /\/\.file$/);
+  assert.equal(move.headers.Destination, svc.destHeader('film.mkv'));
+  assert.equal(move.headers.Overwrite, 'T');
+});
+
+test('a cancelled collection is deleted so it does not linger on the NAS', async () => {
+  reset();
+  script = (_url, opts) => (opts.method === 'DELETE' ? { status: 204 } : { status: 201 });
+  const created = await svc.createUploadCollection();
+  const out = await svc.abortUpload(created.id);
+  assert.equal(out.ok, true);
+  const del = calls.filter((c) => c.method === 'DELETE');
+  assert.equal(del.length, 1);
+  assert.match(del[0].url, new RegExp(`/${created.id}$`));
+});
+
+test('an already-gone collection is not an error on abort', async () => {
+  reset();
+  script = () => ({ status: 404 });
+  const out = await svc.abortUpload('abc123');
+  assert.equal(out.ok, true);
+});

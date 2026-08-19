@@ -145,8 +145,11 @@ const apiLimiter = rateLimit({
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
   // A single large file becomes many sequential chunk PUTs; exempt the
   // resumable-upload subtree so big uploads don't trip the per-minute cap.
-  skip: (req) =>
-    /\/api\/v1\/cloud\/upload\/resumable\//.test(req.originalUrl || req.url || ''),
+  skip: (req) => {
+    const u = req.originalUrl || req.url || '';
+    return /\/api\/v1\/cloud\/upload\/resumable\//.test(u)
+      || /\/api\/v1\/cloud\/nas\/upload\/resumable\//.test(u);
+  },
 });
 app.use('/api/', apiLimiter);
 
@@ -5905,6 +5908,7 @@ attachResumableRoutes(cloudRouter, { cloudService, ensureDrive, tg });
 // ═══════════════════════════════════════════════════════════════
 
 const nasFiles = require('./nas-files-service');
+const { attachNasResumableRoutes } = require('./nas-resumable');
 
 /** Fail a mutation in the NAS's own vocabulary rather than as a generic 500. */
 function nasFail(res, reason) {
@@ -6017,6 +6021,8 @@ cloudRouter.delete('/nas/files/:name', async (req, res, next) => {
     next(err);
   }
 });
+
+attachNasResumableRoutes(cloudRouter, { nasFiles, tg });
 
 cloudRouter.get('/files/:id/download', async (req, res, next) => {
   if (!ensureDrive(res)) return;
