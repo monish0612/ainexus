@@ -30,12 +30,13 @@ const fs = require('fs');
 const { tg } = require('./telegram');
 
 const DEFAULT_URL = 'http://10.10.10.2:8788/v1/snapshot';
+const statsHistory = require('./nas-stats-history');
 
-// Kept short on purpose. Its job is to collapse a burst — the app polling every 2s while a
-// pull-to-refresh lands on top of it — into one upstream call, not to serve stale data. The
-// NAS resamples every 2s, so a TTL longer than that would throw away freshness the daemon
-// already paid for.
-const DEFAULT_CACHE_TTL_MS = 1500;
+// Kept short on purpose. Its job is to collapse a burst — the app polling every 1s while a
+// detail-screen rebuild lands on top of it — into one upstream call, not to serve stale data.
+// The NAS live-samples every 1s, so a TTL longer than that would throw away freshness the
+// daemon already paid for.
+const DEFAULT_CACHE_TTL_MS = 800;
 const DEFAULT_TIMEOUT_MS = 4000;
 
 function cfg() {
@@ -67,6 +68,7 @@ function _resetForTests() {
   _wasOnline = null;
   _prevCpu = null;
   _lastBilling = null;
+  statsHistory._resetForTests();
 }
 
 // ── the VPS, measured here ───────────────────────────────────────────────────────
@@ -285,9 +287,65 @@ async function fetchSnapshot() {
 }
 
 /**
+ * Turn the snapshot URL into the sibling /v1/history route without inventing a second env var.
+ *
+ * Production points NAS_SNAPSHOT_URL at the host-network socat gateway
+ * (http://10.0.1.1:18788/v1/snapshot). History is the same host, same token, different path.
+ */
+function historyUrlFor(snapshotUrl, range) {
+  const u = new URL(snapshotUrl);
+  u.pathname = u.pathname.replace(/\/v1\/snapshot\/?$/, '/v1/history');
+  if (!/\/v1\/history\/?$/.test(u.pathname)) {
+    u.pathname = `${u.pathname.replace(/\/$/, '')}/v1/history`;
+  }
+  u.search = '';
+  u.searchParams.set('range', range);
+  return u.toString();
+}
+
+/**
+ * NAS 7D/30D series. Never throws: a missing history route on an older daemon is an empty
+ * chart, not a broken Stats screen. The live snapshot path is unchanged.
+ */
+async function fetchNasHistory(range) {
+  const { url, token, timeoutMs } = cfg();
+  if (!token) return { online: false, reason: 'not_configured', points: [] };
+  const allowed = range === 'now' || range === '7d' || range === '30d' ? range : 'now';
+
+  let res;
+  try {
+    res = await fetch(historyUrlFor(url, allowed), {
+      headers: { Authorization: `Bearer ${token}` },
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+  } catch (err) {
+    const timedOut = err && (err.name === 'TimeoutError' || err.name === 'AbortError');
+    return { online: false, reason: timedOut ? 'timeout' : 'unreachable', points: [] };
+  }
+
+  if (res.status === 401 || res.status === 403) return { online: false, reason: 'auth', points: [] };
+  if (res.status === 404) return { online: false, reason: 'not_configured', points: [] };
+  if (!res.ok) return { online: false, reason: 'unreachable', points: [] };
+
+  let body;
+  try {
+    body = await res.json();
+  } catch {
+    return { online: false, reason: 'bad_payload', points: [] };
+  }
+  const points = Array.isArray(body && body.points) ? body.points.slice(0, 400) : [];
+  return {
+    online: true,
+    reason: null,
+    step_s: typeof body.step_s === 'number' ? body.step_s : null,
+    points,
+  };
+}
+
+/**
  * Log only when online-ness changes.
  *
- * The app polls every 2 seconds. Logging each failure would put thirty messages a minute into
+ * The app polls every 1 second. Logging each failure would put sixty messages a minute into
  * Telegram for a NAS that is merely switched off, which is how the channel that also carries
  * "your VPS is suspended" gets muted. The first result after startup is not a transition.
  */
@@ -352,6 +410,7 @@ async function getStats() {
     try {
       const result = await fetchSnapshot();
       const env = envelope(result);
+      try { statsHistory.recordEnvelope(env); } catch { /* chart only */ }
       _cache.value = env;
       _cache.expiresAt = Date.now() + cfg().cacheTtlMs;
       return env;
@@ -370,6 +429,8 @@ async function getStats() {
 
 module.exports = {
   getStats,
+  fetchNasHistory,
+  historyUrlFor,
   // Exported for the tests only.
   _resetForTests,
   cpuPct,

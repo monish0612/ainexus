@@ -39,6 +39,7 @@ require.cache[tgPath].exports = {
 };
 
 const svc = require('../src/nas-stats-service');
+const hist = require('../src/nas-stats-history');
 
 // ── a representative snapshot, shaped like the real one ──────────
 function snapshot(over = {}) {
@@ -131,6 +132,17 @@ test('a reachable NAS produces online:true and passes the snapshot through', asy
   assert.equal(env.snapshot.memory.pressure, 'ok');
   assert.equal(env.last_seen_at, snap.at);
   assert.ok(env.age_s >= 0 && env.age_s < 5, `age_s should be tiny, got ${env.age_s}`);
+});
+
+test('getStats records a history sample without changing the envelope', async () => {
+  reset();
+  script = () => ({ status: 200, body: snapshot() });
+  const env = await svc.getStats();
+  assert.equal(env.online, true);
+  const now = await hist.getHistory('now');
+  assert.ok(now.vps.points.length >= 1, 'VPS live ring should move with /stats');
+  assert.ok(now.nas.points.length >= 1, 'NAS live ring should move with /stats');
+  assert.equal(now.nas.points[0].cpu, 12.5);
 });
 
 test('the bearer token is sent, and only in the Authorization header', async () => {

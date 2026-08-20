@@ -147,8 +147,14 @@ const apiLimiter = rateLimit({
   // resumable-upload subtree so big uploads don't trip the per-minute cap.
   skip: (req) => {
     const u = req.originalUrl || req.url || '';
-    return /\/api\/v1\/cloud\/upload\/resumable\//.test(u)
-      || /\/api\/v1\/cloud\/nas\/upload\/resumable\//.test(u);
+    if (/\/api\/v1\/cloud\/upload\/resumable\//.test(u)
+      || /\/api\/v1\/cloud\/nas\/upload\/resumable\//.test(u)) {
+      return true;
+    }
+    // 1 Hz live gauges share this process with news/files. A 120/min budget must
+    // not freeze the dashboard because something else was also open.
+    return req.method === 'GET'
+      && /\/api\/v1\/cloud\/stats(\/history)?(\?|$)/.test(u);
   },
 });
 app.use('/api/', apiLimiter);
@@ -5773,6 +5779,12 @@ app.use('/api/v1/category-learnings', requireApp, learningsRouter);
 
 const cloudService = require('./cloud-service');
 const nasStatsService = require('./nas-stats-service');
+const nasStatsHistory = require('./nas-stats-history');
+try {
+  nasStatsHistory.startVpsMinuteSampler(() => nasStatsService.vpsLive(null));
+} catch (err) {
+  tg.w('Cloud/stats', `VPS history sampler did not start: ${err.message}`);
+}
 const Busboy = require('busboy');
 
 const cloudRouter = express.Router();
@@ -5822,10 +5834,22 @@ cloudRouter.get('/quota', async (_req, res, next) => {
 // could turn a switched-off NAS into an error.
 cloudRouter.get('/stats', async (_req, res) => {
   const stats = await nasStatsService.getStats();
-  // The app polls this every 2s and the service already caches upstream; letting any hop
+  // The app polls this every 1s and the service already caches upstream; letting any hop
   // cache it would show the owner a frozen dashboard and no way to tell.
   res.setHeader('Cache-Control', 'no-store');
   res.json(stats);
+});
+
+// 7D / 30D series for the enlarged stat view. Always 200, same honesty contract as /stats:
+// an unreachable NAS is an empty NAS series, not a 502. "Now" is served from the in-memory
+// 1-second ring filled by /stats polls; the phone also keeps its own rolling window so this
+// is a fallback rather than a second poller.
+cloudRouter.get('/stats/history', async (req, res) => {
+  const range = String(req.query.range || 'now');
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(await nasStatsHistory.getHistory(range, {
+    fetchNas: (r) => nasStatsService.fetchNasHistory(r),
+  }));
 });
 
 // Token broker — hands a *trusted* (already requireApp-authenticated) client a
