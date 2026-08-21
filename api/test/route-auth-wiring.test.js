@@ -36,6 +36,7 @@ const PROTECTED = [
   'app-settings',
   'data-reset',
   'sync',
+  'profile',
 ];
 
 for (const name of PROTECTED) {
@@ -86,6 +87,11 @@ test('Drive backup routes live on the (requireApp-gated) cloud router', () => {
   assert.match(SRC, /pingBackup\('saved-search-delete'\)/);
   assert.match(SRC, /pingBackup\('news-nuke'\)/);
   assert.match(SRC, /onMutate: \(reason\) => pingBackup\(reason\)/);
+});
+
+test('full data-reset wipes the profile photo', () => {
+  assert.match(SRC, /wipeProfilePhoto\(pool\)/);
+  assert.match(SRC, /scope === 'full'/);
 });
 
 test('app-auth helpers are imported into index.js', () => {

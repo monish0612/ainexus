@@ -37,6 +37,7 @@ const TABLES = [
   { name: 'article_chat_summaries', pk: ['article_id'] },
   { name: 'user_preferences', pk: ['key'] },
   { name: 'app_settings', pk: ['key'] },
+  { name: 'profile_photo', pk: ['id'] },
 ];
 
 const TABLE_BY_NAME = Object.fromEntries(TABLES.map((t) => [t.name, t]));
@@ -54,6 +55,7 @@ function jsonSafe(value) {
   if (value == null) return value;
   if (value instanceof Date) return value.toISOString();
   if (typeof value === 'bigint') return value.toString();
+  if (Buffer.isBuffer(value)) return value.toString('base64');
   if (Array.isArray(value)) return value.map(jsonSafe);
   if (typeof value === 'object') {
     const out = {};
@@ -273,6 +275,13 @@ async function applySnapshot(pool, snapshot) {
         );
       }
     }
+    // Only prune when the snapshot actually carried this table — an older
+    // Drive file must not wipe a photo that was saved after that backup.
+    if (Array.isArray(original.profile_photo)) {
+      await _deleteNotIn(
+        client, 'profile_photo', 'id', [..._ids(clean.tables.profile_photo)],
+      );
+    }
 
     await client.query('COMMIT');
   } catch (err) {
@@ -326,7 +335,8 @@ function _countLine(counts) {
     `expenses=${counts.expenses || 0} ` +
     `savedArticles=${counts.news_articles || 0} ` +
     `savedWords=${counts.saved_words || 0} ` +
-    `savedSearches=${counts.saved_searches || 0}`
+    `savedSearches=${counts.saved_searches || 0} ` +
+    `profilePhoto=${counts.profile_photo || 0}`
   );
 }
 

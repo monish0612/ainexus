@@ -21,6 +21,10 @@ describe('Drive backup names', () => {
 });
 
 describe('snapshot helpers', () => {
+  test('TABLES includes the rolling profile photo', () => {
+    assert.ok(backup.TABLES.some((t) => t.name === 'profile_photo' && t.pk[0] === 'id'));
+  });
+
   test('jsonSafe turns Dates into ISO strings and leaves the rest', () => {
     const d = new Date('2026-08-21T05:00:00.000Z');
     assert.equal(backup.jsonSafe(d), '2026-08-21T05:00:00.000Z');
@@ -29,6 +33,7 @@ describe('snapshot helpers', () => {
       { n: 1, when: '2026-08-21T05:00:00.000Z', nested: { t: '2026-08-21T05:00:00.000Z' } },
     );
     assert.equal(backup.jsonSafe(null), null);
+    assert.equal(backup.jsonSafe(Buffer.from('hi')), Buffer.from('hi').toString('base64'));
   });
 
   test('isValidSnapshot rejects garbage and wrong kinds', () => {
@@ -76,6 +81,7 @@ describe('buildSnapshot', () => {
     assert.equal(snap.tables.news_articles.length, 1);
     assert.deepEqual(snap.tables.article_chat_messages.map((r) => r.id), ['m1']);
     assert.equal(snap.counts.expenses, 1);
+    assert.ok(Object.prototype.hasOwnProperty.call(snap.counts, 'profile_photo'));
     assert.ok(snap.createdAt);
   });
 });
@@ -613,6 +619,7 @@ describe('applySnapshot prune', () => {
     });
     assert.equal(log.some((q) => q.sql === 'DELETE FROM "saved_words"'), false);
     assert.equal(log.some((q) => q.sql.includes('UPDATE news_articles')), false);
+    assert.equal(log.some((q) => q.sql.includes('DELETE FROM "profile_photo"')), false);
   });
 
   test('empty saved_words array wipes the live table', async () => {
@@ -627,6 +634,20 @@ describe('applySnapshot prune', () => {
       tables: { saved_words: [] },
     });
     assert.ok(log.some((q) => q.sql === 'DELETE FROM "saved_words"'));
+  });
+
+  test('empty profile_photo array wipes the live photo; omitted key does not', async () => {
+    const log = [];
+    const client = {
+      async query(sql, params) { log.push({ sql, params }); return { rows: [] }; },
+      release() {},
+    };
+    await backup.applySnapshot({ connect: async () => client }, {
+      kind: backup.KIND,
+      schemaVersion: 1,
+      tables: { profile_photo: [] },
+    });
+    assert.ok(log.some((q) => q.sql === 'DELETE FROM "profile_photo"'));
   });
 
   test('skips rows with missing primary keys', async () => {

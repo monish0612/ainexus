@@ -84,6 +84,7 @@ const {
   isAppAuthRequired,
   buildClientLog,
 } = require('./app-auth');
+const { buildProfilePhotoRouter, wipeProfilePhoto } = require('./profile-photo');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -4596,6 +4597,10 @@ dataResetRouter.post('/', async (req, res, next) => {
     const scope = (req.body && req.body.scope) === 'expense' ? 'expense' : 'full';
     const fullDelta = scope === 'full' ? 1 : 0;
     const expenseDelta = scope === 'expense' ? 1 : 0;
+    if (scope === 'full') {
+      await wipeProfilePhoto(pool);
+      pingBackup('data-reset-full');
+    }
     const { rows } = await pool.query(
       `INSERT INTO data_reset (id, full_gen, expense_gen, reset_at)
        VALUES (1, $1, $2, NOW())
@@ -4906,6 +4911,14 @@ const savedWordsRouter = buildSavedWordsRouter(express, pool, {
 });
 
 app.use('/api/v1/saved-words', requireApp, savedWordsRouter);
+
+// ═══════════════════════════════════════════════════════════════
+//  PROFILE PHOTO — one JPEG for the app login, shared by phone + web
+// ═══════════════════════════════════════════════════════════════
+
+app.use('/api/v1/profile', requireApp, buildProfilePhotoRouter(express, pool, {
+  onMutate: (reason) => pingBackup(reason),
+}));
 
 // ═══════════════════════════════════════════════════════════════
 //  ARTICLE CHAT MESSAGES
@@ -6234,6 +6247,7 @@ const _REQUIRED_TABLES = [
   'saved_searches', 'saved_search_chat_messages',
   'saved_search_chat_summaries', 'deleted_saved_searches',
   'deleted_expenses', 'deleted_saved_words',
+  'profile_photo',
 ];
 
 async function _runSafe(label, fn) {
@@ -6514,6 +6528,16 @@ async function initTables() {
     CREATE TABLE IF NOT EXISTS user_preferences (
       key        TEXT PRIMARY KEY,
       value      TEXT NOT NULL,
+      updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+    )
+  `));
+
+  await _runSafe('profile_photo', () => pool.query(`
+    CREATE TABLE IF NOT EXISTS profile_photo (
+      id         TEXT PRIMARY KEY,
+      jpeg_b64   TEXT NOT NULL,
+      sha256     TEXT NOT NULL,
+      bytes      INT NOT NULL,
       updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
     )
   `));
