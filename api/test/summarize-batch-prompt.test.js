@@ -146,4 +146,16 @@ test('batch handler deep-extracts thin articles with guard rails', () => {
   assert.match(src, /deepExtractContent\(a\.url/);
   // Enriched text wins, client content is the fallback.
   assert.match(src, /enrichedContent\.get\(a\.id\) \|\| a\.content/);
+  // Movies on-demand: live Twitter/web audience research, then attach
+  // as audienceResearch so Finance/AI batches are untouched.
+  assert.match(src, /attachMovieAudienceResearch/);
+  assert.match(src, /audienceResearch: researched\.brief/);
+});
+
+test('movie summaries must use live audience research when present', () => {
+  assert.match(PROMPT, /audienceResearch/);
+  assert.match(PROMPT, /GENERAL AUDIENCES/);
+  assert.match(PROMPT, /Twitter\/X/);
+  assert.match(PROMPT, /NEVER invent a/);
+  assert.match(PROMPT, /Letterboxd/);
 });

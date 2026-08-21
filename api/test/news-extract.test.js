@@ -36,6 +36,8 @@ const {
   selectorsForUrl,
   htmlToRichMarkdown,
   visibleTextLen,
+  canonicalArticleUrl,
+  toiMovieAmpUrl,
 } = require('../src/news-extract');
 
 // ─── extractCleanArticle ───────────────────────────────────────────────
@@ -93,6 +95,58 @@ describe('extractCleanArticle', () => {
     assert.ok(r.date instanceof Date && !isNaN(r.date.getTime()));
     assert.ok(r.content.includes('Drishyam films'));
     assert.ok(r.content.includes('Georgekutty'));
+  });
+
+  test('onlykollywood.com selector strips related-post WordPress footer', () => {
+    const html = `
+      <html><head>
+        <meta property="og:title" content="DC Movie Review: An unfiltered action thriller that hits hard" />
+      </head><body>
+        <article>
+          <div class="entry-content">
+            <p>After Rocky, Saani Kaayidham and Captain Miller, director Arun Matheswaran returns with another intense action entertainer that never forgets its emotional core.</p>
+            <p>Lokesh Kanagaraj delivers a remarkable performance in his acting debut and looks completely comfortable in the role of Devadas during the action sequences.</p>
+            <h2>DC Movie Rating: 3.75/5</h2>
+            <p>The post DC Movie Review: An unfiltered action thriller that hits hard appeared first on Only Kollywood.</p>
+          </div>
+        </article>
+      </body></html>`;
+    const r = extractCleanArticle(html, 'https://www.onlykollywood.com/dc-movie-review/');
+    assert.ok(r.content.includes('Lokesh Kanagaraj'));
+    assert.ok(r.content.includes('DC Movie Rating'));
+    assert.ok(!r.content.includes('appeared first on'), r.content);
+  });
+
+  test('does not delete <body> when it has *share* in the class list', () => {
+    const html = `
+      <html><body class="has-mobile-share hide_share_post_top">
+        <article>
+          <div class="entry-content">
+            <p>${'Lokesh Kanagaraj delivers a remarkable performance in his acting debut. '.repeat(6)}</p>
+            <p>${'The second half continues the relentless chase between the police and the gang. '.repeat(4)}</p>
+          </div>
+        </article>
+      </body></html>`;
+    const r = extractCleanArticle(html, 'https://www.onlykollywood.com/dc-movie-review/');
+    assert.ok(r.content.includes('Lokesh Kanagaraj'), r.content);
+  });
+
+  test('TOI JSON-LD articleBody wins over a short synopsis block', () => {
+    const html = `<html><head>
+      <script type="application/ld+json">${JSON.stringify({
+        '@type': 'NewsArticle',
+        headline: 'Mutiny Movie Review',
+        articleBody: 'Story: Cole Reed is a former Royal Marine seeking revenge. Review: The film lies somewhere between The Expendables and John Wick. ' + 'Statham delivers the part convincingly. '.repeat(20),
+      })}</script>
+    </head><body>
+      <div class="Normal">Short synopsis only that is still over two hundred characters so the site selector would otherwise keep this teaser instead of the real critic copy from JSON-LD.</div>
+    </body></html>`;
+    const r = extractCleanArticle(
+      html,
+      'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/1.cms',
+    );
+    assert.ok(r.content.includes('Cole Reed'), r.content);
+    assert.ok(r.content.includes('Expendables'), r.content);
   });
 
   test('byline normalisation handles all common prefixes', () => {
@@ -359,6 +413,53 @@ describe('extractGizbotProsConsRating', () => {
     assert.deepEqual(extractGizbotProsConsRating(''), { rating: '', pros: [], cons: [] });
     assert.deepEqual(extractGizbotProsConsRating(null), { rating: '', pros: [], cons: [] });
   });
+
+  test('Only Kollywood heading "Movie Rating: 3.75/5"', () => {
+    const html = `<html><body>
+      <div class="entry-content">
+        <p>${'Lokesh Kanagaraj delivers a remarkable performance. '.repeat(8)}</p>
+        <h2 style="text-align: center;">DC Movie Rating: 3.75/5</h2>
+      </div>
+    </body></html>`;
+    const r = extractGizbotProsConsRating(html);
+    assert.equal(r.rating, '3.75');
+  });
+
+  test('prefers visible Movie Rating 3.75 over JSON-LD 3.799999…', () => {
+    const html = `<html><head>
+      <script type="application/ld+json">${JSON.stringify({
+        '@type': 'Review',
+        reviewRating: { ratingValue: 3.7999999999999998 },
+      })}</script>
+    </head><body>
+      <h2>DC Movie Rating: 3.75/5</h2>
+    </body></html>`;
+    const r = extractGizbotProsConsRating(html);
+    assert.equal(r.rating, '3.75');
+  });
+
+  test('TOI critic rating from label + score', () => {
+    const html = `<html><body>
+      <p>Critic&#x27;s Rating</p>
+      <p class="mRQ76">3.0 <span class="U6a0t"></span></p>
+      <p>The film does not break new ground and follows a familiar action-thriller formula.</p>
+    </body></html>`;
+    const r = extractGizbotProsConsRating(html);
+    assert.equal(r.rating, '3.0');
+  });
+
+  test('TOI JSON-LD Movie aggregateRating', () => {
+    const html = `<html><head>
+      <script type="application/ld+json">${JSON.stringify({
+        '@context': 'https://schema.org',
+        '@type': 'Movie',
+        name: 'Mutiny',
+        aggregateRating: { '@type': 'AggregateRating', ratingValue: '3.0', bestRating: '5' },
+      })}</script>
+    </head><body><p>Review body.</p></body></html>`;
+    const r = extractGizbotProsConsRating(html);
+    assert.equal(r.rating, '3.0');
+  });
 });
 
 // ─── scrapeListingPage ─────────────────────────────────────────────────
@@ -462,6 +563,39 @@ describe('scrapeListingPage', () => {
     });
     assert.equal(items.length, 1);
     assert.equal(items[0].title, 'iPhone 17 Pro Review');
+  });
+
+  test('TOI English listing keeps critic reviews and drops Hindi/AMP/nav', () => {
+    const html = `<html><body>
+      <article><a href="/entertainment/english/movie-reviews/mutiny/movie-review/133377432.cms"><h2>Mutiny</h2></a></article>
+      <article><a href="/entertainment/hindi/movie-reviews/jumper/movie-review/133246120.cms"><h2>Jumper</h2></a></article>
+      <article><a href="/entertainment/english/movie-reviews/mutiny/amp_movie_review/133377432.cms">Mutiny AMP</a></article>
+      <a href="https://timesofindia.indiatimes.com/entertainment/english/movie-reviews">English reviews home</a>
+      <article>
+        <h2>The Invite</h2>
+        <a href="/entertainment/english/movie-reviews/the-invite/movie-review/132258336.cms">Critic's Rating</a>
+      </article>
+    </body></html>`;
+    const items = scrapeListingPage(html, {
+      baseUrl: 'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews',
+      linkPattern: 'timesofindia\\.indiatimes\\.com/entertainment/english/movie-reviews/[^/?#]+/movie-review/\\d+\\.cms$',
+    });
+    assert.equal(items.length, 2);
+    assert.ok(items.every((i) => /\/english\/movie-reviews\/.+\/movie-review\/\d+\.cms$/.test(i.link)));
+    assert.deepEqual(items.map((i) => i.title).sort(), ['Mutiny', 'The Invite']);
+  });
+
+  test('canonicalises trailing-slash duplicates for Only Kollywood', () => {
+    const html = `<html><body>
+      <article><a href="https://www.onlykollywood.com/dc-movie-review/">DC Movie Review</a></article>
+      <article><a href="https://onlykollywood.com/dc-movie-review">DC Movie Review again</a></article>
+    </body></html>`;
+    const items = scrapeListingPage(html, {
+      baseUrl: 'https://www.onlykollywood.com/category/movie-reviews/',
+      linkPattern: 'onlykollywood\\.com/[a-z0-9-]+-(?:movie-)?review/?$',
+    });
+    assert.equal(items.length, 1);
+    assert.match(items[0].link, /dc-movie-review/);
   });
 });
 
@@ -633,6 +767,32 @@ describe('host helpers', () => {
     assert.ok(selectorsForUrl('https://www.gizbot.com/x').length > 0);
     assert.ok(selectorsForUrl('https://sudhir-srinivasan.com/x').length > 0,
         'sudhir-srinivasan.com must have tuned selectors');
+    assert.ok(selectorsForUrl('https://www.onlykollywood.com/dc-movie-review/').includes('div.entry-content'));
+    assert.ok(selectorsForUrl('https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/1.cms').length > 0);
     assert.equal(selectorsForUrl('https://random-blog.example/').length, 0);
+  });
+});
+
+describe('canonicalArticleUrl / toiMovieAmpUrl', () => {
+  test('strips www, query, hash, trailing slash', () => {
+    assert.equal(
+      canonicalArticleUrl('https://www.onlykollywood.com/dc-movie-review/?utm=x#comments'),
+      'https://onlykollywood.com/dc-movie-review',
+    );
+  });
+
+  test('keeps TOI .cms permalinks', () => {
+    assert.equal(
+      canonicalArticleUrl('https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/133377432.cms?from=home'),
+      'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/133377432.cms',
+    );
+  });
+
+  test('maps TOI review URL to AMP twin', () => {
+    assert.equal(
+      toiMovieAmpUrl('https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/133377432.cms'),
+      'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/amp_movie_review/133377432.cms',
+    );
+    assert.equal(toiMovieAmpUrl('https://www.onlykollywood.com/dc-movie-review/'), '');
   });
 });

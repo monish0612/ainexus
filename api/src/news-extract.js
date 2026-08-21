@@ -109,6 +109,25 @@ const SITE_SELECTORS = {
     'div.story-content',
     'article',
   ],
+  'onlykollywood.com': [
+    // WordPress — review body lives in entry-content. The live page also
+    // appends a related-posts rail that BOILERPLATE_SELECTORS strip.
+    'div.entry-content',
+    'div.td-post-content',
+    'article .entry-content',
+    'div.post-content',
+    'article',
+  ],
+  'timesofindia.indiatimes.com': [
+    // Desktop review pages are a Next.js shell; AMP (`amp_movie_review`)
+    // is the reliable full-body source. These selectors cover both.
+    '[itemprop="articleBody"]',
+    'div.Normal',
+    'div.article_content',
+    'article .Normal',
+    'div.story-content',
+    'article',
+  ],
 };
 
 const BOILERPLATE_SELECTORS = [
@@ -148,6 +167,49 @@ function hostOf(url) {
   } catch {
     return '';
   }
+}
+
+/**
+ * Stable article URL for listing dedup. Strips www, tracking query, hash,
+ * and a trailing slash so `…/dc-movie-review/` and `…/dc-movie-review`
+ * collapse to one key. `.cms` TOI permalinks are left intact.
+ */
+function canonicalArticleUrl(url) {
+  if (!url || typeof url !== 'string') return '';
+  try {
+    const u = new URL(url.trim());
+    u.hash = '';
+    u.search = '';
+    u.hostname = u.hostname.replace(/^www\./i, '').toLowerCase();
+    u.pathname = (u.pathname || '/').replace(/\/+$/, '') || '/';
+    return `${u.protocol}//${u.hostname}${u.pathname}`;
+  } catch {
+    return url.trim().replace(/\/+$/, '');
+  }
+}
+
+/**
+ * TOI desktop movie-review URLs hydrate almost no body. The AMP twin
+ * (`…/amp_movie_review/<id>.cms`) ships the full critic copy + rating.
+ */
+function toiMovieAmpUrl(url) {
+  try {
+    const u = new URL(url);
+    if (!u.hostname.toLowerCase().endsWith('timesofindia.indiatimes.com')) return '';
+    const m = u.pathname.match(/^(.*\/)movie-review\/(\d+)\.cms$/i);
+    if (!m) return '';
+    return `${u.origin}${m[1]}amp_movie_review/${m[2]}.cms`;
+  } catch {
+    return '';
+  }
+}
+
+function _stripBoilerplate($) {
+  $(BOILERPLATE_SELECTORS.join(',')).each((_, el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'html' || tag === 'body') return;
+    $(el).remove();
+  });
 }
 
 function selectorsForUrl(url) {
@@ -249,7 +311,11 @@ function _flattenMainBlock($, mainEl, baseUrl = '') {
   const out = [];
   const seenImg = new Set();
 
-  mainEl.find(BOILERPLATE_SELECTORS.join(',')).remove();
+  mainEl.find(BOILERPLATE_SELECTORS.join(',')).each((_, el) => {
+    const tag = String(el.tagName || '').toLowerCase();
+    if (tag === 'html' || tag === 'body') return;
+    $(el).remove();
+  });
   mainEl.find('br').replaceWith('\n');
 
   const pushImage = ($img) => {
@@ -404,9 +470,13 @@ function extractCleanArticle(html, url = '') {
 
   // ── Date (multiple signals; prefer JSON-LD > og: > <time>) ────────────
   const date = extractDateFromHtml(html, $);
+  const jsonLdBody = _jsonLdArticleBodyToMarkdown($);
 
   // Drop boilerplate before content selection so density math is accurate.
-  $(BOILERPLATE_SELECTORS.join(',')).remove();
+  // Skip <html>/<body> — Jannah/WordPress themes stamp `has-mobile-share`
+  // on <body>, which would otherwise match `[class*="share"]` and delete
+  // the entire document (Only Kollywood live pages).
+  _stripBoilerplate($);
 
   // ── Strategy 1: site-specific selectors ───────────────────────────────
   let content = '';
@@ -445,12 +515,19 @@ function extractCleanArticle(html, url = '') {
     content = bestText;
   }
 
+  if (visibleTextLen(jsonLdBody) > visibleTextLen(content)) {
+    content = jsonLdBody;
+  }
+
   if (content.length > MAX_BODY_CHARS) {
     // Trim at a paragraph boundary so we never cut a markdown image or
     // fenced-code block in half (which would render as broken syntax).
     const cut = content.lastIndexOf('\n\n', MAX_BODY_CHARS);
     content = content.slice(0, cut > MIN_BODY_CHARS ? cut : MAX_BODY_CHARS).trim();
   }
+
+  // WordPress RSS/body footer: "The post X appeared first on Only Kollywood."
+  content = content.replace(/\n*The post .+? appeared first on .+$/gim, '').trim();
 
   return {
     title: title.trim(),
@@ -552,16 +629,13 @@ function extractDateFromHtml(html, $maybe) {
 // ─── extractGizbotProsConsRating ───────────────────────────────────────
 
 /**
- * Pulls structured review metadata from a Gizbot review page.
+ * Pulls structured review metadata (rating + optional pros/cons).
+ *
+ * Originally Gizbot-specific; now also covers Only Kollywood
+ * (`<h2>DC Movie Rating: 3.75/5</h2>`) and TOI critic scores
+ * (`Critic's Rating: 3.0`, JSON-LD `ratingValue`).
  *
  * Returns: { rating: string, pros: string[], cons: string[] }
- *
- * Rating: a stringified score ("4.1", "4.1/5", or a verdict like "Good")
- * preferred in that order. Empty string when nothing convincing is found.
- *
- * Pros / Cons: emitted as plain strings, deduped, capped at 8 entries
- * each and 200 chars per entry — that's enough to render nicely in the
- * mobile detail modal without overwhelming the user.
  */
 function extractGizbotProsConsRating(html) {
   const out = { rating: '', pros: [], cons: [] };
@@ -574,48 +648,7 @@ function extractGizbotProsConsRating(html) {
     return out;
   }
 
-  // ── Rating ──────────────────────────────────────────────────────────
-  // Try structured signals first (review schema), then visible patterns.
-  const ldRating = (() => {
-    const nodes = $('script[type="application/ld+json"]').toArray();
-    for (const node of nodes) {
-      try {
-        const parsed = JSON.parse($(node).contents().text());
-        const stack = Array.isArray(parsed) ? [...parsed] : [parsed];
-        while (stack.length) {
-          const cur = stack.pop();
-          if (!cur || typeof cur !== 'object') continue;
-          const r = cur.reviewRating || cur.aggregateRating;
-          if (r && r.ratingValue != null) return String(r.ratingValue);
-          if (Array.isArray(cur['@graph'])) stack.push(...cur['@graph']);
-        }
-      } catch {
-        // ignore
-      }
-    }
-    return '';
-  })();
-
-  if (ldRating) {
-    out.rating = ldRating;
-  } else {
-    const text = $('body').text();
-    const patterns = [
-      /\bGizbot\s*Rating[:\s]*(\d+(?:\.\d+)?)/i,
-      /\bOverall\s*Rating[:\s]*(\d+(?:\.\d+)?)/i,
-      /\bRating[:\s]*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
-      /\bScore[:\s]*(\d+(?:\.\d+)?)/i,
-      /\b(\d+(?:\.\d+)?)\s*\/\s*5\b/, // generic "X/5" — last because noisy
-      /\bVerdict[:\s]*(Good|Average|Excellent|Poor|Mediocre|Recommended)\b/i,
-    ];
-    for (const rx of patterns) {
-      const m = text.match(rx);
-      if (m && m[1]) {
-        out.rating = m[1].trim();
-        break;
-      }
-    }
-  }
+  out.rating = _extractReviewRating($, html);
 
   // ── Strategy A: site-specific class names (Gizbot ships pros-box /
   //    cons-box divs with a nested <ul>). This is the highest-signal
@@ -729,6 +762,124 @@ function extractGizbotProsConsRating(html) {
   return out;
 }
 
+const extractReviewMeta = extractGizbotProsConsRating;
+
+function _walkJsonLd(node, visit, depth = 0) {
+  if (!node || depth > 12) return;
+  if (Array.isArray(node)) {
+    for (const item of node) _walkJsonLd(item, visit, depth + 1);
+    return;
+  }
+  if (typeof node !== 'object') return;
+  visit(node);
+  for (const value of Object.values(node)) {
+    if (value && typeof value === 'object') _walkJsonLd(value, visit, depth + 1);
+  }
+}
+
+function _jsonLdArticleBodyToMarkdown($) {
+  let best = '';
+  const nodes = $('script[type="application/ld+json"]').toArray();
+  for (const node of nodes) {
+    let parsed;
+    try {
+      parsed = JSON.parse($(node).contents().text());
+    } catch {
+      continue;
+    }
+    _walkJsonLd(parsed, (cur) => {
+      if (typeof cur.articleBody === 'string' && cur.articleBody.length > best.length) {
+        best = cur.articleBody;
+      }
+    });
+  }
+  if (!best) return '';
+  return best
+    .replace(/\r\n/g, '\n')
+    .replace(/\b(Story|Review|Synopsis|Verdict|Plus|Minus)\s*:/g, '\n\n## $1\n\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function _extractReviewRating($, html) {
+  const text = $('body').length ? $('body').text() : $.root().text();
+
+  // Visible critic scores beat JSON-LD: Only Kollywood publishes
+  // "DC Movie Rating: 3.75/5" while schema.org rounds that to 3.8.
+  const visible = [
+    /\bMovie Rating[:\s]*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
+    /\bCritics?\s*Rating[:\s]*(\d+(?:\.\d+)?)\s*(?:\/\s*5|\s*stars?)?/i,
+    /\bGizbot\s*Rating[:\s]*(\d+(?:\.\d+)?)/i,
+    /\bOverall\s*Rating[:\s]*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
+  ];
+  for (const rx of visible) {
+    const m = text.match(rx);
+    if (m && m[1]) return _tidyRating(m[1]);
+  }
+
+  let reviewRating = '';
+  let aggregateRating = '';
+  const nodes = $('script[type="application/ld+json"]').toArray();
+  for (const node of nodes) {
+    let parsed;
+    try {
+      parsed = JSON.parse($(node).contents().text());
+    } catch {
+      continue;
+    }
+    _walkJsonLd(parsed, (cur) => {
+      const types = []
+        .concat(cur['@type'] || [])
+        .map((t) => String(t).toLowerCase());
+      const r = cur.reviewRating || (types.includes('review') ? cur.aggregateRating : null);
+      if (r && r.ratingValue != null && !reviewRating) {
+        reviewRating = _tidyRating(r.ratingValue);
+      }
+      if (cur.aggregateRating && cur.aggregateRating.ratingValue != null && !aggregateRating) {
+        aggregateRating = _tidyRating(cur.aggregateRating.ratingValue);
+      }
+    });
+  }
+  if (reviewRating) return reviewRating;
+
+  const toiCritic = $('.mRQ76').first().text().replace(/\s+/g, ' ').trim();
+  const toiScore = toiCritic.match(/^(\d+(?:\.\d+)?)/);
+  if (toiScore) return _tidyRating(toiScore[1]);
+
+  const fallback = [
+    /\bRating[:\s]*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
+    /\bScore[:\s]*(\d+(?:\.\d+)?)\s*\/\s*5\b/i,
+    /\b(\d+(?:\.\d+)?)\s*\/\s*5\b/,
+    /\bVerdict[:\s]*(Good|Average|Excellent|Poor|Mediocre|Recommended)\b/i,
+  ];
+  for (const rx of fallback) {
+    const m = text.match(rx);
+    if (m && m[1]) return _tidyRating(m[1]);
+  }
+
+  if (aggregateRating) return aggregateRating;
+
+  const buried = html.match(/"ratingValue"\s*:\s*"?(\d+(?:\.\d+)?)/);
+  return buried ? _tidyRating(buried[1]) : '';
+}
+
+function _tidyRating(raw) {
+  const s = String(raw).trim();
+  const n = Number(s);
+  if (!Number.isFinite(n)) return s;
+  // JSON-LD sometimes emits 3.7999999999999998 for 3.8
+  if (/\.\d{3,}/.test(s)) return String(Math.round(n * 100) / 100);
+  return s;
+}
+
+function _isWeakListingTitle(title) {
+  const t = (title || '').replace(/\s+/g, ' ').trim();
+  if (t.length < 3) return true;
+  return /^(read more|more|watch|trailer|videos?|related|next|prev|home)$/i.test(t)
+    || /^(critic'?s?|user|audience)\s*rating\b/i.test(t)
+    || /^\d+(?:\.\d+)?\s*(?:\/\s*\d+)?(?:\s*stars?)?$/i.test(t);
+}
+
 // ─── Listing-page scraper (no-RSS feeds — Gizbot, etc.) ─────────────────
 
 /**
@@ -783,24 +934,39 @@ function _maybeAdd($, a, baseUrl, rx, seen, out, max) {
   } catch {
     return;
   }
+  // Never ingest the listing page itself, feeds, tags, or AMP twins of
+  // a review we already pick via the canonical permalink.
+  if (/\/(feed|amp_movie_review|tag|category|author)\b/i.test(abs)) return;
   if (!rx.test(abs)) return;
-  if (seen.has(abs)) return;
 
-  // Title: anchor text > nested heading > image alt
-  const title =
+  const canon = canonicalArticleUrl(abs);
+  if (!canon || seen.has(canon)) return;
+
+  // Title: anchor text > nested heading > closest card heading > image alt
+  let title =
     $(a).text().replace(/\s+/g, ' ').trim() ||
     $(a).find('h1, h2, h3, h4').first().text().replace(/\s+/g, ' ').trim() ||
     $(a).find('img').attr('alt') ||
     '';
+  if (_isWeakListingTitle(title)) {
+    const nearby = $(a)
+      .closest('article, .card, .post, .review-card, .listing-item, .story, li, div')
+      .find('h1, h2, h3, h4, [class*="title"]')
+      .first()
+      .text()
+      .replace(/\s+/g, ' ')
+      .trim();
+    if (nearby && !_isWeakListingTitle(nearby)) title = nearby;
+  }
 
-  // Skip ghost anchors. We do NOT call `seen.add(abs)` until after this
-  // check — otherwise a short ghost anchor on a URL that ALSO has a real
+  // Skip ghost anchors. We do NOT mark `seen` until after this check —
+  // otherwise a short ghost anchor on a URL that ALSO has a real
   // anchor elsewhere on the page would dedup out the real one.
-  if (title.length < 3) return;
+  if (_isWeakListingTitle(title)) return;
 
-  seen.add(abs);
+  seen.add(canon);
   const image = $(a).find('img').attr('src') || $(a).find('img').attr('data-src') || '';
-  out.push({ title, link: abs, image });
+  out.push({ title, link: abs.split('#')[0], image });
 }
 
 // ─── fetchHtml — retried GET with timeout + UA + logging ───────────────
@@ -947,34 +1113,55 @@ async function _fetchHtmlViaCurl(url, { timeoutMs, logTag }) {
  */
 async function cleanExtract(url, { logTag = 'NEWS/clean-extract', timeoutMs = 15_000, retries = 2 } = {}) {
   const t0 = Date.now();
+  const ampUrl = toiMovieAmpUrl(url);
+  const fetchUrls = ampUrl ? [ampUrl, url] : [url];
+
   let html = '';
-  try {
-    html = await fetchHtml(url, { timeoutMs, retries, logTag });
-  } catch (e) {
-    tg.w(logTag, `Fetch FAILED ${Date.now() - t0}ms ${url}: ${_shortErr(e)}`);
+  let usedUrl = fetchUrls[0];
+  for (const candidate of fetchUrls) {
+    try {
+      html = await fetchHtml(candidate, { timeoutMs, retries, logTag });
+      usedUrl = candidate;
+      const probe = extractCleanArticle(html, url);
+      if (visibleTextLen(probe.content) >= MIN_BODY_CHARS) {
+        const method = selectorsForUrl(url).length > 0 ? 'clean-site' : 'clean-generic';
+        tg.d(
+          logTag,
+          `${method} ${Date.now() - t0}ms ${probe.content.length}ch title="${(probe.title || '').slice(0, 50)}" ${usedUrl.slice(0, 80)}`,
+        );
+        return {
+          content: probe.content,
+          title: probe.title,
+          byline: probe.byline,
+          date: probe.date,
+          extractionMethod: method,
+          paywallSource: 'none',
+          rawHtml: html,
+        };
+      }
+    } catch (e) {
+      tg.w(logTag, `Fetch FAILED ${Date.now() - t0}ms ${candidate}: ${_shortErr(e)}`);
+      html = '';
+    }
+  }
+
+  if (!html) {
     return { content: '', title: '', byline: '', date: null, extractionMethod: 'fetch-failed', paywallSource: 'none' };
   }
 
   const r = extractCleanArticle(html, url);
-  const method = visibleTextLen(r.content) >= MIN_BODY_CHARS
-    ? selectorsForUrl(url).length > 0
-      ? 'clean-site'
-      : 'clean-generic'
-    : 'clean-empty';
-
   tg.d(
     logTag,
-    `${method} ${Date.now() - t0}ms ${r.content.length}ch title="${(r.title || '').slice(0, 50)}" ${url.slice(0, 80)}`,
+    `clean-empty ${Date.now() - t0}ms ${r.content.length}ch title="${(r.title || '').slice(0, 50)}" ${usedUrl.slice(0, 80)}`,
   );
-
   return {
     content: r.content,
     title: r.title,
     byline: r.byline,
     date: r.date,
-    extractionMethod: method,
+    extractionMethod: 'clean-empty',
     paywallSource: 'none',
-    rawHtml: html, // exposed so callers can run Gizbot pros/cons extraction
+    rawHtml: html,
   };
 }
 
@@ -1026,9 +1213,12 @@ module.exports = {
   extractCleanArticle,
   extractDateFromHtml,
   extractGizbotProsConsRating,
+  extractReviewMeta,
   buildReviewMetaMarkdown,
   htmlToRichMarkdown,
   visibleTextLen,
+  canonicalArticleUrl,
+  toiMovieAmpUrl,
   // Internals exposed for tests
   hostOf,
   selectorsForUrl,

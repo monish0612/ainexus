@@ -159,6 +159,36 @@
       "description": "Tamil/Indian film reviews by Sudhir Srinivasan — clean WordPress entry-content extraction; 30-day window because reviews are posted roughly 2–4 times per month"
     },
     {
+      "id": "onlykollywood_reviews",
+      "name": "Only Kollywood",
+      "url": "https://www.onlykollywood.com/category/movie-reviews/feed/",
+      "category": "movies",
+      "app_category": "Movies",
+      "enabled": true,
+      "skip_summary": true,
+      "extraction_strategy": "clean",
+      "extract_review_meta": true,
+      "listing_link_pattern": "https?://(?:www\\.)?onlykollywood\\.com/[a-z0-9-]+-(?:movie-)?review/?$",
+      "max_age_days": 21,
+      "description": "Tamil film reviews from Only Kollywood — WordPress RSS (not the listing page) + Movie Rating X/5 extraction. Link pattern drops news/related posts so the same film is never ingested twice from this source."
+    },
+    {
+      "id": "toi_english_reviews",
+      "name": "TOI English Reviews",
+      "url": "https://timesofindia.indiatimes.com/entertainment/english/movie-reviews",
+      "category": "movies",
+      "app_category": "Movies",
+      "enabled": true,
+      "skip_summary": true,
+      "source_type": "listing",
+      "extraction_strategy": "clean",
+      "extract_review_meta": true,
+      "listing_link_pattern": "https?://(?:www\\.)?timesofindia\\.indiatimes\\.com/entertainment/english/movie-reviews/[^/?#]+/movie-review/\\d+\\.cms$",
+      "max_listing_links": 25,
+      "max_age_days": 14,
+      "description": "Times of India English/Hollywood critic reviews — listing scrape (no dedicated RSS). Strict /english/movie-reviews/<slug>/movie-review/<id>.cms pattern so Hindi/Tamil cards on the same page and AMP twins are never duplicated. Body+rating come from the AMP twin."
+    },
+    {
       "id": "techcrunch_ai",
       "name": "TechCrunch — AI",
       "url": "https://techcrunch.com/category/artificial-intelligence/feed/",
@@ -193,6 +223,7 @@
       "listing_link_pattern": "https?://(?:www\\.)?gizbot\\.com/.*/reviews?/.*\\.html$",
       "max_listing_links": 25,
       "max_age_days": 12,
+      "extract_review_meta": true,
       "description": "Gizbot gadget reviews — listing-page scrape (no RSS) + structured rating/pros/cons extraction"
     }
   ],

@@ -45,6 +45,9 @@ const {
   resolveXGrokModel,
   getXGrokConfig,
 } = require('./xgrok');
+const {
+  attachMovieAudienceResearch,
+} = require('./movie-audience-research');
 const crypto = require('crypto');
 const {
   validateImagePayload: _validateImagePayloadShared,
@@ -2475,13 +2478,31 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
       }));
     }
 
-    const userPayload = articles.map((a) => ({
-      id: a.id,
-      title: a.title,
-      source: a.source || '',
-      category: a.category || '',
-      content: enrichedContent.get(a.id) || a.content,
-    }));
+    // Movies on-demand summarize: live audience pulse (Twitter/X + web
+    // ratings) so the brief covers THIS critic AND how general viewers
+    // received the film. Failures are skipped — critic copy still summarizes.
+    const audienceById = await attachMovieAudienceResearch(articles, {
+      xgrokSearch,
+      groundedSearch,
+      isXGrokAvailable,
+      timeoutMs: 45000,
+      max: 2,
+    });
+    if (audienceById.size > 0) {
+      tg.d('AI/summarize-batch', `Audience research ✓ ${audienceById.size} movie(s)`);
+    }
+
+    const userPayload = articles.map((a) => {
+      const researched = audienceById.get(a.id);
+      return {
+        id: a.id,
+        title: a.title,
+        source: a.source || '',
+        category: a.category || '',
+        content: enrichedContent.get(a.id) || a.content,
+        ...(researched ? { audienceResearch: researched.brief } : {}),
+      };
+    });
 
     const messages = [
       { role: 'system', content: buildBatchArticleSummaryPrompt() },

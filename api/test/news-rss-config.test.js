@@ -8,6 +8,9 @@ const path = require('path');
 const {
   parseFeedItems,
   resolveConfigPath,
+  filterItemsByLinkPattern,
+  dedupeFeedItems,
+  movieTitleKey,
 } = require('../src/news-service');
 
 test('API image ships news_rss_feeds.json next to the service', () => {
@@ -16,7 +19,7 @@ test('API image ships news_rss_feeds.json next to the service', () => {
   const cfg = JSON.parse(fs.readFileSync(apiCopy, 'utf8'));
   assert.ok(Array.isArray(cfg.feeds) && cfg.feeds.length >= 10, 'expected the RSS/listing feed list');
   const ids = new Set(cfg.feeds.map((f) => f.id));
-  for (const id of ['finshots', 'lensmen_reviews', 'sudhir_film_reviews', 'gizbot_reviews', 'techcrunch_ai']) {
+  for (const id of ['finshots', 'lensmen_reviews', 'sudhir_film_reviews', 'gizbot_reviews', 'techcrunch_ai', 'onlykollywood_reviews', 'toi_english_reviews']) {
     assert.ok(ids.has(id), `expected feed ${id}`);
   }
   assert.ok(cfg.feeds.every((f) => f.enabled !== false), 'all listed feeds should be enabled');
@@ -78,4 +81,49 @@ test('parseFeedItems falls back to Atom <entry> when there are no <item>s', () =
   assert.equal(items.length, 1);
   assert.equal(items[0].title, 'Atom story');
   assert.ok(items[0].link.includes('example.com/atom'));
+});
+
+test('Only Kollywood + TOI Movies feeds are listing/RSS-safe', () => {
+  const apiCopy = path.resolve(__dirname, '../news_rss_feeds.json');
+  const cfg = JSON.parse(fs.readFileSync(apiCopy, 'utf8'));
+  const byId = Object.fromEntries(cfg.feeds.map((f) => [f.id, f]));
+
+  const ok = byId.onlykollywood_reviews;
+  assert.equal(ok.app_category, 'Movies');
+  assert.equal(ok.skip_summary, true);
+  assert.equal(ok.extract_review_meta, true);
+  assert.ok(ok.url.endsWith('/category/movie-reviews/feed/'));
+  assert.ok(!ok.source_type, 'Only Kollywood must use RSS, not a listing scrape of one article');
+  assert.match(ok.listing_link_pattern, /onlykollywood/);
+
+  const toi = byId.toi_english_reviews;
+  assert.equal(toi.app_category, 'Movies');
+  assert.equal(toi.source_type, 'listing');
+  assert.equal(toi.extract_review_meta, true);
+  assert.equal(toi.url, 'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews');
+  assert.match(toi.listing_link_pattern, /english\/movie-reviews/);
+  assert.doesNotMatch(toi.listing_link_pattern, /hindi/);
+});
+
+test('filterItemsByLinkPattern drops news URLs from the OK reviews feed', () => {
+  const pattern = 'https?://(?:www\\.)?onlykollywood\\.com/[a-z0-9-]+-(?:movie-)?review/?$';
+  const items = [
+    { title: 'DC Movie Review', link: 'https://www.onlykollywood.com/dc-movie-review/' },
+    { title: 'Box office news', link: 'https://www.onlykollywood.com/dc-box-office-day-14/' },
+    { title: 'Cuckoo', link: 'https://www.onlykollywood.com/cuckoo-review/' },
+  ];
+  const out = filterItemsByLinkPattern(items, pattern);
+  assert.deepEqual(out.map((i) => i.title), ['DC Movie Review', 'Cuckoo']);
+});
+
+test('dedupeFeedItems collapses same film twice in one Movies batch', () => {
+  const items = [
+    { title: 'DC Movie Review: An unfiltered action thriller that hits hard', link: 'https://www.onlykollywood.com/dc-movie-review/' },
+    { title: 'DC Movie Review', link: 'https://www.onlykollywood.com/dc-movie-review/?share=1' },
+    { title: 'GDN Movie Review: A heartfelt tribute', link: 'https://www.onlykollywood.com/gdn-movie-review/' },
+  ];
+  const out = dedupeFeedItems(items, { byTitle: true });
+  assert.equal(out.length, 2);
+  assert.equal(movieTitleKey(items[0].title), 'dc');
+  assert.equal(movieTitleKey(items[1].title), 'dc');
 });

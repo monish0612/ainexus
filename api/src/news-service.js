@@ -25,6 +25,7 @@ const {
   extractDateFromHtml,
   htmlToRichMarkdown,
   visibleTextLen,
+  canonicalArticleUrl,
 } = require('./news-extract');
 
 // Prefer the copy that ships inside the API image (`api/news_rss_feeds.json`).
@@ -249,6 +250,43 @@ function parseFeedItems(xml) {
       return { title, link, guid, pubRaw, html, text: cleanHtml(html), image: extractImage(b, html, link) };
     })
     .filter((i) => i.guid && (i.link || i.title));
+}
+
+function filterItemsByLinkPattern(items, pattern) {
+  if (!pattern || !Array.isArray(items)) return items || [];
+  let rx;
+  try {
+    rx = new RegExp(pattern, 'i');
+  } catch {
+    return items;
+  }
+  return items.filter((i) => rx.test(i.link || ''));
+}
+
+function movieTitleKey(title) {
+  return String(title || '')
+    .toLowerCase()
+    .replace(/['’]/g, '')
+    .replace(/\bmovie reviews?\b.*$/i, '')
+    .replace(/\breviews?\b.*$/i, '')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function dedupeFeedItems(items, { byTitle = false } = {}) {
+  const byUrl = new Set();
+  const titles = new Set();
+  const out = [];
+  for (const item of items || []) {
+    const urlKey = canonicalArticleUrl(item.link) || String(item.link || '').toLowerCase();
+    if (urlKey && byUrl.has(urlKey)) continue;
+    const titleKey = byTitle ? movieTitleKey(item.title) : '';
+    if (titleKey && titleKey.length >= 2 && titles.has(titleKey)) continue;
+    if (urlKey) byUrl.add(urlKey);
+    if (titleKey) titles.add(titleKey);
+    out.push(item);
+  }
+  return out;
 }
 
 function parseDate(v) {
@@ -796,6 +834,18 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   const deleted = await pool.query('SELECT guid FROM deleted_guids WHERE guid = $1', [item.guid]);
   if (deleted.rows.length > 0) return false;
 
+  // Same review, different guid (RSS ?p= vs permalink, www vs bare host).
+  if (item.link) {
+    const canon = canonicalArticleUrl(item.link);
+    const urlDup = await pool.query(
+      `SELECT id FROM news_articles
+        WHERE original_url = $1 OR original_url = $2 OR original_url = $3
+        LIMIT 1`,
+      [item.link, canon, canon ? `${canon}/` : ''],
+    );
+    if (urlDup.rows.length > 0) return false;
+  }
+
   const title = item.title || 'Untitled';
   let pubDate = parseDate(item.pubRaw);
   const hadRssPubDate = !!item.pubRaw;
@@ -858,22 +908,25 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
         );
       }
 
-      // Gizbot-only: parse the raw HTML for rating + pros + cons. We do
-      // this even when the main-content fetch was short, because the
-      // structured fields can survive odd page templates that defeat the
-      // generic extractor.
-      if (feed.id === 'gizbot_reviews' && extracted.rawHtml) {
-        try {
-          const meta = extractGizbotProsConsRating(extracted.rawHtml);
-          if (meta && (meta.rating || meta.pros.length || meta.cons.length)) {
-            reviewMeta = meta;
-            tg.d(
-              _logTag,
-              `Review meta: rating="${meta.rating || '-'}" pros=${meta.pros.length} cons=${meta.cons.length}`,
-            );
+      // Structured review meta (Gizbot gadgets, Only Kollywood, TOI films).
+      // Runs even when the main-content fetch was short, because rating
+      // widgets often live outside the article body selector.
+      const wantReviewMeta = feed.extract_review_meta === true || feed.id === 'gizbot_reviews';
+      if (wantReviewMeta) {
+        const htmlForMeta = extracted.rawHtml || item.html || '';
+        if (htmlForMeta) {
+          try {
+            const meta = extractGizbotProsConsRating(htmlForMeta);
+            if (meta && (meta.rating || meta.pros.length || meta.cons.length)) {
+              reviewMeta = meta;
+              tg.d(
+                _logTag,
+                `Review meta: rating="${meta.rating || '-'}" pros=${meta.pros.length} cons=${meta.cons.length}`,
+              );
+            }
+          } catch (rmErr) {
+            tg.w(_logTag, `Review meta extraction failed: ${rmErr.message?.slice(0, 80)}`);
           }
-        } catch (rmErr) {
-          tg.w(_logTag, `Review meta extraction failed: ${rmErr.message?.slice(0, 80)}`);
         }
       }
     } catch (ceErr) {
@@ -896,6 +949,17 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
       }
     } catch (deepErr) {
       tg.w(_logTag, `Deep extract FAILED ${Date.now() - _dt0}ms "${title.slice(0, 40)}": ${deepErr.message?.slice(0, 80)} — using RSS content`);
+    }
+  }
+
+  if (!reviewMeta && (feed.extract_review_meta === true || feed.id === 'gizbot_reviews') && item.html) {
+    try {
+      const meta = extractGizbotProsConsRating(item.html);
+      if (meta && (meta.rating || meta.pros.length || meta.cons.length)) {
+        reviewMeta = meta;
+      }
+    } catch {
+      // RSS fragment parse is best-effort.
     }
   }
 
@@ -1052,6 +1116,14 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
       allItems = await _fetchRssItems(feed);
     }
 
+    allItems = filterItemsByLinkPattern(
+      allItems,
+      feed.listing_link_pattern || feed.item_link_pattern,
+    );
+    allItems = dedupeFeedItems(allItems, {
+      byTitle: feed.app_category === 'Movies',
+    });
+
     // Date filter strategy:
     //   • Strict "today only" for the legacy RSS feeds we trust pubDate on
     //   • Defer to processItem for feeds with `max_age_days` (Lensmen/Gizbot
@@ -1207,15 +1279,18 @@ async function _fetchListingItems(feed) {
     max: Math.max(20, (feed.max_listing_links || 20)),
   });
 
-  const items = rawItems.map((raw) => ({
-    title: raw.title || 'Untitled',
-    link: raw.link,
-    guid: stableGuid('', raw.link, raw.title),
-    pubRaw: '', // resolved during clean extraction
-    html: '',
-    text: '',
-    image: raw.image || '',
-  }));
+  const items = rawItems.map((raw) => {
+    const link = canonicalArticleUrl(raw.link) || raw.link;
+    return {
+      title: raw.title || 'Untitled',
+      link: raw.link,
+      guid: stableGuid(link, raw.link, raw.title),
+      pubRaw: '', // resolved during clean extraction
+      html: '',
+      text: '',
+      image: raw.image || '',
+    };
+  });
 
   tg.d(logTag, `Listing scrape ✓ ${Date.now() - t0}ms ${items.length} link(s) found`);
   return items;
@@ -1454,4 +1529,8 @@ module.exports = {
   collapseBlanksPreservingCode,
   parseFeedItems,
   resolveConfigPath,
+  filterItemsByLinkPattern,
+  dedupeFeedItems,
+  movieTitleKey,
+  canonicalArticleUrl,
 };
