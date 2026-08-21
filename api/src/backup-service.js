@@ -442,7 +442,13 @@ async function restoreFromDrive(pool, { drive = cloudService, sleeper } = {}) {
   if (!found || !found.file) {
     throw new Error('No nexus-backup.json found in AI Nexus Backups');
   }
-  const stream = await withDriveRetry(() => drive.downloadStream(found.file.id), { sleeper });
+  const downloaded = await withDriveRetry(() => drive.downloadStream(found.file.id), { sleeper });
+  const stream = downloaded && typeof downloaded.on === 'function'
+    ? downloaded
+    : downloaded && downloaded.data;
+  if (!stream || typeof stream.on !== 'function') {
+    throw new Error('Backup download did not return a stream');
+  }
   const chunks = [];
   await new Promise((resolve, reject) => {
     stream.on('data', (c) => chunks.push(c));

@@ -188,6 +188,31 @@ describe('restoreFromDrive', () => {
     assert.ok(log.some((q) => q.sql.includes('INSERT INTO "expenses"')));
   });
 
+  test('unwraps googleapis { data: stream } download responses', async () => {
+    const snapshot = {
+      kind: backup.KIND,
+      schemaVersion: 1,
+      tables: { expenses: [{ id: 'e4', amount: 3 }] },
+    };
+    const log = [];
+    const client = {
+      async query(sql) { log.push(sql); return { rows: [] }; },
+      release() {},
+    };
+    const drive = {
+      isDriveAvailable: () => true,
+      async findBackupFile() {
+        return { folder: { id: 'f' }, file: { id: 'file-1', name: 'nexus-backup.json' } };
+      },
+      async downloadStream() {
+        return { data: Readable.from([Buffer.from(JSON.stringify(snapshot), 'utf8')]) };
+      },
+    };
+    const out = await backup.restoreFromDrive({ connect: async () => client }, { drive });
+    assert.equal(out.success, true);
+    assert.ok(log.some((sql) => sql.includes('INSERT INTO "expenses"')));
+  });
+
   test('rejects invalid JSON without applying', async () => {
     const drive = {
       isDriveAvailable: () => true,
