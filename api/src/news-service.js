@@ -28,6 +28,7 @@ const {
   canonicalArticleUrl,
   hackernoonTechbeatDigestCandidates,
   isHackernoonStoryPermalink,
+  hostOf,
 } = require('./news-extract');
 
 // Prefer the copy that ships inside the API image (`api/news_rss_feeds.json`).
@@ -297,6 +298,14 @@ function feedArticleCap(feed, settings) {
   const n = Number(feed?.max_articles);
   if (Number.isFinite(n) && n > 0) return Math.max(1, Math.floor(n));
   return Math.max(1, Number(settings?.max_articles_per_feed) || 3);
+}
+
+function isThinFeedTitle(title) {
+  const t = String(title || '').replace(/\s+/g, ' ').trim();
+  if (!t || t === 'Untitled' || t.length < 8) return true;
+  if (t.startsWith('/') || /^https?:\/\//i.test(t)) return true;
+  if (/feature image$/i.test(t)) return true;
+  return false;
 }
 
 function movieTitleKey(title) {
@@ -1035,8 +1044,14 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     }
   }
 
-  // Use the extracted page title if RSS / listing title was thin.
-  const finalTitle = (title === 'Untitled' || title.length < 8) && extractedTitle ? extractedTitle : title;
+  // Use the extracted page title if RSS / listing title was thin, or for
+  // HackerNoon where listing cards often ship "/slug feature image".
+  const pageTitle = (extractedTitle || '').replace(/\s*\|\s*HackerNoon\s*$/i, '').trim();
+  const thinTitle = isThinFeedTitle(title);
+  const finalTitle =
+    pageTitle.length >= 12 && (thinTitle || hostOf(item.link) === 'hackernoon.com')
+      ? pageTitle
+      : title;
 
   const t0 = Date.now();
   const skipSummary = feed.skip_summary === true;
@@ -1621,6 +1636,7 @@ module.exports = {
   filterItemsByLinkPattern,
   filterDroppedFeedItems,
   feedArticleCap,
+  isThinFeedTitle,
   dedupeFeedItems,
   movieTitleKey,
   canonicalArticleUrl,

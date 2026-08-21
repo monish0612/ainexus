@@ -24,6 +24,7 @@ const {
   isHackernoonStoryPermalink,
   preferStructuredBody,
   decodeBasicEntities,
+  humanizeArticleSlug,
 } = require('../src/news-extract');
 
 const {
@@ -31,6 +32,7 @@ const {
   filterItemsByLinkPattern,
   filterDroppedFeedItems,
   feedArticleCap,
+  isThinFeedTitle,
   dedupeFeedItems,
   appendSourceLink,
   buildFullContentMarkdown,
@@ -250,6 +252,42 @@ describe('HackerNoon digest listing scrape', () => {
     const claude = titles.indexOf('Navigating Claude Code: The Full Workflow');
     const baby = titles.indexOf('How I Built a $5-a-Month AI Baby Monitor');
     assert.ok(claude < baby);
+  });
+
+  test('img-only digest cards do not keep "/slug feature image" as the title', () => {
+    const html = `<!DOCTYPE html><html><body>
+      <a href="/give-your-mastra-agent-an-imessage-number-using-photon-spectrum">
+        /give-your-mastra-agent-an-imessage-number-using-photon-spectrum
+        <img alt="feature image" src="https://hackernoon.imgix.net/x.png">
+      </a>
+      <a href="/faster-incident-response-how-anyrun-helps-socs-cut-mttr-by-up-to-21-minutes-per-case">
+        <img alt="feature image">
+      </a>
+    </body></html>`;
+    const raw = scrapeListingPage(html, {
+      baseUrl: 'https://hackernoon.com/8-20-2026-techbeat',
+      linkPattern: HN_STORY_PATTERN,
+      max: 20,
+    });
+    assert.equal(raw.length, 2);
+    for (const it of raw) {
+      assert.equal(it.title.startsWith('/'), false, it.title);
+      assert.equal(/feature image/i.test(it.title), false, it.title);
+      assert.ok(it.title.length >= 12, it.title);
+    }
+    assert.equal(
+      raw[0].title,
+      humanizeArticleSlug('https://hackernoon.com/give-your-mastra-agent-an-imessage-number-using-photon-spectrum'),
+    );
+  });
+});
+
+describe('HackerNoon thin titles', () => {
+  test('path / feature-image titles are thin; real headlines are not', () => {
+    assert.equal(isThinFeedTitle('/faster-incident-response-how-anyrun-helps-socs-cut-mttr-by-up-to-21-minutes-per-case feature image'), true);
+    assert.equal(isThinFeedTitle('feature image'), true);
+    assert.equal(isThinFeedTitle('Navigating Claude Code: The Full Workflow'), false);
+    assert.ok(humanizeArticleSlug('https://hackernoon.com/give-your-mastra-agent-an-imessage-number-using-photon-spectrum').includes('Mastra'));
   });
 
   test('live config pattern matches digest story hrefs and rejects the digest itself', () => {

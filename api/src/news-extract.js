@@ -1013,9 +1013,26 @@ function _tidyRating(raw) {
 function _isWeakListingTitle(title) {
   const t = (title || '').replace(/\s+/g, ' ').trim();
   if (t.length < 3) return true;
-  return /^(read more|more|watch|trailer|videos?|related|next|prev|home)$/i.test(t)
+  if (t.startsWith('/') || /^https?:\/\//i.test(t)) return true;
+  return /^(read more|more|watch|trailer|videos?|related|next|prev|home|feature image)$/i.test(t)
+    || /feature image$/i.test(t)
     || /^(critic'?s?|user|audience)\s*rating\b/i.test(t)
     || /^\d+(?:\.\d+)?\s*(?:\/\s*\d+)?(?:\s*stars?)?$/i.test(t);
+}
+
+function humanizeArticleSlug(url) {
+  try {
+    const slug = decodeURIComponent(new URL(url).pathname.replace(/\/+$/, '').split('/').pop() || '');
+    if (!slug || slug.length < 8) return '';
+    return slug
+      .replace(/[$_]+/g, ' ')
+      .replace(/-+/g, ' ')
+      .replace(/\s+/g, ' ')
+      .trim()
+      .replace(/\b([a-z])/g, (m) => m.toUpperCase());
+  } catch {
+    return '';
+  }
 }
 
 // ─── Listing-page scraper (no-RSS feeds — Gizbot, etc.) ─────────────────
@@ -1095,6 +1112,10 @@ function _maybeAdd($, a, baseUrl, rx, seen, out, max) {
       .replace(/\s+/g, ' ')
       .trim();
     if (nearby && !_isWeakListingTitle(nearby)) title = nearby;
+  }
+  if (_isWeakListingTitle(title) && hostOf(abs) === 'hackernoon.com') {
+    const fromSlug = humanizeArticleSlug(abs);
+    if (fromSlug) title = fromSlug;
   }
 
   // Skip ghost anchors. We do NOT mark `seen` until after this check —
@@ -1366,6 +1387,7 @@ module.exports = {
   isHackernoonStoryPermalink,
   decodeBasicEntities,
   collapseRepeatedParagraphs,
+  humanizeArticleSlug,
   // Internals exposed for tests
   hostOf,
   selectorsForUrl,
