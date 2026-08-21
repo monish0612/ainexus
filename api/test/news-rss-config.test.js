@@ -19,7 +19,7 @@ test('API image ships news_rss_feeds.json next to the service', () => {
   const cfg = JSON.parse(fs.readFileSync(apiCopy, 'utf8'));
   assert.ok(Array.isArray(cfg.feeds) && cfg.feeds.length >= 10, 'expected the RSS/listing feed list');
   const ids = new Set(cfg.feeds.map((f) => f.id));
-  for (const id of ['finshots', 'lensmen_reviews', 'sudhir_film_reviews', 'gizbot_reviews', 'techcrunch_ai', 'onlykollywood_reviews', 'toi_english_reviews']) {
+  for (const id of ['finshots', 'lensmen_reviews', 'sudhir_film_reviews', 'gizbot_reviews', 'techcrunch_ai', 'onlykollywood_reviews', 'toi_english_reviews', 'hackernoon_top_story', 'hackernoon_techbeat']) {
     assert.ok(ids.has(id), `expected feed ${id}`);
   }
   assert.ok(cfg.feeds.every((f) => f.enabled !== false), 'all listed feeds should be enabled');
@@ -103,6 +103,36 @@ test('Only Kollywood + TOI Movies feeds are listing/RSS-safe', () => {
   assert.equal(toi.url, 'https://timesofindia.indiatimes.com/entertainment/english/movie-reviews');
   assert.match(toi.listing_link_pattern, /english\/movie-reviews/);
   assert.doesNotMatch(toi.listing_link_pattern, /hindi/);
+});
+
+test('HackerNoon feeds land in AI News with viewer-grade extraction', () => {
+  const apiCopy = path.resolve(__dirname, '../news_rss_feeds.json');
+  const cfg = JSON.parse(fs.readFileSync(apiCopy, 'utf8'));
+  const byId = Object.fromEntries(cfg.feeds.map((f) => [f.id, f]));
+
+  const top = byId.hackernoon_top_story;
+  assert.ok(top, 'hackernoon_top_story missing');
+  assert.equal(top.app_category, 'AI News');
+  assert.equal(top.skip_summary, true);
+  assert.equal(top.extraction_strategy, 'clean');
+  assert.equal(top.url, 'https://hackernoon.com/tagged/hackernoon-top-story/feed');
+  assert.ok(!top.source_type, 'top-story must use the tagged RSS, not the HTML listing');
+  assert.equal(top.max_age_days, 4);
+  assert.equal(top.max_articles, 5);
+  assert.ok(top.drop_category_tags.includes('press-release'));
+  assert.match(top.item_link_pattern, /hackernoon/);
+
+  const beat = byId.hackernoon_techbeat;
+  assert.ok(beat, 'hackernoon_techbeat missing');
+  assert.equal(beat.app_category, 'AI News');
+  assert.equal(beat.skip_summary, true);
+  assert.equal(beat.source_type, 'listing');
+  assert.equal(beat.listing_digest, 'hackernoon-techbeat');
+  assert.equal(beat.extract_review_meta, undefined);
+  assert.equal(beat.url, 'https://hackernoon.com/techbeat');
+  assert.match(beat.drop_link_pattern, /homepage-has-a-new-baby/);
+  assert.match(beat.listing_link_pattern, /hackernoon/);
+  assert.doesNotMatch(beat.listing_link_pattern, /tagged\/hackernoon-top-story\/feed/);
 });
 
 test('filterItemsByLinkPattern drops news URLs from the OK reviews feed', () => {

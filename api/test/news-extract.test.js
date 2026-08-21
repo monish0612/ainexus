@@ -205,9 +205,9 @@ describe('extractCleanArticle', () => {
   });
 
   test('returns empty shape on empty/invalid input', () => {
-    assert.deepEqual(extractCleanArticle(''), { title: '', content: '', byline: '', date: null });
-    assert.deepEqual(extractCleanArticle(null), { title: '', content: '', byline: '', date: null });
-    assert.deepEqual(extractCleanArticle(undefined), { title: '', content: '', byline: '', date: null });
+    assert.deepEqual(extractCleanArticle(''), { title: '', content: '', byline: '', date: null, image: '' });
+    assert.deepEqual(extractCleanArticle(null), { title: '', content: '', byline: '', date: null, image: '' });
+    assert.deepEqual(extractCleanArticle(undefined), { title: '', content: '', byline: '', date: null, image: '' });
   });
 
   test('strips boilerplate (sidebar, share, comments)', () => {
@@ -769,6 +769,7 @@ describe('host helpers', () => {
         'sudhir-srinivasan.com must have tuned selectors');
     assert.ok(selectorsForUrl('https://www.onlykollywood.com/dc-movie-review/').includes('div.entry-content'));
     assert.ok(selectorsForUrl('https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/1.cms').length > 0);
+    assert.ok(selectorsForUrl('https://hackernoon.com/self-hosting-ai-models-on-a-raspberry-pi-5').includes('div.story-body div.prose'));
     assert.equal(selectorsForUrl('https://random-blog.example/').length, 0);
   });
 });

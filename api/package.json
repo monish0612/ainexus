@@ -6,7 +6,7 @@
   "scripts": {
     "start": "node src/index.js",
     "dev": "nodemon src/index.js",
-    "test": "node --test test/gemini-direct.test.js test/news-full-content.test.js test/news-extract.test.js test/news-rss-config.test.js test/x-feed-service.test.js test/smart-parse-prompt.test.js test/expense-insight.test.js test/cloud-service.test.js test/cloud-service-resumable.test.js test/cloud-resumable-http.test.js test/app-auth.test.js test/app-auth-http.test.js test/route-auth-wiring.test.js test/nas-stats-service.test.js test/nas-files-service.test.js test/nas-resumable-http.test.js test/saved-words-tombstones.test.js test/summarize-batch-prompt.test.js"
+    "test": "node --test test/gemini-direct.test.js test/news-full-content.test.js test/news-extract.test.js test/news-rss-config.test.js test/news-hackernoon.test.js test/x-feed-service.test.js test/smart-parse-prompt.test.js test/expense-insight.test.js test/cloud-service.test.js test/cloud-service-resumable.test.js test/cloud-resumable-http.test.js test/app-auth.test.js test/app-auth-http.test.js test/route-auth-wiring.test.js test/nas-stats-service.test.js test/nas-files-service.test.js test/nas-resumable-http.test.js test/saved-words-tombstones.test.js test/summarize-batch-prompt.test.js"
   },
   "dependencies": {
     "bcrypt": "^5.1.1",

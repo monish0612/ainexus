@@ -128,6 +128,17 @@ const SITE_SELECTORS = {
     'div.story-content',
     'article',
   ],
+  'hackernoon.com': [
+    // Next.js story pages: the readable article lives in Tailwind
+    // `.story-body > .prose`. JSON-LD `articleBody` is a plaintext
+    // fallback (no images / code fences). Prefer the prose block so the
+    // Flutter reader gets headings, figures, and fenced code.
+    'div.story-body div.prose',
+    'div.story-body',
+    'div.prose',
+    '[itemprop="articleBody"]',
+    'article',
+  ],
 };
 
 const BOILERPLATE_SELECTORS = [
@@ -441,7 +452,7 @@ function htmlToRichMarkdown(html, { baseUrl = '', maxChars = MAX_BODY_CHARS } = 
  */
 function extractCleanArticle(html, url = '') {
   if (!html || typeof html !== 'string') {
-    return { title: '', content: '', byline: '', date: null };
+    return { title: '', content: '', byline: '', date: null, image: '' };
   }
 
   let $;
@@ -449,16 +460,25 @@ function extractCleanArticle(html, url = '') {
     $ = cheerio.load(html);
   } catch (e) {
     tg.d('NEWS/extract', `cheerio.load failed: ${_shortErr(e)}`);
-    return { title: '', content: '', byline: '', date: null };
+    return { title: '', content: '', byline: '', date: null, image: '' };
   }
 
   // ── Title (og:title > <title> > h1) ───────────────────────────────────
-  const title =
+  const title = (
     $('meta[property="og:title"]').attr('content') ||
     $('meta[name="twitter:title"]').attr('content') ||
     $('title').first().text() ||
     $('h1').first().text() ||
-    '';
+    ''
+  ).replace(/\s*\|\s*HackerNoon\s*$/i, '');
+
+  // Card art — captured before boilerplate stripping (meta lives in <head>).
+  const image = (
+    $('meta[property="og:image"]').attr('content') ||
+    $('meta[property="og:image:secure_url"]').attr('content') ||
+    $('meta[name="twitter:image"]').attr('content') ||
+    ''
+  ).trim();
 
   // ── Byline ────────────────────────────────────────────────────────────
   const byline =
@@ -515,8 +535,10 @@ function extractCleanArticle(html, url = '') {
     content = bestText;
   }
 
-  if (visibleTextLen(jsonLdBody) > visibleTextLen(content)) {
-    content = jsonLdBody;
+  content = preferStructuredBody(jsonLdBody, content);
+
+  if (hostOf(url) === 'hackernoon.com') {
+    content = tidyHackernoonMarkdown(content);
   }
 
   if (content.length > MAX_BODY_CHARS) {
@@ -532,6 +554,7 @@ function extractCleanArticle(html, url = '') {
   return {
     title: title.trim(),
     content: content.trim(),
+    image,
     // Normalise common byline prefixes ("By ...", "Posted by ...",
     // "Written by ...") to a bare author name. Themes vary wildly here —
     // this regex keeps a single clean form across all 4 supported feeds.
@@ -794,11 +817,126 @@ function _jsonLdArticleBodyToMarkdown($) {
     });
   }
   if (!best) return '';
-  return best
+  return decodeBasicEntities(best)
     .replace(/\r\n/g, '\n')
     .replace(/\b(Story|Review|Synopsis|Verdict|Plus|Minus)\s*:/g, '\n\n## $1\n\n')
     .replace(/\n{3,}/g, '\n\n')
     .trim();
+}
+
+/**
+ * Pick JSON-LD plaintext vs HTML-derived markdown.
+ *
+ * JSON-LD wins when the live HTML is a teaser (TOI desktop synopsis) or
+ * empty. HTML wins when it already has a real body — especially if it
+ * carries images / code that JSON-LD would throw away (HackerNoon
+ * `.story-body .prose`).
+ */
+function preferStructuredBody(jsonLdBody, htmlContent) {
+  const jsonLen = visibleTextLen(jsonLdBody);
+  const htmlLen = visibleTextLen(htmlContent);
+  if (jsonLen < MIN_BODY_CHARS) return htmlContent || '';
+  if (htmlLen < MIN_BODY_CHARS) return jsonLdBody;
+  // Rich HTML (images, fenced code, headings) is always better for the
+  // Flutter reader than JSON-LD plaintext, even when JSON-LD is a bit
+  // longer. HackerNoon `.prose` often loses this comparison by ~20%.
+  const htmlIsRich =
+    /!\[[^\]]*\]\(/.test(htmlContent || '') ||
+    /(^|\n)```/.test(htmlContent || '') ||
+    /(^|\n)#{1,3}\s/.test(htmlContent || '');
+  if (htmlIsRich) return htmlContent;
+  if (jsonLen > htmlLen * 1.25) return jsonLdBody;
+  return htmlContent;
+}
+
+function decodeBasicEntities(s) {
+  return String(s || '')
+    .replace(/&nbsp;/gi, ' ')
+    .replace(/&apos;|&#0*39;|&#x0*27;/gi, "'")
+    .replace(/&quot;|&#0*34;|&#x0*22;/gi, '"')
+    .replace(/&amp;/gi, '&')
+    .replace(/&lt;/gi, '<')
+    .replace(/&gt;/gi, '>')
+    .replace(/&#(\d+);/g, (_, n) => {
+      const c = Number(n);
+      return Number.isFinite(c) && c >= 32 && c < 65535 ? String.fromCharCode(c) : ' ';
+    })
+    .replace(/&#x([0-9a-f]+);/gi, (_, n) => {
+      const c = parseInt(n, 16);
+      return Number.isFinite(c) && c >= 32 && c < 65535 ? String.fromCharCode(c) : ' ';
+    });
+}
+
+function collapseRepeatedParagraphs(md) {
+  const parts = String(md || '').split(/\n{2,}/);
+  const out = [];
+  for (const p of parts) {
+    const t = p.trim();
+    if (!t) continue;
+    if (out.length && out[out.length - 1] === t) continue;
+    out.push(t);
+  }
+  return out.join('\n\n');
+}
+
+/**
+ * HackerNoon JSON-LD / prose leftovers that ruin a reader: Unsplash
+ * photo credits, newsletter CTAs, "Read All" teasers, and the digest
+ * habit of repeating the same heading three times.
+ */
+function tidyHackernoonMarkdown(md) {
+  let s = collapseRepeatedParagraphs(decodeBasicEntities(md));
+  s = s.replace(/(?:\s*Photo by .+? on Unsplash)+/gi, '');
+  s = s.replace(/\s+[A-Z][a-z]+ [A-Z][a-z]+\s+Unsplash\s*$/g, '');
+  s = s.replace(/\n+(?:Want the Top Headlines[\s\S]*)$/i, '');
+  s = s.replace(/\n+(?:Like this story\??[\s\S]*)$/i, '');
+  s = s.replace(/\n+(?:Also published in[\s\S]*)$/i, '');
+  s = s.replace(/\n+(?:The Techbeat by HackerNoon[\s\S]*?Set email preference here\.?)/gi, '\n');
+  s = s.replace(/^\s*How are you, hacker\??\s*$/gim, '');
+  s = s.replace(/^\s*Read All\s*$/gim, '');
+  s = s.replace(/(?:\n+---)+\s*$/g, '');
+  return collapseRepeatedParagraphs(s).trim();
+}
+
+function hackernoonTechbeatDigestUrl(date) {
+  const d = date instanceof Date && !isNaN(date.getTime()) ? date : new Date();
+  return `https://hackernoon.com/${d.getUTCMonth() + 1}-${d.getUTCDate()}-${d.getUTCFullYear()}-techbeat`;
+}
+
+function hackernoonTechbeatDigestCandidates(now = new Date(), lookbackDays = 3) {
+  const parsed = Number(lookbackDays);
+  const n = Number.isFinite(parsed) ? Math.max(1, Math.min(14, parsed)) : 3;
+  const base = now instanceof Date && !isNaN(now.getTime()) ? now : new Date();
+  const out = [];
+  const seen = new Set();
+  for (let i = 0; i < n; i++) {
+    const d = new Date(Date.UTC(base.getUTCFullYear(), base.getUTCMonth(), base.getUTCDate() - i));
+    const url = hackernoonTechbeatDigestUrl(d);
+    if (seen.has(url)) continue;
+    seen.add(url);
+    out.push(url);
+  }
+  return out;
+}
+
+/**
+ * True for a HackerNoon *story* permalink (one slug, no /tagged/ etc).
+ * Daily TechBeat digest pages (`8-20-2026-techbeat`) are NOT stories —
+ * ingesting those as one card dumps a pile of duplicated teasers.
+ */
+function isHackernoonStoryPermalink(url) {
+  if (!url || typeof url !== 'string') return false;
+  try {
+    const u = new URL(url.trim(), 'https://hackernoon.com');
+    if (!/(?:^|\.)hackernoon\.com$/i.test(u.hostname)) return false;
+    const slug = (u.pathname || '/').replace(/^\/+|\/+$/g, '');
+    if (!slug || slug.includes('/')) return false;
+    if (/^\d{1,2}-\d{1,2}-\d{4}-techbeat$/i.test(slug)) return false;
+    if (/^(tagged|techbeat|u|c|feed|new|about|login|signup|search)$/i.test(slug)) return false;
+    return /^[a-z0-9][a-z0-9$._-]{11,}$/i.test(slug);
+  } catch {
+    return false;
+  }
 }
 
 function _extractReviewRating($, html) {
@@ -1134,6 +1272,7 @@ async function cleanExtract(url, { logTag = 'NEWS/clean-extract', timeoutMs = 15
           title: probe.title,
           byline: probe.byline,
           date: probe.date,
+          image: probe.image || '',
           extractionMethod: method,
           paywallSource: 'none',
           rawHtml: html,
@@ -1146,7 +1285,7 @@ async function cleanExtract(url, { logTag = 'NEWS/clean-extract', timeoutMs = 15
   }
 
   if (!html) {
-    return { content: '', title: '', byline: '', date: null, extractionMethod: 'fetch-failed', paywallSource: 'none' };
+    return { content: '', title: '', byline: '', date: null, image: '', extractionMethod: 'fetch-failed', paywallSource: 'none' };
   }
 
   const r = extractCleanArticle(html, url);
@@ -1159,6 +1298,7 @@ async function cleanExtract(url, { logTag = 'NEWS/clean-extract', timeoutMs = 15
     title: r.title,
     byline: r.byline,
     date: r.date,
+    image: r.image || '',
     extractionMethod: 'clean-empty',
     paywallSource: 'none',
     rawHtml: html,
@@ -1219,6 +1359,13 @@ module.exports = {
   visibleTextLen,
   canonicalArticleUrl,
   toiMovieAmpUrl,
+  preferStructuredBody,
+  tidyHackernoonMarkdown,
+  hackernoonTechbeatDigestUrl,
+  hackernoonTechbeatDigestCandidates,
+  isHackernoonStoryPermalink,
+  decodeBasicEntities,
+  collapseRepeatedParagraphs,
   // Internals exposed for tests
   hostOf,
   selectorsForUrl,

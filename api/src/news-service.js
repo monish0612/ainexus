@@ -26,6 +26,8 @@ const {
   htmlToRichMarkdown,
   visibleTextLen,
   canonicalArticleUrl,
+  hackernoonTechbeatDigestCandidates,
+  isHackernoonStoryPermalink,
 } = require('./news-extract');
 
 // Prefer the copy that ships inside the API image (`api/news_rss_feeds.json`).
@@ -247,7 +249,10 @@ function parseFeedItems(xml) {
       const guid = stableGuid(extractTag(b, ['guid', 'id']), link, title);
       const pubRaw = extractTag(b, ['pubDate', 'published', 'updated', 'dc:date', 'created']);
       const html = extractHtmlContent(b);
-      return { title, link, guid, pubRaw, html, text: cleanHtml(html), image: extractImage(b, html, link) };
+      const categories = [...b.matchAll(/<category\b[^>]*>([\s\S]*?)<\/category>/gi)]
+        .map((m) => decodeHtmlEntities(stripCdata(m[1] || '')).trim())
+        .filter(Boolean);
+      return { title, link, guid, pubRaw, html, text: cleanHtml(html), image: extractImage(b, html, link), categories };
     })
     .filter((i) => i.guid && (i.link || i.title));
 }
@@ -261,6 +266,37 @@ function filterItemsByLinkPattern(items, pattern) {
     return items;
   }
   return items.filter((i) => rx.test(i.link || ''));
+}
+
+function filterDroppedFeedItems(items, feed = {}) {
+  if (!Array.isArray(items) || items.length === 0) return items || [];
+  const dropTags = new Set(
+    (feed.drop_category_tags || []).map((t) => String(t).toLowerCase().trim()).filter(Boolean),
+  );
+  const compile = (pattern) => {
+    if (!pattern) return null;
+    try {
+      return new RegExp(pattern, 'i');
+    } catch {
+      return null;
+    }
+  };
+  const titleRx = compile(feed.drop_title_pattern);
+  const linkRx = compile(feed.drop_link_pattern);
+  return items.filter((item) => {
+    if (titleRx && titleRx.test(item.title || '')) return false;
+    if (linkRx && linkRx.test(item.link || '')) return false;
+    if (dropTags.size === 0) return true;
+    const cats = (item.categories || []).map((c) => String(c).toLowerCase());
+    if (cats.some((c) => dropTags.has(c))) return false;
+    return true;
+  });
+}
+
+function feedArticleCap(feed, settings) {
+  const n = Number(feed?.max_articles);
+  if (Number.isFinite(n) && n > 0) return Math.max(1, Math.floor(n));
+  return Math.max(1, Number(settings?.max_articles_per_feed) || 3);
 }
 
 function movieTitleKey(title) {
@@ -391,7 +427,7 @@ function appendSourceLink(summary, url, source) {
     : url.includes('venturebeat') ? '⚡' : url.includes('techcrunch') ? '📰'
     : url.includes('artificialintelligence-news') ? '✨'
     : url.includes('lensmen') ? '🎬' : url.includes('sudhir-srinivasan') ? '🎬'
-    : url.includes('gizbot') ? '📱' : '🔗';
+    : url.includes('gizbot') ? '📱' : url.includes('hackernoon') ? '🌙' : '🔗';
 
   return `${summary.trim()}\n\n---\n\n## ${srcIcon} Read Original Article\n\n> **Want to dive deeper?** Access the full article with original charts, images, and detailed analysis.\n\n**[📖 Read Full Article on ${srcName} →](${url})**\n`.trim();
 }
@@ -834,19 +870,27 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   const deleted = await pool.query('SELECT guid FROM deleted_guids WHERE guid = $1', [item.guid]);
   if (deleted.rows.length > 0) return false;
 
-  // Same review, different guid (RSS ?p= vs permalink, www vs bare host).
   if (item.link) {
-    const canon = canonicalArticleUrl(item.link);
+    const cleaned = canonicalArticleUrl(item.link);
+    if (cleaned) item.link = cleaned;
+  }
+
+  // Same review, different guid (RSS ?p= vs permalink, www vs bare host,
+  // ?source=rss vs ?ref=hackernoon.com).
+  if (item.link) {
+    const canon = canonicalArticleUrl(item.link) || item.link;
     const urlDup = await pool.query(
       `SELECT id FROM news_articles
         WHERE original_url = $1 OR original_url = $2 OR original_url = $3
+           OR original_url LIKE $4
         LIMIT 1`,
-      [item.link, canon, canon ? `${canon}/` : ''],
+      [item.link, canon, canon ? `${canon}/` : '', canon ? `${canon}?%` : ''],
     );
     if (urlDup.rows.length > 0) return false;
   }
 
   const title = item.title || 'Untitled';
+  let cardImage = item.image || '';
   let pubDate = parseDate(item.pubRaw);
   const hadRssPubDate = !!item.pubRaw;
   const source = feed.name || feed.id;
@@ -879,6 +923,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     const _logTag = `NEWS/${feed.id}`;
     try {
       const extracted = await cleanExtract(item.link, { logTag: _logTag });
+      if (!cardImage && extracted.image) cardImage = extracted.image;
       // Prefer the live-page extraction ONLY when it actually has MORE
       // visible text than the rich RSS body we already hold. This stops a
       // thin page (Substack cover-image + paywall teaser) from clobbering a
@@ -1091,7 +1136,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     )`,
     [
       id, finalTitle, feed.app_category || 'Technology', feed.category || null,
-      readTime(summary), fmtTimeAgo(pubDate), fmtDate(pubDate), item.image || '',
+      readTime(summary), fmtTimeAgo(pubDate), fmtDate(pubDate), cardImage || '',
       buildExcerpt(excerptSummary, contentText), source,
       false, JSON.stringify({ sourceId: feed.id, originalUrl: item.link || '', publishedAt: pubDate.toISOString(), isFullContent: skipSummary }),
       false, false, item.guid, item.link || '', summary,
@@ -1120,6 +1165,7 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
       allItems,
       feed.listing_link_pattern || feed.item_link_pattern,
     );
+    allItems = filterDroppedFeedItems(allItems, feed);
     allItems = dedupeFeedItems(allItems, {
       byTitle: feed.app_category === 'Movies',
     });
@@ -1133,9 +1179,20 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
       feed.source_type === 'listing' ||
       (typeof feed.max_age_days === 'number' && feed.max_age_days > 0);
 
+    const cap = feedArticleCap(feed, settings);
     let items;
     if (deferDateFilter) {
-      items = allItems.slice(0, settings.max_articles_per_feed);
+      // Listing feeds (TechBeat, Gizbot) keep page order — that's the ranking.
+      // RSS feeds with a date window still want newest-first so a reversed
+      // or shuffled feed doesn't spend the cap on stale items that
+      // processItem will immediately reject.
+      if (feed.source_type === 'listing') {
+        items = allItems.slice(0, cap);
+      } else {
+        items = [...allItems]
+          .sort((a, b) => parseDate(b.pubRaw) - parseDate(a.pubRaw))
+          .slice(0, cap);
+      }
     } else {
       // Sort newest-first so both the today-filter and the past-article
       // backfill below pick the freshest entries.
@@ -1145,13 +1202,13 @@ async function processFeed({ pool, feed, config, settings, summaryLimiter, compl
       const todayItems = sorted.filter((item) => isPublishedToday(parseDate(item.pubRaw)));
 
       if (todayItems.length > 0) {
-        items = todayItems.slice(0, settings.max_articles_per_feed);
+        items = todayItems.slice(0, cap);
       } else if (sorted.length > 0) {
         // Nothing fresh today — backfill the most-recent past article(s) so
         // the feed is never empty (low-cadence sources, weekends, holidays).
         // `processItem` dedups by guid, so already-stored pieces are skipped
         // and this only fills genuine gaps rather than re-adding old news.
-        items = sorted.slice(0, Math.min(settings.max_articles_per_feed, 2));
+        items = sorted.slice(0, Math.min(cap, 2));
         console.log(
           `[NEWS] ${feed.id}: no items from today (${todayIST()}) — backfilling ${items.length} most-recent past article(s)`,
         );
@@ -1265,19 +1322,46 @@ async function _fetchRssItems(feed) {
 async function _fetchListingItems(feed) {
   const t0 = Date.now();
   const logTag = `NEWS/${feed.id}`;
-  let html;
-  try {
-    html = await fetchHtml(feed.url, { timeoutMs: 20_000, retries: 2, logTag });
-  } catch (e) {
-    tg.e(logTag, `Listing fetch failed: ${e.message?.slice(0, 120)}`, e);
-    throw e;
-  }
+  const max = Math.max(20, (feed.max_listing_links || 20));
+  const linkPattern = feed.listing_link_pattern || '.*';
 
-  const rawItems = scrapeListingPage(html, {
-    baseUrl: feed.url,
-    linkPattern: feed.listing_link_pattern || '.*',
-    max: Math.max(20, (feed.max_listing_links || 20)),
-  });
+  let rawItems = [];
+  if (feed.listing_digest === 'hackernoon-techbeat') {
+    const lookback = Math.max(1, Number(feed.listing_digest_lookback_days || 3));
+    const candidates = hackernoonTechbeatDigestCandidates(new Date(), lookback);
+    for (const url of candidates) {
+      try {
+        const html = await fetchHtml(url, { timeoutMs: 20_000, retries: 2, logTag });
+        const scraped = scrapeListingPage(html, { baseUrl: url, linkPattern, max });
+        const stories = scraped.filter((it) => isHackernoonStoryPermalink(it.link));
+        if (stories.length >= 2) {
+          rawItems = stories;
+          tg.d(logTag, `TechBeat digest ${url} → ${stories.length} stories`);
+          break;
+        }
+        tg.d(logTag, `TechBeat digest thin ${url} (${stories.length} stories)`);
+      } catch (e) {
+        tg.d(logTag, `TechBeat digest miss ${url}: ${_shortErrSafe(e)}`);
+      }
+    }
+    if (rawItems.length === 0) {
+      tg.w(logTag, `TechBeat digest lookback empty (${candidates.join(', ')})`);
+      return [];
+    }
+  } else {
+    let html;
+    try {
+      html = await fetchHtml(feed.url, { timeoutMs: 20_000, retries: 2, logTag });
+    } catch (e) {
+      tg.e(logTag, `Listing fetch failed: ${e.message?.slice(0, 120)}`, e);
+      throw e;
+    }
+    rawItems = scrapeListingPage(html, {
+      baseUrl: feed.url,
+      linkPattern,
+      max,
+    });
+  }
 
   const items = rawItems.map((raw) => {
     const link = canonicalArticleUrl(raw.link) || raw.link;
@@ -1285,15 +1369,20 @@ async function _fetchListingItems(feed) {
       title: raw.title || 'Untitled',
       link: raw.link,
       guid: stableGuid(link, raw.link, raw.title),
-      pubRaw: '', // resolved during clean extraction
+      pubRaw: '',
       html: '',
       text: '',
       image: raw.image || '',
+      categories: [],
     };
   });
 
   tg.d(logTag, `Listing scrape ✓ ${Date.now() - t0}ms ${items.length} link(s) found`);
   return items;
+}
+
+function _shortErrSafe(e) {
+  return (e && (e.message || String(e)) || 'unknown').slice(0, 80);
 }
 
 async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteModelFn, getXGrokLiteModelFn, deepExtractFn, ensureTablesFn } = {}) {
@@ -1530,6 +1619,8 @@ module.exports = {
   parseFeedItems,
   resolveConfigPath,
   filterItemsByLinkPattern,
+  filterDroppedFeedItems,
+  feedArticleCap,
   dedupeFeedItems,
   movieTitleKey,
   canonicalArticleUrl,
