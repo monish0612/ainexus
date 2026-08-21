@@ -60,7 +60,10 @@ test('default folder id matches the Android app', () => {
   assert.strictEqual(cloud.FOLDER_ID, '1ybi-QMnDHDSFLXiRQjFacrJ7uLGmFX13');
 });
 
-test('backup folder and rolling file names are exported', () => {
-  assert.strictEqual(cloud.BACKUP_FOLDER_NAME, 'AI Nexus Backups');
-  assert.strictEqual(cloud.BACKUP_FILE_NAME, 'nexus-backup.json');
+test('Cloud file listing excludes Drive folders so the backup folder stays hidden', () => {
+  const fs = require('fs');
+  const path = require('path');
+  const src = fs.readFileSync(path.join(__dirname, '../src/cloud-service.js'), 'utf8');
+  assert.match(src, /mimeType != '\$\{FOLDER_MIME\}'/);
+  assert.match(src, /BACKUP_FOLDER_NAME = 'AI Nexus Backups'/);
 });

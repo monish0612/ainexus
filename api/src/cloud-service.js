@@ -179,12 +179,19 @@ async function upsertBackupFile(body, { mimeType = 'application/json' } = {}) {
   });
   const media = { mimeType, body };
   if (existing) {
-    const { data } = await drive.files.update({
-      fileId: existing.id,
-      media,
-      fields: FILE_FIELDS,
-    });
-    return { file: mapFile(data), folder, overwritten: true };
+    try {
+      const { data } = await drive.files.update({
+        fileId: existing.id,
+        media,
+        fields: FILE_FIELDS,
+      });
+      return { file: mapFile(data), folder, overwritten: true };
+    } catch (err) {
+      const status = Number(err.status || err.code || err.response?.status);
+      const missing = status === 404 || /not found|404/i.test(String(err.message || ''));
+      if (!missing) throw err;
+      tg.w('Cloud/backup', 'rolling file vanished — recreating nexus-backup.json');
+    }
   }
   const { data } = await drive.files.create({
     requestBody: { name: BACKUP_FILE_NAME, parents: [folder.id] },

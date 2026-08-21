@@ -88,11 +88,11 @@ function makePool() {
   return { query, _words: words, _tombstones: tombstones };
 }
 
-function startServer() {
+function startServer(opts = {}) {
   const pool = makePool();
   const app = express();
   app.use(express.json());
-  app.use('/saved-words', buildSavedWordsRouter(express, pool, { log: () => {} }));
+  app.use('/saved-words', buildSavedWordsRouter(express, pool, { log: () => {}, ...opts }));
   const server = http.createServer(app);
   return new Promise((resolve) => {
     server.listen(0, '127.0.0.1', () => {
@@ -215,6 +215,22 @@ test('POST without id/word → 400', async () => {
   try {
     const res = await req(base, 'POST', '/saved-words', { word: '' });
     assert.equal(res.status, 400);
+  } finally {
+    server.close();
+  }
+});
+
+test('delete and bulk-clear notify onMutate so Drive backup can drop the word', async () => {
+  const reasons = [];
+  const { server, base } = await startServer({ onMutate: (r) => reasons.push(r) });
+  try {
+    await req(base, 'POST', '/saved-words', { id: 'w1', word: 'x', savedAt: '2026-01-01T00:00:00.000Z' });
+    await req(base, 'DELETE', '/saved-words/w1');
+    await req(base, 'POST', '/saved-words', { id: 'w2', word: 'y', savedAt: '2026-01-01T00:00:00.000Z' });
+    await req(base, 'DELETE', '/saved-words');
+    assert.ok(reasons.includes('saved-word-delete'));
+    assert.ok(reasons.includes('saved-words-clear'));
+    assert.ok(reasons.includes('saved-word-upsert'));
   } finally {
     server.close();
   }

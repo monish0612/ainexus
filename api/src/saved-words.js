@@ -15,7 +15,14 @@
 //  phone (the phone's saved-words pull was insert-only with no delete log).
 // ═══════════════════════════════════════════════════════════════
 
-function buildSavedWordsRouter(express, pool, { log = console.log } = {}) {
+function buildSavedWordsRouter(express, pool, { log = console.log, onMutate } = {}) {
+  const ping = (reason) => {
+    try {
+      if (typeof onMutate === 'function') onMutate(reason);
+    } catch {
+      // Backup scheduling must never fail a user-visible delete/save.
+    }
+  };
   const router = express.Router();
 
   // GET all saved words
@@ -103,6 +110,7 @@ function buildSavedWordsRouter(express, pool, { log = console.log } = {}) {
       await pool.query('DELETE FROM deleted_saved_words WHERE id = $1', [id]);
 
       log('[SAVED_WORDS] Upserted:', id, word);
+      ping('saved-word-upsert');
       res.json({ ok: true, id });
     } catch (err) {
       next(err);
@@ -121,6 +129,7 @@ function buildSavedWordsRouter(express, pool, { log = console.log } = {}) {
       );
       const result = await pool.query('DELETE FROM saved_words');
       log('[SAVED_WORDS] Cleared all:', result.rowCount, 'rows deleted | tombstones written');
+      ping('saved-words-clear');
       res.json({ ok: true, deleted: result.rowCount });
     } catch (err) {
       next(err);
@@ -140,6 +149,7 @@ function buildSavedWordsRouter(express, pool, { log = console.log } = {}) {
       );
       const result = await pool.query('DELETE FROM saved_words WHERE id = $1', [id]);
       log('[SAVED_WORDS] Deleted:', id, '| rows:', result.rowCount, '| tombstone written');
+      ping('saved-word-delete');
       res.json({ ok: true, deleted: result.rowCount });
     } catch (err) {
       next(err);

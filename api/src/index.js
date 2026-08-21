@@ -1334,6 +1334,15 @@ app.use('/api/v1/finance', financeRouter);
 
 const { syncNewsFeeds, getSyncState, startScheduler } = require('./news-service');
 const { startXFeedScheduler, manualXFeedSync, getXFeedStatus } = require('./x-feed-service');
+const backupService = require('./backup-service');
+
+function pingBackup(reason) {
+  try {
+    backupService.scheduleBackupSoon(pool, { reason });
+  } catch {
+    // Drive backup is best-effort; user-facing writes must still succeed.
+  }
+}
 
 /**
  * Shared provider resolver with in-memory TTL cache.
@@ -1574,6 +1583,7 @@ newsRouter.post('/:id/save', async (req, res, next) => {
     const next_val = !cur.rows[0].saved;
     await pool.query('UPDATE news_articles SET saved = $1, updated_at = NOW() WHERE id = $2', [next_val, id]);
     const updated = await pool.query('SELECT * FROM news_articles WHERE id = $1', [id]);
+    pingBackup(next_val ? 'article-save' : 'article-unsave');
     res.json({ article: mapArticleRow(updated.rows[0]), saved: next_val });
   } catch (err) {
     next(err);
@@ -1681,6 +1691,7 @@ newsRouter.post('/nuke', async (_req, res, next) => {
       'News/nuke',
       `☢️ deleted ALL ${result.rowCount} article(s) incl. saved ${Date.now() - _t0}ms`,
     );
+    pingBackup('news-nuke');
     res.json({ deleted: result.rowCount, ok: true });
   } catch (err) {
     tg.e('News/nuke', `FATAL ${Date.now() - _t0}ms: ${err.message?.slice(0, 200)}`, err);
@@ -1744,6 +1755,7 @@ newsRouter.delete('/:id', async (req, res, next) => {
       );
     }
     await pool.query('DELETE FROM news_articles WHERE id = $1', [id]);
+    pingBackup('article-delete');
     res.json({ ok: true });
   } catch (err) {
     next(err);
@@ -4889,7 +4901,9 @@ app.use('/api/v1/sync', requireApp, syncRouter);
 // Router (incl. cross-device delete-sync tombstones) lives in ./saved-words so
 // the full lifecycle is unit-testable with a fake pool.
 const { buildSavedWordsRouter } = require('./saved-words');
-const savedWordsRouter = buildSavedWordsRouter(express, pool);
+const savedWordsRouter = buildSavedWordsRouter(express, pool, {
+  onMutate: (reason) => pingBackup(reason),
+});
 
 app.use('/api/v1/saved-words', requireApp, savedWordsRouter);
 
@@ -5245,6 +5259,7 @@ savedSearchesRouter.delete('/', async (_req, res, next) => {
     console.log(
       `[SAVED_SEARCHES] Cleared all: ${result.rowCount} rows deleted | tombstones written`,
     );
+    pingBackup('saved-searches-clear');
     res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
@@ -5275,6 +5290,7 @@ savedSearchesRouter.delete('/:id', async (req, res, next) => {
     console.log(
       `[SAVED_SEARCHES] Delete: ${id} | rows: ${result.rowCount} | tombstone written`,
     );
+    pingBackup('saved-search-delete');
     res.json({ ok: true, deleted: result.rowCount });
   } catch (err) {
     next(err);
@@ -5876,8 +5892,6 @@ cloudRouter.get('/stats/history', async (req, res) => {
 // Token broker — hands a *trusted* (already requireApp-authenticated) client a
 // short-lived Drive access token so the Android app can talk to Drive directly
 // WITHOUT ever embedding the service-account private key in the APK.
-const backupService = require('./backup-service');
-
 cloudRouter.get('/backup', (_req, res) => {
   res.setHeader('Cache-Control', 'no-store');
   res.json(backupService.getState());

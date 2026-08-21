@@ -95,8 +95,8 @@ async function _flush() {
 }
 
 const tg = {
-  d: (tag, msg) => _enqueue('🔵', tag, msg),
-  i: (tag, msg) => _enqueue('🟢', tag, msg),
+  d: (tag, msg, extra) => _enqueue('🔵', tag, msg, extra),
+  i: (tag, msg, extra) => _enqueue('🟢', tag, msg, extra),
   w: (tag, msg, err) => _enqueue('🟡', tag, msg, { error: err }),
   e: (tag, msg, err) => _enqueue('🔴', tag, msg, { error: err, immediate: true }),
   fatal: (tag, msg, err) => _enqueue('💀', tag, msg, { error: err, immediate: true }),

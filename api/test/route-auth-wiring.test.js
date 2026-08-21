@@ -81,6 +81,11 @@ test('Drive backup routes live on the (requireApp-gated) cloud router', () => {
   assert.match(SRC, /cloudRouter\.post\('\/backup'/);
   assert.match(SRC, /cloudRouter\.post\('\/backup\/restore'/);
   assert.match(SRC, /backupService\.startScheduler\(pool\)/);
+  assert.match(SRC, /pingBackup\('article-delete'\)/);
+  assert.match(SRC, /pingBackup\(next_val \? 'article-save' : 'article-unsave'\)/);
+  assert.match(SRC, /pingBackup\('saved-search-delete'\)/);
+  assert.match(SRC, /pingBackup\('news-nuke'\)/);
+  assert.match(SRC, /onMutate: \(reason\) => pingBackup\(reason\)/);
 });
 
 test('app-auth helpers are imported into index.js', () => {
