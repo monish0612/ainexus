@@ -20,6 +20,7 @@ const {
   cleanExtract,
   fetchHtml,
   scrapeListingPage,
+  extractCleanArticle,
   extractGizbotProsConsRating,
   buildReviewMetaMarkdown,
   extractDateFromHtml,
@@ -306,6 +307,27 @@ function isThinFeedTitle(title) {
   if (t.startsWith('/') || /^https?:\/\//i.test(t)) return true;
   if (/feature image$/i.test(t)) return true;
   return false;
+}
+
+function pageTitleFromExtract(extractedTitle) {
+  return String(extractedTitle || '').replace(/\s*\|\s*HackerNoon\s*$/i, '').trim();
+}
+
+async function maybeRepairThinNewsTitle(pool, row, item, feed) {
+  if (!row || !item?.link || !isThinFeedTitle(row.title)) return;
+  try {
+    const html = await fetchHtml(item.link, { logTag: `NEWS/${feed.id}/title-repair` });
+    const extracted = extractCleanArticle(html, item.link);
+    const pageTitle = pageTitleFromExtract(extracted.title);
+    if (pageTitle.length < 12) return;
+    await pool.query(
+      'UPDATE news_articles SET title = $1, updated_at = NOW() WHERE id = $2',
+      [pageTitle, row.id],
+    );
+    console.log(`[NEWS] Repaired thin title ${row.id}: "${pageTitle.slice(0, 60)}"`);
+  } catch (err) {
+    console.warn(`[NEWS] title repair skipped for ${row.id}: ${(err.message || '').slice(0, 80)}`);
+  }
 }
 
 function movieTitleKey(title) {
@@ -873,8 +895,11 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
 }
 
 async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }) {
-  const existing = await pool.query('SELECT id FROM news_articles WHERE guid = $1', [item.guid]);
-  if (existing.rows.length > 0) return false;
+  const existing = await pool.query('SELECT id, title FROM news_articles WHERE guid = $1', [item.guid]);
+  if (existing.rows.length > 0) {
+    await maybeRepairThinNewsTitle(pool, existing.rows[0], item, feed);
+    return false;
+  }
 
   const deleted = await pool.query('SELECT guid FROM deleted_guids WHERE guid = $1', [item.guid]);
   if (deleted.rows.length > 0) return false;
@@ -889,13 +914,16 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   if (item.link) {
     const canon = canonicalArticleUrl(item.link) || item.link;
     const urlDup = await pool.query(
-      `SELECT id FROM news_articles
+      `SELECT id, title FROM news_articles
         WHERE original_url = $1 OR original_url = $2 OR original_url = $3
            OR original_url LIKE $4
         LIMIT 1`,
       [item.link, canon, canon ? `${canon}/` : '', canon ? `${canon}?%` : ''],
     );
-    if (urlDup.rows.length > 0) return false;
+    if (urlDup.rows.length > 0) {
+      await maybeRepairThinNewsTitle(pool, urlDup.rows[0], item, feed);
+      return false;
+    }
   }
 
   const title = item.title || 'Untitled';
@@ -1046,7 +1074,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
 
   // Use the extracted page title if RSS / listing title was thin, or for
   // HackerNoon where listing cards often ship "/slug feature image".
-  const pageTitle = (extractedTitle || '').replace(/\s*\|\s*HackerNoon\s*$/i, '').trim();
+  const pageTitle = pageTitleFromExtract(extractedTitle);
   const thinTitle = isThinFeedTitle(title);
   const finalTitle =
     pageTitle.length >= 12 && (thinTitle || hostOf(item.link) === 'hackernoon.com')
