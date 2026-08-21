@@ -76,6 +76,13 @@ test('cloud token-broker route exists on the (requireApp-gated) cloud router', (
   assert.match(SRC, /res\.setHeader\('Cache-Control',\s*'no-store'\)/);
 });
 
+test('Drive backup routes live on the (requireApp-gated) cloud router', () => {
+  assert.match(SRC, /cloudRouter\.get\('\/backup'/);
+  assert.match(SRC, /cloudRouter\.post\('\/backup'/);
+  assert.match(SRC, /cloudRouter\.post\('\/backup\/restore'/);
+  assert.match(SRC, /backupService\.startScheduler\(pool\)/);
+});
+
 test('app-auth helpers are imported into index.js', () => {
   assert.match(SRC, /require\('\.\/app-auth'\)/);
   for (const fn of ['requireApp', 'checkAppCredentials', 'makeAppToken', 'buildClientLog']) {

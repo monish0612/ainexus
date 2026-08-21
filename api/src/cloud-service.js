@@ -14,6 +14,11 @@ const { tg } = require('./telegram');
 const FOLDER_ID =
   process.env.GOOGLE_DRIVE_FOLDER_ID || '1ybi-QMnDHDSFLXiRQjFacrJ7uLGmFX13';
 
+/** Dedicated Drive folder for the rolling user-data snapshot. Not listed in Cloud. */
+const BACKUP_FOLDER_NAME = 'AI Nexus Backups';
+const BACKUP_FILE_NAME = 'nexus-backup.json';
+const FOLDER_MIME = 'application/vnd.google-apps.folder';
+
 const DRIVE_SCOPE = 'https://www.googleapis.com/auth/drive';
 const FILE_FIELDS =
   'id,name,mimeType,size,createdTime,modifiedTime,starred,thumbnailLink';
@@ -87,11 +92,17 @@ function mapFile(f) {
   };
 }
 
+function _escapeDriveQuery(value) {
+  return String(value || '').replace(/\\/g, '\\\\').replace(/'/g, "\\'");
+}
+
 async function listFiles({ pageToken, pageSize = 50, q } = {}) {
   const drive = await _getDrive();
-  let query = `'${FOLDER_ID}' in parents and trashed = false`;
+  // Folders (including "AI Nexus Backups") stay out of the Cloud file list so
+  // a restore snapshot is never mixed in with user uploads.
+  let query = `'${FOLDER_ID}' in parents and trashed = false and mimeType != '${FOLDER_MIME}'`;
   if (q && String(q).trim()) {
-    const escaped = String(q).replace(/'/g, "\\'");
+    const escaped = _escapeDriveQuery(q);
     query += ` and (name contains '${escaped}' or fullText contains '${escaped}')`;
   }
   const { data } = await drive.files.list({
@@ -115,6 +126,82 @@ async function getQuota() {
     usageBytes: Number(q.usage || 0),
     limitBytes: Number(q.limit || 16106127360),
   };
+}
+
+async function _findChild({ parentId, name, mimeType }) {
+  const drive = await _getDrive();
+  const escaped = _escapeDriveQuery(name);
+  let query = `name = '${escaped}' and '${parentId}' in parents and trashed = false`;
+  if (mimeType) query += ` and mimeType = '${mimeType}'`;
+  const { data } = await drive.files.list({
+    q: query,
+    fields: `files(id,name,mimeType,size,modifiedTime)`,
+    pageSize: 1,
+  });
+  return (data.files && data.files[0]) || null;
+}
+
+/**
+ * Find-or-create `AI Nexus Backups` under the existing Cloud folder.
+ * The service account already has write access there; the folder is
+ * unique by name so restarts do not create duplicates.
+ */
+async function ensureBackupFolder() {
+  const existing = await _findChild({
+    parentId: FOLDER_ID,
+    name: BACKUP_FOLDER_NAME,
+    mimeType: FOLDER_MIME,
+  });
+  if (existing) return { id: existing.id, name: existing.name, created: false };
+  const drive = await _getDrive();
+  const { data } = await drive.files.create({
+    requestBody: {
+      name: BACKUP_FOLDER_NAME,
+      mimeType: FOLDER_MIME,
+      parents: [FOLDER_ID],
+    },
+    fields: 'id,name',
+  });
+  tg.i('Cloud/backup', `Created Drive folder "${BACKUP_FOLDER_NAME}" → ${data.id}`);
+  return { id: data.id, name: data.name, created: true };
+}
+
+/**
+ * Create or overwrite the single rolling backup file in the backups folder.
+ * Same name every run — Drive `files.update` replaces the bytes in place.
+ */
+async function upsertBackupFile(body, { mimeType = 'application/json' } = {}) {
+  const folder = await ensureBackupFolder();
+  const drive = await _getDrive();
+  const existing = await _findChild({
+    parentId: folder.id,
+    name: BACKUP_FILE_NAME,
+  });
+  const media = { mimeType, body };
+  if (existing) {
+    const { data } = await drive.files.update({
+      fileId: existing.id,
+      media,
+      fields: FILE_FIELDS,
+    });
+    return { file: mapFile(data), folder, overwritten: true };
+  }
+  const { data } = await drive.files.create({
+    requestBody: { name: BACKUP_FILE_NAME, parents: [folder.id] },
+    media,
+    fields: FILE_FIELDS,
+  });
+  return { file: mapFile(data), folder, overwritten: false };
+}
+
+async function findBackupFile() {
+  const folder = await ensureBackupFolder();
+  const existing = await _findChild({
+    parentId: folder.id,
+    name: BACKUP_FILE_NAME,
+  });
+  if (!existing) return { folder, file: null };
+  return { folder, file: mapFile(existing) };
 }
 
 async function getFileMeta(fileId) {
@@ -304,9 +391,14 @@ async function fetchThumbnail(fileId, size = 320) {
 
 module.exports = {
   FOLDER_ID,
+  BACKUP_FOLDER_NAME,
+  BACKUP_FILE_NAME,
   isDriveAvailable,
   getAccessToken,
   listFiles,
+  ensureBackupFolder,
+  upsertBackupFile,
+  findBackupFile,
   getQuota,
   getFileMeta,
   uploadStream,

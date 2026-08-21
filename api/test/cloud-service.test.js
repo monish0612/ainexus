@@ -18,6 +18,9 @@ test('cloud-service exposes the expected proxy API', () => {
     'deleteFile',
     'setStar',
     'fetchThumbnail',
+    'ensureBackupFolder',
+    'upsertBackupFile',
+    'findBackupFile',
   ]) {
     assert.strictEqual(typeof cloud[fn], 'function', `${fn} should be a function`);
   }
@@ -55,4 +58,9 @@ test('getAccessToken rejects clearly when Drive is not configured', async () => 
 
 test('default folder id matches the Android app', () => {
   assert.strictEqual(cloud.FOLDER_ID, '1ybi-QMnDHDSFLXiRQjFacrJ7uLGmFX13');
+});
+
+test('backup folder and rolling file names are exported', () => {
+  assert.strictEqual(cloud.BACKUP_FOLDER_NAME, 'AI Nexus Backups');
+  assert.strictEqual(cloud.BACKUP_FILE_NAME, 'nexus-backup.json');
 });

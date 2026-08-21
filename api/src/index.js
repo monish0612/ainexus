@@ -5876,6 +5876,35 @@ cloudRouter.get('/stats/history', async (req, res) => {
 // Token broker — hands a *trusted* (already requireApp-authenticated) client a
 // short-lived Drive access token so the Android app can talk to Drive directly
 // WITHOUT ever embedding the service-account private key in the APK.
+const backupService = require('./backup-service');
+
+cloudRouter.get('/backup', (_req, res) => {
+  res.setHeader('Cache-Control', 'no-store');
+  res.json(backupService.getState());
+});
+
+cloudRouter.post('/backup', async (_req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const result = await backupService.runBackup(pool, { reason: 'manual' });
+    res.json(result);
+  } catch (err) {
+    tg.e('Backup', `manual run failed: ${err.message}`, err);
+    next(err);
+  }
+});
+
+cloudRouter.post('/backup/restore', async (_req, res, next) => {
+  if (!ensureDrive(res)) return;
+  try {
+    const result = await backupService.restoreFromDrive(pool);
+    res.json(result);
+  } catch (err) {
+    tg.e('Backup', `restore failed: ${err.message}`, err);
+    next(err);
+  }
+});
+
 cloudRouter.get('/token', async (_req, res, next) => {
   if (!ensureDrive(res)) return;
   try {
@@ -6738,6 +6767,8 @@ async function _initTablesWithRetry(maxRetries = 3) {
       deepExtractFn: deepExtractContent,
       ensureTablesFn: initTables,
     });
+
+    backupService.startScheduler(pool);
 
     // ── Start X Feed scheduler (8 AM + 9 PM IST daily digest) ───
     await startXFeedScheduler(pool);
