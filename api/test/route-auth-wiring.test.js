@@ -100,3 +100,9 @@ test('app-auth helpers are imported into index.js', () => {
     assert.ok(SRC.includes(fn), `index.js should use ${fn}`);
   }
 });
+
+test('global API limiter skips live stats even under a /nexusai prefix', () => {
+  assert.match(SRC, /require\('\.\/rate-limit-skip'\)/);
+  assert.match(SRC, /skip:\s*skipGlobalApiRateLimit/);
+  assert.match(SRC, /apiLimiter = rateLimit\(\{[\s\S]*?max:\s*180/);
+});

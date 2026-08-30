@@ -140,26 +140,17 @@ app.use(cors({ origin: process.env.CORS_ORIGIN || '*' }));
 app.use(express.json({ limit: '10mb' }));
 
 const rateLimit = require('express-rate-limit');
+const { skipGlobalApiRateLimit } = require('./rate-limit-skip');
 const apiLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 120,
+  // Phone + web + news can sit on one IP. 1 Hz stats are skipped below; 180
+  // leaves room for article follow-up without a 32ms 429 from this limiter.
+  max: 180,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later' },
   keyGenerator: (req) => req.ip || req.headers['x-forwarded-for'] || 'unknown',
-  // A single large file becomes many sequential chunk PUTs; exempt the
-  // resumable-upload subtree so big uploads don't trip the per-minute cap.
-  skip: (req) => {
-    const u = req.originalUrl || req.url || '';
-    if (/\/api\/v1\/cloud\/upload\/resumable\//.test(u)
-      || /\/api\/v1\/cloud\/nas\/upload\/resumable\//.test(u)) {
-      return true;
-    }
-    // 1 Hz live gauges share this process with news/files. A 120/min budget must
-    // not freeze the dashboard because something else was also open.
-    return req.method === 'GET'
-      && /\/api\/v1\/cloud\/stats(\/history)?(\?|$)/.test(u);
-  },
+  skip: skipGlobalApiRateLimit,
 });
 app.use('/api/', apiLimiter);
 
