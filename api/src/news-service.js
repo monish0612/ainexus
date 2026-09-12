@@ -1187,6 +1187,18 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     ],
   );
 
+  try {
+    require('./narration-client').enqueueFromIngest({
+      articleId: id,
+      title: finalTitle,
+      category: feed.app_category || 'Technology',
+      source,
+      text: contentText,
+    });
+  } catch (narErr) {
+    tg.w('NARRATION/ingest', `hook failed: ${narErr.message}`);
+  }
+
   return true;
 }
 

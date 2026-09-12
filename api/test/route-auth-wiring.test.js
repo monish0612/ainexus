@@ -37,6 +37,7 @@ const PROTECTED = [
   'data-reset',
   'sync',
   'profile',
+  'narration',
 ];
 
 for (const name of PROTECTED) {

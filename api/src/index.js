@@ -1773,6 +1773,9 @@ newsRouter.get('/x-feed/status', async (_req, res, next) => {
 
 app.use('/api/v1/news', requireApp, newsRouter);
 
+const { buildNarrationRouter } = require('./narration-proxy');
+app.use('/api/v1/narration', requireApp, buildNarrationRouter(express, pool));
+
 // ═══════════════════════════════════════════════════════════════
 //  ROUTES — AI  /api/v1/ai
 // ═══════════════════════════════════════════════════════════════

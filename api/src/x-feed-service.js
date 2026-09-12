@@ -326,6 +326,18 @@ async function insertDigestArticle({ handle, dateStr, slot, title, excerpt, cate
     ],
   );
 
+  try {
+    require('./narration-client').enqueueFromIngest({
+      articleId,
+      title,
+      category,
+      source,
+      text: summaryMarkdown || excerpt,
+    });
+  } catch (narErr) {
+    tg.w('NARRATION/ingest', `x-feed hook failed: ${narErr.message}`);
+  }
+
   await _pool.query('UPDATE news_articles SET is_featured = FALSE WHERE is_featured = TRUE');
   await _pool.query('UPDATE news_articles SET is_featured = TRUE WHERE id = $1', [articleId]);
   await incrementArticleCount(handle);
