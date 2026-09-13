@@ -1520,6 +1520,7 @@ function mapArticleRow(row) {
 }
 
 const newsRouter = express.Router();
+const { dropArticles } = require('./narration-client');
 
 newsRouter.get('/', async (_req, res, next) => {
   try {
@@ -1606,6 +1607,7 @@ newsRouter.post('/:id/read', async (req, res, next) => {
       );
     }
     await pool.query('DELETE FROM news_articles WHERE id = $1', [id]);
+    dropArticles([id]);
     res.json({ deleted: true, id });
   } catch (err) {
     next(err);
@@ -1644,9 +1646,10 @@ newsRouter.post('/mark-all-read', async (req, res, next) => {
       [ids],
     );
     const result = await pool.query(
-      'DELETE FROM news_articles WHERE id = ANY($1::text[]) AND saved = FALSE',
+      'DELETE FROM news_articles WHERE id = ANY($1::text[]) AND saved = FALSE RETURNING id',
       [ids],
     );
+    dropArticles(result.rows.map((r) => r.id));
     // i-level so the daily Telegram digest shows when the catch-up clear-out
     // fires in production. Saved-row protection is surfaced explicitly
     // (requested - deleted = saved-or-missing rows).
@@ -1678,7 +1681,8 @@ newsRouter.post('/nuke', async (_req, res, next) => {
        SELECT guid FROM news_articles WHERE guid IS NOT NULL
        ON CONFLICT (guid) DO NOTHING`,
     );
-    const result = await pool.query('DELETE FROM news_articles');
+    const result = await pool.query('DELETE FROM news_articles RETURNING id');
+    dropArticles(result.rows.map((r) => r.id));
     tg.w(
       'News/nuke',
       `☢️ deleted ALL ${result.rowCount} article(s) incl. saved ${Date.now() - _t0}ms`,
@@ -1694,8 +1698,9 @@ newsRouter.post('/nuke', async (_req, res, next) => {
 newsRouter.delete('/cleanup-mock', async (_req, res, next) => {
   try {
     const result = await pool.query(
-      `DELETE FROM news_articles WHERE (image = '' OR image IS NULL) AND (summary_markdown = '' OR summary_markdown IS NULL)`,
+      `DELETE FROM news_articles WHERE (image = '' OR image IS NULL) AND (summary_markdown = '' OR summary_markdown IS NULL) RETURNING id`,
     );
+    dropArticles(result.rows.map((r) => r.id));
     res.json({ deleted: result.rowCount });
   } catch (err) {
     next(err);
@@ -1710,8 +1715,10 @@ newsRouter.post('/clear-fallbacks', async (_req, res, next) => {
          AND (summary_markdown LIKE '# %\n\n## Article Preview%'
               OR summary_markdown LIKE '%<!-- summary-unavailable -->%'
               OR summary_markdown IS NULL
-              OR LENGTH(summary_markdown) < 200)`,
+              OR LENGTH(summary_markdown) < 200)
+       RETURNING id`,
     );
+    dropArticles(result.rows.map((r) => r.id));
     res.json({ deleted: result.rowCount, message: 'Fallback articles cleared. Trigger /refresh to re-fetch with LLM summaries.' });
   } catch (err) {
     next(err);
@@ -1721,7 +1728,8 @@ newsRouter.post('/clear-fallbacks', async (_req, res, next) => {
 newsRouter.post('/force-resync', async (_req, res, next) => {
   try {
     await pool.query('DELETE FROM deleted_guids');
-    const del = await pool.query('DELETE FROM news_articles WHERE saved = FALSE');
+    const del = await pool.query('DELETE FROM news_articles WHERE saved = FALSE RETURNING id');
+    dropArticles(del.rows.map((r) => r.id));
     const { syncNewsFeeds } = require('./news-service');
     syncNewsFeeds(pool, {
       reason: 'force-resync',
@@ -1747,6 +1755,7 @@ newsRouter.delete('/:id', async (req, res, next) => {
       );
     }
     await pool.query('DELETE FROM news_articles WHERE id = $1', [id]);
+    dropArticles([id]);
     pingBackup('article-delete');
     res.json({ ok: true });
   } catch (err) {

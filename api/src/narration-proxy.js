@@ -23,22 +23,19 @@ function buildNarrationRouter(express, pool) {
   router.post('/:id/ensure', async (req, res, next) => {
     try {
       const id = req.params.id;
-      let title = String(req.body?.title || '');
-      let category = String(req.body?.category || '');
-      let source = String(req.body?.source || '');
-      let text = String(req.body?.text || '');
-      if (!text.trim()) {
-        const result = await pool.query(
-          'SELECT title, category, source, summary_markdown FROM news_articles WHERE id = $1',
-          [id],
-        );
-        if (result.rows.length === 0) return res.status(404).json({ error: 'Article not found' });
-        const row = result.rows[0];
-        title = title || row.title || '';
-        category = category || row.category || '';
-        source = source || row.source || '';
-        text = row.summary_markdown || '';
+      const existing = await pool.query(
+        'SELECT title, category, source, summary_markdown FROM news_articles WHERE id = $1',
+        [id],
+      );
+      if (existing.rows.length === 0) {
+        return res.json({ status: 'deleted', reason: 'article_dropped', configured: enabled() });
       }
+      const row = existing.rows[0];
+      let title = String(req.body?.title || '') || row.title || '';
+      let category = String(req.body?.category || '') || row.category || '';
+      let source = String(req.body?.source || '') || row.source || '';
+      let text = String(req.body?.text || '');
+      if (!text.trim()) text = row.summary_markdown || '';
       if (!text.trim()) {
         return res.json({ status: 'fallback', reason: 'empty_text', configured: enabled() });
       }
@@ -72,7 +69,7 @@ function buildNarrationRouter(express, pool) {
     try {
       const rec = await jobStatus(req.params.id);
       const cacheKey = rec?.cache_key || rec?.cacheKey;
-      if (!cacheKey || rec.status === 'fallback') {
+      if (!cacheKey || rec.status === 'fallback' || rec.status === 'deleted') {
         return res.status(404).json({ error: 'audio not ready' });
       }
       await proxyAudio(req, res, cacheKey, { hd: req.query.hd === '1' });

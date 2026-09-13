@@ -1672,16 +1672,23 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
        WHERE saved = FALSE AND read = TRUE AND guid IS NOT NULL
        ON CONFLICT (guid) DO NOTHING`,
     );
-    const { rowCount: purged } = await pool.query(
+    const purgedResult = await pool.query(
       `DELETE FROM news_articles
        WHERE saved = FALSE
          AND (
            read = TRUE
            OR (published_at IS NOT NULL AND published_at < $1)
            OR (published_at IS NULL AND created_at < $1)
-         )`,
+         )
+       RETURNING id`,
       [cutoffDate.toISOString()],
     );
+    const purged = purgedResult.rowCount;
+    try {
+      require('./narration-client').dropArticles(purgedResult.rows.map((r) => r.id));
+    } catch (narErr) {
+      tg.w('NARRATION/drop', `purge drop failed: ${narErr.message}`);
+    }
 
     // mark latest unread article as featured
     await pool.query('UPDATE news_articles SET is_featured = FALSE WHERE is_featured = TRUE');

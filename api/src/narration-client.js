@@ -82,7 +82,9 @@ function enqueueFromIngest({ articleId, title, category, source, text }) {
 
 async function ensureJob(payload) {
   if (!enabled()) return { status: 'fallback', reason: 'unconfigured' };
-  return postJson('/v1/jobs', payload, { timeoutMs: 8000 });
+  // `force` lets a still-existing article recover from a leftover listen-complete
+  // tombstone. Ingest enqueue must NOT set force — dropped ids stay dropped.
+  return postJson('/v1/jobs', { ...payload, force: true }, { timeoutMs: 8000 });
 }
 
 async function jobStatus(articleId) {
@@ -94,6 +96,17 @@ async function jobStatus(articleId) {
 async function completeListen({ cacheKey, articleId }) {
   if (!enabled()) return { deleted: false, skipped: true };
   return postJson('/v1/complete', { cache_key: cacheKey, article_id: articleId });
+}
+
+function dropArticles(ids) {
+  if (!enabled()) return;
+  const unique = [...new Set((ids || []).map((id) => String(id || '').trim()).filter(Boolean))];
+  if (!unique.length) return;
+  setImmediate(() => {
+    postJson('/v1/drop', { article_ids: unique }, { timeoutMs: 60000 }).catch((err) => {
+      tg.w('NARRATION/drop', `drop failed ${unique.length} ids: ${err.message}`.slice(0, 180));
+    });
+  });
 }
 
 async function proxyAudio(req, res, cacheKey, { hd = false } = {}) {
@@ -133,5 +146,6 @@ module.exports = {
   ensureJob,
   jobStatus,
   completeListen,
+  dropArticles,
   proxyAudio,
 };
