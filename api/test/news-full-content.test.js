@@ -26,6 +26,7 @@ const {
   appendSourceLink,
   looksPreformatted,
   collapseBlanksPreservingCode,
+  shouldPreferExtractedOverRss,
 } = require('../src/news-service');
 
 // ─── splitParagraphs ───────────────────────────────────────────
@@ -346,6 +347,20 @@ test('buildFullContentExcerpt: uses ONLY first paragraph when multiple are prese
   const out = buildFullContentExcerpt(content);
   assert.equal(out, 'First short lead paragraph.');
   assert.equal(out.includes('Second'), false);
+});
+
+test('buildFullContentExcerpt: skips a leading code fence and uses first prose', () => {
+  const content = '```python\nimport argparse\nPATTERN = r"(?i)^refund"\n```\n\nPicture a support inbox for a bank. Every message needs a category.\n\nSecond paragraph.';
+  const out = buildFullContentExcerpt(content);
+  assert.ok(out.includes('Picture a support inbox'));
+  assert.equal(out.includes('import argparse'), false);
+});
+
+test('shouldPreferExtractedOverRss: live essay beats a longer gist dump', () => {
+  const gist = '```python\n' + 'x = 1\n'.repeat(4000) + '```';
+  const essay = 'Picture a support inbox for a bank. '.repeat(20);
+  assert.equal(shouldPreferExtractedOverRss(essay, gist), true);
+  assert.equal(shouldPreferExtractedOverRss(gist, essay), false);
 });
 
 // ─── appendSourceLink (regression coverage) ─────────────────────

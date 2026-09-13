@@ -26,6 +26,9 @@ const {
   extractDateFromHtml,
   htmlToRichMarkdown,
   visibleTextLen,
+  proseVisibleLen,
+  dropOversizedCodeFences,
+  isMostlyFencedCode,
   canonicalArticleUrl,
   hackernoonTechbeatDigestCandidates,
   isHackernoonStoryPermalink,
@@ -330,6 +333,85 @@ async function maybeRepairThinNewsTitle(pool, row, item, feed) {
   }
 }
 
+function needsCodeDumpBodyRepair(md) {
+  const text = String(md || '');
+  if (!text) return false;
+  const cleaned = dropOversizedCodeFences(text);
+  const dropped = visibleTextLen(text) - visibleTextLen(cleaned);
+  if (dropped > 5000) return true;
+  if (isMostlyFencedCode(text) && proseVisibleLen(text) < 1500) return true;
+  if (text.includes('```') && proseVisibleLen(text) < 400) return true;
+  return false;
+}
+
+async function maybeRepairCodeDumpBody(pool, row, item, feed) {
+  if (!row?.id || feed?.skip_summary !== true) return false;
+  const url = item?.link || row.original_url;
+  if (!url) return false;
+  if (!needsCodeDumpBodyRepair(row.summary_markdown)) return false;
+  try {
+    const md = String(row.summary_markdown || '');
+    const cleaned = dropOversizedCodeFences(md);
+    if (proseVisibleLen(cleaned) >= 400 && !isMostlyFencedCode(cleaned)) {
+      const source = feed.name || row.source || feed.id;
+      const summary = buildFullContentMarkdown({ content: cleaned, url, source });
+      const excerpt = buildFullContentExcerpt(cleaned);
+      await pool.query(
+        `UPDATE news_articles SET summary_markdown = $1, excerpt = $2, updated_at = NOW() WHERE id = $3`,
+        [summary, excerpt, row.id],
+      );
+      console.log(`[NEWS] Repaired code-dump body ${row.id} (dropped oversized fences)`);
+      return true;
+    }
+    const extracted = await cleanExtract(url, { logTag: `NEWS/${feed.id || 'repair'}/body-repair` });
+    const next = dropOversizedCodeFences(extracted.content || '');
+    if (proseVisibleLen(next) < 400 || isMostlyFencedCode(next)) return false;
+    const source = feed.name || row.source || feed.id;
+    const summary = buildFullContentMarkdown({ content: next, url, source });
+    const excerpt = buildFullContentExcerpt(next);
+    await pool.query(
+      `UPDATE news_articles SET summary_markdown = $1, excerpt = $2, updated_at = NOW() WHERE id = $3`,
+      [summary, excerpt, row.id],
+    );
+    console.log(`[NEWS] Repaired code-dump body ${row.id}`);
+    return true;
+  } catch (err) {
+    console.warn(`[NEWS] body repair skipped for ${row.id}: ${(err.message || '').slice(0, 80)}`);
+    return false;
+  }
+}
+
+async function repairCodeDumpNewsBodies(pool, feeds) {
+  const targets = (feeds || []).filter((f) => f.skip_summary === true);
+  if (!targets.length) return 0;
+  const names = targets.map((f) => f.name || f.id);
+  let rows = [];
+  try {
+    const r = await pool.query(
+      `SELECT id, title, summary_markdown, original_url, source
+         FROM news_articles
+        WHERE source = ANY($1)
+          AND COALESCE(published_at, created_at) > NOW() - INTERVAL '21 days'
+        ORDER BY COALESCE(published_at, created_at) DESC
+        LIMIT 24`,
+      [names],
+    );
+    rows = r.rows;
+  } catch (e) {
+    console.warn(`[NEWS] body-repair scan skipped: ${(e.message || '').slice(0, 80)}`);
+    return 0;
+  }
+  let repaired = 0;
+  for (const row of rows) {
+    if (repaired >= 6) break;
+    const feed = targets.find((f) => (f.name || f.id) === row.source) || targets[0];
+    const ok = await maybeRepairCodeDumpBody(pool, row, { link: row.original_url }, feed);
+    if (ok) repaired += 1;
+  }
+  if (repaired) console.log(`[NEWS] Repaired ${repaired} code-dump article bodies`);
+  return repaired;
+}
+
 function movieTitleKey(title) {
   return String(title || '')
     .toLowerCase()
@@ -601,13 +683,40 @@ function buildFullContentMarkdown({ content, url, source }) {
 }
 
 function buildFullContentExcerpt(content) {
-  const paras = splitParagraphs(content);
-  const src = (paras[0] || content || '').replace(/\s+/g, ' ').trim();
+  const stripped = String(content || '')
+    .replace(/```[\s\S]*?```/g, '\n\n')
+    .replace(/^#{1,3}\s+.+$/gm, '')
+    .replace(/^>\s?.*$/gm, '')
+    .trim();
+  const paras = splitParagraphs(stripped).filter((p) => {
+    const t = p.replace(/\s+/g, ' ').trim();
+    if (!t) return false;
+    if (/read original article/i.test(t)) return false;
+    if (/^authors?:/i.test(t)) return false;
+    return true;
+  });
+  const src = (paras[0] || stripped || '').replace(/\s+/g, ' ').trim();
   if (!src) return 'New article available.';
   if (src.length <= 240) return src;
   const t = src.slice(0, 237);
   const sp = t.lastIndexOf(' ');
   return `${(sp > 140 ? t.slice(0, sp) : t).trim()}…`;
+}
+
+/**
+ * RSS `content:encoded` for Medium/TDS often ships a GitHub gist that is
+ * longer than the live essay. Prefer the live extract when it actually
+ * has the story, not when it merely has more characters.
+ */
+function shouldPreferExtractedOverRss(extracted, rss) {
+  const extractedMd = dropOversizedCodeFences(extracted || '');
+  const rssMd = dropOversizedCodeFences(rss || '');
+  const extractedText = visibleTextLen(extractedMd);
+  const rssText = visibleTextLen(rssMd);
+  if (extractedText < 200) return false;
+  if (isMostlyFencedCode(rssMd) && !isMostlyFencedCode(extractedMd)) return true;
+  if (isMostlyFencedCode(extractedMd) && proseVisibleLen(rssMd) >= 200) return false;
+  return extractedText >= rssText;
 }
 
 // Sentinel emitted when the LLM call could not produce a summary for an
@@ -895,9 +1004,10 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
 }
 
 async function processItem({ pool, item, feed, config, settings, summaryLimiter, completeFn, fallbackCompleteFn, deepExtractFn, liteModel, xgrokLiteModel }) {
-  const existing = await pool.query('SELECT id, title FROM news_articles WHERE guid = $1', [item.guid]);
+  const existing = await pool.query('SELECT id, title, summary_markdown, original_url FROM news_articles WHERE guid = $1', [item.guid]);
   if (existing.rows.length > 0) {
     await maybeRepairThinNewsTitle(pool, existing.rows[0], item, feed);
+    await maybeRepairCodeDumpBody(pool, existing.rows[0], item, feed);
     return false;
   }
 
@@ -914,7 +1024,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
   if (item.link) {
     const canon = canonicalArticleUrl(item.link) || item.link;
     const urlDup = await pool.query(
-      `SELECT id, title FROM news_articles
+      `SELECT id, title, summary_markdown, original_url FROM news_articles
         WHERE original_url = $1 OR original_url = $2 OR original_url = $3
            OR original_url LIKE $4
         LIMIT 1`,
@@ -922,6 +1032,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     );
     if (urlDup.rows.length > 0) {
       await maybeRepairThinNewsTitle(pool, urlDup.rows[0], item, feed);
+      await maybeRepairCodeDumpBody(pool, urlDup.rows[0], item, feed);
       return false;
     }
   }
@@ -961,15 +1072,11 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
     try {
       const extracted = await cleanExtract(item.link, { logTag: _logTag });
       if (!cardImage && extracted.image) cardImage = extracted.image;
-      // Prefer the live-page extraction ONLY when it actually has MORE
-      // visible text than the rich RSS body we already hold. This stops a
-      // thin page (Substack cover-image + paywall teaser) from clobbering a
-      // full `content:encoded` body, while still upgrading feeds whose RSS
-      // ships only a teaser (Lensmen, TechCrunch, Towards Data Science).
-      const extractedText = visibleTextLen(extracted.content || '');
-      if (extracted.content && extractedText >= 200 && extractedText >= visibleTextLen(contentText)) {
+      const extractedContent = dropOversizedCodeFences(extracted.content || '');
+      contentText = dropOversizedCodeFences(contentText);
+      if (extractedContent && shouldPreferExtractedOverRss(extractedContent, contentText)) {
         const rssLen = contentText.length;
-        contentText = extracted.content;
+        contentText = extractedContent;
         if (extracted.title) extractedTitle = extracted.title;
         // Late-discovered publication date — used by feeds whose RSS
         // doesn't carry pubDate (Lensmen) and as a sanity check for the
@@ -1578,6 +1685,8 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
        )`,
     );
 
+    await repairCodeDumpNewsBodies(pool, feeds);
+
     const syncElapsed = Date.now() - syncT0;
     lastSyncAt = new Date().toISOString();
     lastSyncError = null;
@@ -1671,6 +1780,8 @@ module.exports = {
   appendSourceLink,
   looksPreformatted,
   collapseBlanksPreservingCode,
+  shouldPreferExtractedOverRss,
+  needsCodeDumpBodyRepair,
   parseFeedItems,
   resolveConfigPath,
   filterItemsByLinkPattern,

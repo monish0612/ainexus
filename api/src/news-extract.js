@@ -58,6 +58,18 @@ const DEFAULT_HEADERS = {
   'Sec-Fetch-User': '?1',
 };
 
+// Medium custom domains (Towards Data Science, etc.). The essay lives in
+// `storyContent`; RSS `content:encoded` often inlines a GitHub gist as one
+// giant <pre>, and the generic density heuristic then scores that dump
+// above the actual article because a gist has almost no links.
+const MEDIUM_SELECTORS = [
+  '[data-testid="storyContent"]',
+  'section[data-field="body"]',
+  'section.meteredContent',
+  'article',
+  '[itemprop="articleBody"]',
+];
+
 // Site-specific main-content selectors. Order matters — the first match
 // that yields ≥ MIN_BODY_CHARS wins. We deliberately list multiple
 // fallbacks per host because WordPress themes (Lensmen) and bespoke CMSes
@@ -139,6 +151,15 @@ const SITE_SELECTORS = {
     '[itemprop="articleBody"]',
     'article',
   ],
+  'towardsdatascience.com': MEDIUM_SELECTORS,
+  'medium.com': MEDIUM_SELECTORS,
+  'marktechpost.com': [
+    'div.entry-content',
+    'div.td-post-content',
+    'article .entry-content',
+    'div.post-content',
+    'article',
+  ],
 };
 
 const BOILERPLATE_SELECTORS = [
@@ -161,6 +182,11 @@ const BOILERPLATE_SELECTORS = [
   '[class*="modal" i]', '[class*="banner" i]',
   // figure captions can survive but rarely add value to TTS / markdown
   'figure figcaption', '.wp-caption-text',
+  // GitHub gist shells (exact class — do NOT substring-match "gist",
+  // which would also hit "digest" widgets).
+  '.gist',
+  'iframe[src*="gist.github"]',
+  'script[src*="gist.github"]',
 ];
 
 const MIN_BODY_CHARS = 200; // a "good" main-content block must clear this
@@ -169,6 +195,8 @@ const MIN_BODY_CHARS = 200; // a "good" main-content block must clear this
 // paragraph boundary (see extractCleanArticle) so image/code markdown is
 // never cut mid-token.
 const MAX_BODY_CHARS = 45000;
+// Inline samples stay; pasted GitHub gists / dataset dumps do not.
+const MAX_CODE_FENCE_CHARS = 8000;
 
 // ─── Helpers ────────────────────────────────────────────────────────────
 
@@ -308,6 +336,46 @@ function visibleTextLen(md) {
     .trim().length;
 }
 
+function stripFencedCode(md) {
+  return String(md || '').replace(/```[\s\S]*?```/g, '\n');
+}
+
+function proseVisibleLen(md) {
+  return visibleTextLen(stripFencedCode(md));
+}
+
+/**
+ * Drop pasted dataset dumps / GitHub gists while keeping short samples.
+ * A 28 KB BANKING77 dump will lose to this; an 80-line tutorial snippet
+ * will not.
+ */
+function dropOversizedCodeFences(md, maxFenceChars = MAX_CODE_FENCE_CHARS) {
+  const src = String(md || '');
+  if (!src.includes('```')) return src;
+  return src
+    .replace(/```[\s\S]*?```/g, (fence) => (
+      visibleTextLen(fence) > maxFenceChars ? '' : fence
+    ))
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+function isMostlyFencedCode(md) {
+  const total = visibleTextLen(md);
+  if (total < MIN_BODY_CHARS) return false;
+  const prose = proseVisibleLen(md);
+  return prose < MIN_BODY_CHARS || prose / total < 0.35;
+}
+
+function looksLikeBotBlockPage(html) {
+  const head = String(html || '').slice(0, 2500);
+  return (
+    /<title>\s*403\s*-?\s*Forbidden/i.test(head) ||
+    /<title>\s*Attention Required/i.test(head) ||
+    /cf-browser-verification|just a moment\.\.\./i.test(head)
+  );
+}
+
 /**
  * Walks a content root and emits RICH markdown — paragraphs, headings,
  * lists, blockquotes, fenced code (whitespace PRESERVED), and inline
@@ -429,7 +497,7 @@ function htmlToRichMarkdown(html, { baseUrl = '', maxChars = MAX_BODY_CHARS } = 
     return '';
   }
   const $root = $('body').length ? $('body') : $.root();
-  let md = _flattenMainBlock($, $root, baseUrl);
+  let md = dropOversizedCodeFences(_flattenMainBlock($, $root, baseUrl));
   if (maxChars > 0 && md.length > maxChars) {
     // Trim at a paragraph boundary so we never cut an image/code block in half.
     const cut = md.lastIndexOf('\n\n', maxChars);
@@ -503,8 +571,8 @@ function extractCleanArticle(html, url = '') {
   for (const sel of selectorsForUrl(url)) {
     const el = $(sel).first();
     if (el.length === 0) continue;
-    const flat = _flattenMainBlock($, el, url);
-    if (visibleTextLen(flat) >= MIN_BODY_CHARS) {
+    const flat = dropOversizedCodeFences(_flattenMainBlock($, el, url));
+    if (visibleTextLen(flat) >= MIN_BODY_CHARS && !isMostlyFencedCode(flat)) {
       content = flat;
       break;
     }
@@ -519,9 +587,13 @@ function extractCleanArticle(html, url = '') {
       const $el = $(el);
       // Skip obvious wrappers
       if ($el.find('article, main').length > 0) return;
-      const flat = _flattenMainBlock($, $el, url);
+      // A gist-only <pre> has huge text and ~0 links, so density would
+      // otherwise beat the essay. Require at least one paragraph.
+      if ($el.find('pre').length && $el.find('p').length === 0) return;
+      const flat = dropOversizedCodeFences(_flattenMainBlock($, $el, url));
       const textLen = visibleTextLen(flat);
       if (textLen < MIN_BODY_CHARS) return;
+      if (isMostlyFencedCode(flat)) return;
       // Density = visible-text length ÷ (link char count + 1) — penalises
       // link farms / nav menus that survived boilerplate stripping. Uses
       // text (not raw markdown) so long image URLs don't inflate the score.
@@ -535,7 +607,7 @@ function extractCleanArticle(html, url = '') {
     content = bestText;
   }
 
-  content = preferStructuredBody(jsonLdBody, content);
+  content = preferStructuredBody(jsonLdBody, dropOversizedCodeFences(content));
 
   if (hostOf(url) === 'hackernoon.com') {
     content = tidyHackernoonMarkdown(content);
@@ -833,20 +905,26 @@ function _jsonLdArticleBodyToMarkdown($) {
  * `.story-body .prose`).
  */
 function preferStructuredBody(jsonLdBody, htmlContent) {
-  const jsonLen = visibleTextLen(jsonLdBody);
-  const htmlLen = visibleTextLen(htmlContent);
-  if (jsonLen < MIN_BODY_CHARS) return htmlContent || '';
-  if (htmlLen < MIN_BODY_CHARS) return jsonLdBody;
+  const html = dropOversizedCodeFences(htmlContent || '');
+  const json = jsonLdBody || '';
+  const jsonLen = visibleTextLen(json);
+  const htmlLen = visibleTextLen(html);
+  const htmlProse = proseVisibleLen(html);
+  const jsonProse = proseVisibleLen(json);
+  if (jsonProse < MIN_BODY_CHARS) return html || '';
+  if (htmlProse < MIN_BODY_CHARS) return json;
+  // A gist dump is "rich" (it has ```) but it is not the article.
+  if (isMostlyFencedCode(html) && jsonProse >= MIN_BODY_CHARS) return json;
   // Rich HTML (images, fenced code, headings) is always better for the
   // Flutter reader than JSON-LD plaintext, even when JSON-LD is a bit
   // longer. HackerNoon `.prose` often loses this comparison by ~20%.
   const htmlIsRich =
-    /!\[[^\]]*\]\(/.test(htmlContent || '') ||
-    /(^|\n)```/.test(htmlContent || '') ||
-    /(^|\n)#{1,3}\s/.test(htmlContent || '');
-  if (htmlIsRich) return htmlContent;
-  if (jsonLen > htmlLen * 1.25) return jsonLdBody;
-  return htmlContent;
+    /!\[[^\]]*\]\(/.test(html) ||
+    (/(^|\n)```/.test(html) && !isMostlyFencedCode(html)) ||
+    /(^|\n)#{1,3}\s/.test(html);
+  if (htmlIsRich) return html;
+  if (jsonLen > htmlLen * 1.25) return json;
+  return html;
 }
 
 function decodeBasicEntities(s) {
@@ -1182,6 +1260,11 @@ async function fetchHtml(url, { timeoutMs = 15_000, retries = 2, logTag = 'NEWS/
         continue;
       }
       const html = await res.text();
+      if (looksLikeBotBlockPage(html)) {
+        tg.d(logTag, `fetchHtml HTTP ${res.status} WAF/block page — escalating to curl`);
+        escalateToCurl = true;
+        break;
+      }
       if (attempt > 0) tg.d(logTag, `fetchHtml ✓ ${Date.now() - t0}ms (after ${attempt} retr${attempt === 1 ? 'y' : 'ies'})`);
       return html;
     } catch (e) {
@@ -1248,6 +1331,9 @@ async function _fetchHtmlViaCurl(url, { timeoutMs, logTag }) {
     const html = stdout || '';
     tg.d(logTag, `curl ✓ ${Date.now() - t0}ms ${html.length}ch`);
     if (!html) throw new Error('curl returned empty body');
+    if (looksLikeBotBlockPage(html)) {
+      throw new Error('curl returned a bot-block page');
+    }
     return html;
   } catch (e) {
     if (e.code === 'ENOENT') {
@@ -1378,6 +1464,10 @@ module.exports = {
   buildReviewMetaMarkdown,
   htmlToRichMarkdown,
   visibleTextLen,
+  proseVisibleLen,
+  dropOversizedCodeFences,
+  isMostlyFencedCode,
+  looksLikeBotBlockPage,
   canonicalArticleUrl,
   toiMovieAmpUrl,
   preferStructuredBody,

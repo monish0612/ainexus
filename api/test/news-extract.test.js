@@ -36,6 +36,11 @@ const {
   selectorsForUrl,
   htmlToRichMarkdown,
   visibleTextLen,
+  proseVisibleLen,
+  dropOversizedCodeFences,
+  isMostlyFencedCode,
+  looksLikeBotBlockPage,
+  preferStructuredBody,
   canonicalArticleUrl,
   toiMovieAmpUrl,
 } = require('../src/news-extract');
@@ -228,6 +233,49 @@ describe('extractCleanArticle', () => {
     assert.ok(!r.content.includes('Share on Twitter'));
     assert.ok(!r.content.includes('Read more articles'));
     assert.ok(!r.content.includes('User comment'));
+  });
+
+  test('TDS/Medium: keeps the essay and drops a giant gist <pre>', () => {
+    const gist = Array.from({ length: 450 }, (_, i) => `BANKING77_EXAMPLE_${i} = "refund ${i}"`).join('\n');
+    const html = `
+      <html><head>
+        <meta property="og:title" content="One Capital Letter Was Silently Breaking My AI Support Bot" />
+      </head><body>
+        <article>
+          <section data-testid="storyContent">
+            <p>Picture a support inbox for a bank. Every message that comes in needs to be sorted into a category, a lost card, a refund request, a wrong charge, and sent to the right team.</p>
+            <p>Now picture that sorting job handed to an AI model instead of a person. The model reads the message and hands back a short note in a fixed format so the rest of the program can read it.</p>
+            <p>That is the problem this article is about: a model can sound correct to a person and still be wrong for the software that uses its answer.</p>
+            <pre class="language-python">${gist}</pre>
+          </section>
+        </article>
+        <div class="gist"><pre>${gist}</pre></div>
+      </body></html>`;
+    const r = extractCleanArticle(
+      html,
+      'https://towardsdatascience.com/one-capital-letter-was-silently-breaking-my-ai-support-bot/',
+    );
+    assert.ok(r.content.includes('Picture a support inbox'), r.content.slice(0, 240));
+    assert.equal(
+      r.content.includes('BANKING77_EXAMPLE_200'),
+      false,
+      'giant gist must not replace the article',
+    );
+  });
+
+  test('density heuristic skips a pre-only dump in favor of paragraph story', () => {
+    const gist = Array.from({ length: 450 }, (_, i) => `CODE_LINE_${i} = ${i}`).join('\n');
+    const html = `
+      <html><body>
+        <div id="story">
+          <p>Picture a support inbox for a bank. Every message that comes in needs to be sorted into a category and sent to the right team with a clear owner.</p>
+          <p>Now picture that sorting job handed to an AI model instead of a person who can notice a misspelled label in the reply payload.</p>
+        </div>
+        <div id="gist-embed"><pre>${gist}</pre></div>
+      </body></html>`;
+    const r = extractCleanArticle(html, 'https://example-blog.test/capital-letter/');
+    assert.ok(r.content.includes('Picture a support inbox'), r.content.slice(0, 240));
+    assert.equal(r.content.includes('CODE_LINE_200'), false);
   });
 
   test('emits headings, lists, blockquotes in markdown form', () => {
@@ -696,6 +744,31 @@ describe('extractCleanArticle — rich images & code', () => {
   });
 });
 
+describe('code-dump guards', () => {
+  test('isMostlyFencedCode / dropOversizedCodeFences', () => {
+    const dump = '```python\n' + 'x = 1\n'.repeat(4000) + '```';
+    assert.equal(isMostlyFencedCode(dump), true);
+    assert.equal(dropOversizedCodeFences(dump), '');
+    const sample = 'Lead paragraph about the function.\n\n```python\ndef add(a, b):\n    return a + b\n```\n\nClosing thoughts.';
+    assert.equal(isMostlyFencedCode(sample), false);
+    assert.ok(dropOversizedCodeFences(sample).includes('def add'));
+    assert.ok(proseVisibleLen(dump) < 50);
+  });
+
+  test('preferStructuredBody: gist dump loses to JSON-LD prose', () => {
+    const dump = '```python\n' + 'x = 1\n'.repeat(4000) + '```';
+    const json = 'Picture a support inbox for a bank. '.repeat(12);
+    const picked = preferStructuredBody(json, dump);
+    assert.ok(picked.includes('support inbox'));
+    assert.equal(picked.includes('```python'), false);
+  });
+
+  test('looksLikeBotBlockPage catches WAF 200/403 shells', () => {
+    assert.equal(looksLikeBotBlockPage('<html><head><title>403 - Forbidden</title></head><body>no</body></html>'), true);
+    assert.equal(looksLikeBotBlockPage('<html><head><title>One Capital Letter</title></head><body><p>ok</p></body></html>'), false);
+  });
+});
+
 describe('htmlToRichMarkdown', () => {
   test('converts an RSS content:encoded fragment to rich markdown', () => {
     const html = `
@@ -770,6 +843,9 @@ describe('host helpers', () => {
     assert.ok(selectorsForUrl('https://www.onlykollywood.com/dc-movie-review/').includes('div.entry-content'));
     assert.ok(selectorsForUrl('https://timesofindia.indiatimes.com/entertainment/english/movie-reviews/mutiny/movie-review/1.cms').length > 0);
     assert.ok(selectorsForUrl('https://hackernoon.com/self-hosting-ai-models-on-a-raspberry-pi-5').includes('div.story-body div.prose'));
+    assert.ok(selectorsForUrl('https://towardsdatascience.com/one-capital-letter/').includes('[data-testid="storyContent"]'));
+    assert.ok(selectorsForUrl('https://medium.com/@user/slug').includes('article'));
+    assert.ok(selectorsForUrl('https://www.marktechpost.com/2026/09/12/swe-2/').includes('div.entry-content'));
     assert.equal(selectorsForUrl('https://random-blog.example/').length, 0);
   });
 });
@@ -797,3 +873,39 @@ describe('canonicalArticleUrl / toiMovieAmpUrl', () => {
     assert.equal(toiMovieAmpUrl('https://www.onlykollywood.com/dc-movie-review/'), '');
   });
 });
+
+describe('WAF / gist / digest edge cases', () => {
+  test('looksLikeBotBlockPage catches 403-title and Cloudflare interstitial', () => {
+    assert.equal(
+      looksLikeBotBlockPage('<html><head><title>403 - Forbidden</title></head><body>blocked</body></html>'),
+      true,
+    );
+    assert.equal(
+      looksLikeBotBlockPage('<html><head><title>Attention Required! | Cloudflare</title></head>'),
+      true,
+    );
+    assert.equal(
+      looksLikeBotBlockPage('<html><head><title>One Capital Letter</title></head><body><p>essay</p></body></html>'),
+      false,
+    );
+    assert.equal(looksLikeBotBlockPage(''), false);
+  });
+
+  test('class digest is kept, class gist is stripped', () => {
+    const html = `
+      <html><head><meta property="og:title" content="Weekly digest" /></head>
+      <body>
+        <article>
+          <div class="entry-content">
+            <p>${'Weekly digest of AI papers that actually shipped, with enough prose to pass the body-length floor. '.repeat(8)}</p>
+            <div class="digest-widget"><p>More digest notes for readers who want the roundup.</p></div>
+            <div class="gist"><pre>${'gistline\n'.repeat(40)}</pre></div>
+          </div>
+        </article>
+      </body></html>`;
+    const r = extractCleanArticle(html, 'https://www.marktechpost.com/weekly-digest/');
+    assert.ok(r.content.toLowerCase().includes('weekly digest of ai papers'), r.content.slice(0, 200));
+    assert.equal(r.content.includes('gistline'), false);
+  });
+});
+
