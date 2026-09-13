@@ -392,9 +392,17 @@ async function repairCodeDumpNewsBodies(pool, feeds) {
          FROM news_articles
         WHERE source = ANY($1)
           AND COALESCE(published_at, created_at) > NOW() - INTERVAL '21 days'
+          AND (
+            summary_markdown LIKE $2
+            OR summary_markdown ILIKE '%BANKING77%'
+            OR (
+              char_length(COALESCE(summary_markdown, '')) < 2000
+              AND position($3 in summary_markdown) > 0
+            )
+          )
         ORDER BY COALESCE(published_at, created_at) DESC
         LIMIT 24`,
-      [names],
+      [names, '```%', '```'],
     );
     rows = r.rows;
   } catch (e) {
@@ -403,7 +411,7 @@ async function repairCodeDumpNewsBodies(pool, feeds) {
   }
   let repaired = 0;
   for (const row of rows) {
-    if (repaired >= 6) break;
+    if (repaired >= 12) break;
     const feed = targets.find((f) => (f.name || f.id) === row.source) || targets[0];
     const ok = await maybeRepairCodeDumpBody(pool, row, { link: row.original_url }, feed);
     if (ok) repaired += 1;

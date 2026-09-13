@@ -97,6 +97,16 @@ describe('needsCodeDumpBodyRepair', () => {
     assert.equal(needsCodeDumpBodyRepair(''), false);
     assert.equal(needsCodeDumpBodyRepair(null), false);
   });
+
+  test('repair scan targets fence dumps, not the newest healthy essays', () => {
+    const src = require('node:fs').readFileSync(
+      require('node:path').join(__dirname, '../src/news-service.js'),
+      'utf8',
+    );
+    assert.match(src, /summary_markdown LIKE \$2/);
+    assert.match(src, /BANKING77/);
+    assert.match(src, /position\(\$3 in summary_markdown\)/);
+  });
 });
 
 describe('shouldPreferExtractedOverRss', () => {
