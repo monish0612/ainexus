@@ -10,7 +10,9 @@ const bcrypt = require('bcrypt');
 const { v4: uuidv4 } = require('uuid');
 const { z } = require('zod');
 const {
-  REPHRASE_PLATFORMS,
+  REPHRASE_ANSWER_PLATFORMS,
+  wrapUserText,
+  isModelRefusal,
   buildRephraseSystemPrompt,
   looksLikeReplyInsteadOfRephrase,
   REPHRASE_RETRY_NUDGE,
@@ -20,6 +22,7 @@ const {
   buildBatchArticleSummaryPrompt,
   SMART_PARSE_SYSTEM_PROMPT,
   buildSmartParseSystemPrompt,
+  WATCH_EXTRACT_SYSTEM_PROMPT,
   CATEGORIZE_SYSTEM_PROMPT,
   IMAGE_LENS_PROMPT,
   buildVisionExpertPrompt,
@@ -332,7 +335,7 @@ async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
 // emit a rich `{error: {code, message, model}}` envelope to the
 // client.
 
-async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048, jsonOutput = false }) {
+async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048, jsonOutput = false, thinking = false }) {
   // ── Path 1: direct Gemini ──────────────────────────────────
   //
   // Triggered when:
@@ -374,6 +377,7 @@ async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 204
           temperature,
           maxTokens,
           jsonOutput,
+          thinking,
         });
         if (i > 0) {
           tg.w(
@@ -739,6 +743,42 @@ const AI_REPHRASE_PLATFORM_META = {
   },
   forum: {
     guidance: 'online forum or community post, informative and engaging',
+    charLimit: null,
+  },
+  fix: {
+    guidance: 'fix grammar, spelling, and punctuation only',
+    charLimit: null,
+  },
+  improve: {
+    guidance: 'rewrite for clarity, flow, and coherence',
+    charLimit: null,
+  },
+  shorten: {
+    guidance: 'more concise while preserving core meaning',
+    charLimit: null,
+  },
+  expand: {
+    guidance: 'more detail without fabricating information',
+    charLimit: null,
+  },
+  formal: {
+    guidance: 'formal professional tone, same message shape',
+    charLimit: null,
+  },
+  emoji: {
+    guidance: 'add relevant emojis throughout the same message',
+    charLimit: null,
+  },
+  human: {
+    guidance: 'sound naturally human, drop AI clichés',
+    charLimit: null,
+  },
+  reply: {
+    guidance: 'contextual reply to the source message',
+    charLimit: null,
+  },
+  define: {
+    guidance: 'short dictionary meaning of the selected text',
     charLimit: null,
   },
 };
@@ -1808,11 +1848,13 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       model: pickedModel || undefined,
       messages: [
         { role: 'system', content: extraSystem ? `${systemPrompt}\n\n${extraSystem}` : systemPrompt },
-        { role: 'user', content: sourceText },
+        { role: 'user', content: wrapUserText(sourceText) },
       ],
       maxTokens: 800,
       // Lower temp → more faithful rewrites, fewer conversational replies.
       temperature: 0.35,
+      jsonOutput: true,
+      thinking: true,
     });
 
     let result = await runOnce(null);
@@ -1821,8 +1863,20 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
     );
 
+    if (rephrasedText && isModelRefusal(rephrasedText)) {
+      tg.w('AI/rephrase', `refusal detected — not returning model text (platform=${platformId})`);
+      return res.status(422).json({
+        error: {
+          code: 'REFUSAL',
+          message: 'Blocked — try another tone',
+        },
+      });
+    }
+
     // One-shot retry when the model answers instead of rephrasing.
-    if (rephrasedText && looksLikeReplyInsteadOfRephrase(sourceText, rephrasedText)) {
+    // reply/define are supposed to answer, so skip the detector there.
+    const skipReplyDetect = REPHRASE_ANSWER_PLATFORMS.has(platformId);
+    if (!skipReplyDetect && rephrasedText && looksLikeReplyInsteadOfRephrase(sourceText, rephrasedText)) {
       tg.w('AI/rephrase', `reply-shaped output detected — retrying once (platform=${platformId})`);
       result = await runOnce(REPHRASE_RETRY_NUDGE);
       parsed = parseJsonContent(result.content);
@@ -1837,6 +1891,16 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       } else {
         rephrasedText = retryText || sourceText;
       }
+    }
+
+    if (rephrasedText && isModelRefusal(rephrasedText)) {
+      tg.w('AI/rephrase', `refusal after retry — not returning model text (platform=${platformId})`);
+      return res.status(422).json({
+        error: {
+          code: 'REFUSAL',
+          message: 'Blocked — try another tone',
+        },
+      });
     }
 
     tg.i('AI/rephrase', `✓ model=${result.model_used} ${Date.now() - _t0}ms, platform=${platformId}`);
@@ -2655,6 +2719,68 @@ aiRouter.post('/smart-parse', async (req, res, next) => {
     });
   } catch (err) {
     tg.e('AI/smart-parse', `Failed ${Date.now() - _t0}ms`, err);
+    next(err);
+  }
+});
+
+// POST /api/v1/ai/watch-extract
+// Last-resort PDP extract for Price Watch when store adapters miss.
+// Pins Settings → Gemini Lite (`liteModel`). Never invents a price.
+const AIWatchExtractSchema = z.object({
+  url: z.string().min(8).max(2000),
+  excerpt: z.string().min(20).max(8000),
+  liteModel: z.string().max(200).optional(),
+});
+
+aiRouter.post('/watch-extract', async (req, res, next) => {
+  const _t0 = Date.now();
+  try {
+    const val = validate(AIWatchExtractSchema, req.body);
+    if (!val.ok) return res.status(400).json({ error: val.error });
+
+    const { url, excerpt } = val.data;
+    const pickedModel = _pickLiteLLMModel(val.data.liteModel, undefined);
+    tg.d('AI/watch-extract', `url="${url.slice(0, 80)}" excerpt=${excerpt.length} model=${pickedModel || '(default)'}`);
+
+    const result = await callLiteLLM({
+      model: pickedModel || undefined,
+      messages: [
+        { role: 'system', content: WATCH_EXTRACT_SYSTEM_PROMPT },
+        { role: 'user', content: `URL: ${url}\n\n${excerpt}` },
+      ],
+      temperature: 0,
+      maxTokens: 400,
+      jsonOutput: true,
+    });
+
+    let parsed;
+    try {
+      parsed = parseJsonContent(result.content);
+    } catch {
+      return res.status(422).json({ error: 'Failed to parse LLM response', raw: result.content });
+    }
+
+    const isProduct = parsed?.isProduct === true || parsed?.is_product === true;
+    const priceNum = typeof parsed?.price === 'number'
+      ? parsed.price
+      : parseFloat(parsed?.price);
+    const safePrice = isProduct && Number.isFinite(priceNum) && priceNum > 0 ? priceNum : 0;
+    const name = asString(parsed?.name || parsed?.title || '').trim();
+
+    tg.i('AI/watch-extract', `✓ model=${result.model_used} ${Date.now() - _t0}ms product=${isProduct} price=${safePrice}`);
+    res.json({
+      isProduct: Boolean(isProduct && safePrice > 0 && name),
+      name,
+      price: safePrice,
+      currency: asString(parsed?.currency || 'INR') || 'INR',
+      imageUrl: asString(parsed?.imageUrl || parsed?.image_url || ''),
+      availability: parsed?.availability || null,
+      confidence: typeof parsed?.confidence === 'number' ? parsed.confidence : 0,
+      model: result.model_used,
+      usage: result.usage,
+    });
+  } catch (err) {
+    tg.e('AI/watch-extract', `Failed ${Date.now() - _t0}ms`, err);
     next(err);
   }
 });

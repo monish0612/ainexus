@@ -48,6 +48,79 @@ const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const DEFAULT_TIMEOUT_MS = 30_000;
 const MAX_RETRIES = 2; // total attempts = MAX_RETRIES + 1
 const MODEL_LIST_TTL_MS = 5 * 60_000; // 5 min cache for /models discovery
+const THINKING_UNSUPPORTED_TTL_MS = 24 * 60 * 60 * 1000;
+
+// Keep-alive pool for generativelanguage.googleapis.com. SwiftSlate opens a
+// fresh HttpURLConnection per call and disconnect()s it; we reuse TCP/TLS
+// so the bubble's first chip tap isn't a cold handshake. undici ships with
+// Node 18+; if require fails we fall back to global fetch.
+let _geminiAgent = undefined; // undefined = not tried, null = unavailable, Agent = ready
+function _getGeminiAgent() {
+  if (_geminiAgent !== undefined) return _geminiAgent || undefined;
+  try {
+    const { Agent } = require('undici');
+    _geminiAgent = new Agent({
+      keepAliveTimeout: 30_000,
+      connections: 8,
+    });
+  } catch {
+    _geminiAgent = null;
+  }
+  return _geminiAgent || undefined;
+}
+
+function _geminiFetch(url, opts) {
+  const dispatcher = _getGeminiAgent();
+  return fetch(url, dispatcher ? { ...opts, dispatcher } : opts);
+}
+
+/** modelId → timestamp until which we omit thinkingConfig after a 400. */
+const _thinkingUnsupportedUntil = new Map();
+
+function resetThinkingConfigState() {
+  _thinkingUnsupportedUntil.clear();
+}
+
+function _thinkingIsUnsupported(modelId) {
+  const until = _thinkingUnsupportedUntil.get(modelId);
+  return Boolean(until && until > Date.now());
+}
+
+function _markThinkingUnsupported(modelId) {
+  _thinkingUnsupportedUntil.set(modelId, Date.now() + THINKING_UNSUPPORTED_TTL_MS);
+}
+
+/**
+ * Pick the fastest thinking config for a Gemini model.
+ *
+ * Gemini 3+ Flash defaults to medium thinking (~4–5s). The latency win is
+ * `thinkingLevel: "low"` on any flash-lite / `"minimal"` on flash.
+ * Gemini 2.5 uses `thinkingBudget: 0`. 1.x, pro, and unknown ids omit it.
+ *
+ * @param {string} modelId
+ * @returns {{ thinkingConfig: object } | null}
+ */
+function thinkingConfigFor(modelId) {
+  const id = normaliseModelId(modelId).toLowerCase();
+  if (!id) return null;
+  // Gemini 2.5 uses thinkingBudget, not thinkingLevel.
+  if (/gemini-2\.5/.test(id)) {
+    return { thinkingConfig: { thinkingBudget: 0 } };
+  }
+  // 1.x / 2.0 do not accept thinkingLevel. Skip rather than paying a 400.
+  if (/gemini-1\./.test(id) || /gemini-2\./.test(id)) {
+    return null;
+  }
+  // Gemini 3+ (and later flash-lite ids such as 3.5 / 4.x): low on lite,
+  // minimal on flash. Unknown names omit the field; a 400 still retries bare.
+  if (/flash-lite/.test(id)) {
+    return { thinkingConfig: { thinkingLevel: 'low' } };
+  }
+  if (/flash/.test(id) && !/pro/.test(id)) {
+    return { thinkingConfig: { thinkingLevel: 'minimal' } };
+  }
+  return null;
+}
 
 // ── Typed error class (HTTP-status-aware) ──────────────────────
 
@@ -324,7 +397,7 @@ async function _callGeminiOnce({ modelId, body, timeoutMs }) {
 
   let response;
   try {
-    response = await fetch(url, {
+    response = await _geminiFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
@@ -482,6 +555,8 @@ function _isRetryable(err) {
  * @param {number} [opts.temperature=0.7]
  * @param {number} [opts.maxTokens=2048]
  * @param {boolean} [opts.jsonOutput=false]- Force JSON mime type
+ * @param {boolean} [opts.thinking=false] - Apply flash thinkingConfig (rephrase)
+ * @param {string}  [opts.thinkingLevel]  - Explicit thinkingLevel, skips the helper
  * @param {number} [opts.timeoutMs=30000]
  * @returns {Promise<{content:string, model_used:string, usage:object|null}>}
  */
@@ -491,6 +566,8 @@ async function geminiComplete({
   temperature = 0.7,
   maxTokens = 2048,
   jsonOutput = false,
+  thinking = false,
+  thinkingLevel,
   timeoutMs = DEFAULT_TIMEOUT_MS,
 }) {
   if (!model || typeof model !== 'string' || !model.trim()) {
@@ -509,10 +586,22 @@ async function geminiComplete({
     ...(jsonOutput ? { responseMimeType: 'application/json' } : {}),
   };
 
+  const wantThinking = thinking === true || typeof thinkingLevel === 'string';
+  if (wantThinking && !_thinkingIsUnsupported(modelId)) {
+    if (typeof thinkingLevel === 'string' && thinkingLevel) {
+      baseBody.generationConfig.thinkingConfig = { thinkingLevel };
+    } else {
+      const auto = thinkingConfigFor(modelId);
+      if (auto?.thinkingConfig) {
+        baseBody.generationConfig.thinkingConfig = auto.thinkingConfig;
+      }
+    }
+  }
+
   let lastError;
   for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
     try {
-      if (attempt > 0) {
+      if (attempt > 0 && lastError && !_isThinkingConfigRejection(lastError)) {
         const delay = Math.min(500 * Math.pow(2, attempt - 1), 4000);
         tg.w('GeminiDirect', `Retry ${attempt}/${MAX_RETRIES} model=${modelId} in ${delay}ms (${lastError?.code || 'unknown'})`);
         await new Promise((r) => setTimeout(r, delay));
@@ -526,10 +615,29 @@ async function geminiComplete({
       lastError = e instanceof GeminiDirectError
         ? e
         : new GeminiDirectError(String(e?.message || e), ERROR_CODES.NETWORK, 502, modelId);
+
+      if (
+        _isThinkingConfigRejection(lastError) &&
+        baseBody.generationConfig.thinkingConfig
+      ) {
+        _markThinkingUnsupported(modelId);
+        delete baseBody.generationConfig.thinkingConfig;
+        tg.w('GeminiDirect', `thinkingConfig rejected for ${modelId} — retrying without it`);
+        continue;
+      }
+
       if (!_isRetryable(lastError) || attempt >= MAX_RETRIES) break;
     }
   }
   throw lastError;
+}
+
+function _isThinkingConfigRejection(err) {
+  return (
+    err instanceof GeminiDirectError &&
+    err.code === ERROR_CODES.API &&
+    err.status === 400
+  );
 }
 
 // ── Dynamic model discovery (cached) ───────────────────────────
@@ -570,7 +678,7 @@ async function listAvailableModels({ force = false } = {}) {
 
   const url = `${GEMINI_API_BASE}/models?key=${apiKey}&pageSize=100`;
   try {
-    const res = await fetch(url, {
+    const res = await _geminiFetch(url, {
       method: 'GET',
       signal: AbortSignal.timeout(10_000),
     });
@@ -656,6 +764,8 @@ module.exports = {
   isGeminiModel,
   stripGeminiPrefix,
   normaliseModelId,
+  thinkingConfigFor,
+  resetThinkingConfigState,
   GeminiDirectError,
   ERROR_CODES,
   mapErrorToHttp,

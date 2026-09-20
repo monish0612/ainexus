@@ -22,6 +22,8 @@ const {
   isGeminiModel,
   normaliseModelId,
   stripGeminiPrefix,
+  thinkingConfigFor,
+  resetThinkingConfigState,
   GeminiDirectError,
   ERROR_CODES,
   mapErrorToHttp,
@@ -219,6 +221,31 @@ test('geminiComplete: forwards bare id verbatim (whatever user set in Settings)'
   );
 });
 
+test('geminiComplete: a newer Settings flash-lite id is forwarded as-is', async () => {
+  let receivedUrl = '';
+  await withFakeFetch(
+    async (url) => {
+      receivedUrl = url;
+      return jsonResponse(200, {
+        candidates: [{
+          content: { parts: [{ text: 'ok' }] },
+          finishReason: 'STOP',
+        }],
+      });
+    },
+    async () => {
+      await geminiComplete({
+        model: 'gemini-3.5-flash-lite',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.ok(
+        receivedUrl.includes('/models/gemini-3.5-flash-lite'),
+        `URL should contain the Settings id: ${receivedUrl}`,
+      );
+    },
+  );
+});
+
 test('geminiComplete: strips gemini/ prefix before hitting Google', async () => {
   let receivedUrl = '';
   await withFakeFetch(
@@ -408,6 +435,139 @@ test('geminiComplete: inline data:base64 image is forwarded as inline_data', asy
       assert.equal(parts.length, 2);
       assert.equal(parts[1].inline_data.mime_type, 'image/png');
       assert.equal(parts[1].inline_data.data, 'AAAA');
+    },
+  );
+});
+
+// ── Thinking config (rephrase fast-path) ─────────────────────
+
+test('thinkingConfigFor: gemini 3 flash-lite → low', () => {
+  assert.deepEqual(
+    thinkingConfigFor('gemini-3.1-flash-lite-preview')?.thinkingConfig,
+    { thinkingLevel: 'low' },
+  );
+  assert.deepEqual(
+    thinkingConfigFor('gemini-3.5-flash-lite')?.thinkingConfig,
+    { thinkingLevel: 'low' },
+  );
+  assert.deepEqual(
+    thinkingConfigFor('gemini/gemini-3.1-flash-lite-preview')?.thinkingConfig,
+    { thinkingLevel: 'low' },
+  );
+});
+
+test('thinkingConfigFor: a later flash-lite generation still gets low', () => {
+  assert.deepEqual(
+    thinkingConfigFor('gemini-4.0-flash-lite')?.thinkingConfig,
+    { thinkingLevel: 'low' },
+  );
+  assert.deepEqual(
+    thinkingConfigFor('gemini-3.6-flash-lite-preview')?.thinkingConfig,
+    { thinkingLevel: 'low' },
+  );
+});
+
+test('thinkingConfigFor: gemini 3 flash → minimal', () => {
+  assert.deepEqual(
+    thinkingConfigFor('gemini-3.6-flash')?.thinkingConfig,
+    { thinkingLevel: 'minimal' },
+  );
+});
+
+test('thinkingConfigFor: gemini 2.5 → thinkingBudget 0', () => {
+  assert.deepEqual(
+    thinkingConfigFor('gemini-2.5-flash')?.thinkingConfig,
+    { thinkingBudget: 0 },
+  );
+  assert.deepEqual(
+    thinkingConfigFor('gemini-2.5-flash-lite')?.thinkingConfig,
+    { thinkingBudget: 0 },
+  );
+});
+
+test('thinkingConfigFor: pro / 1.x / unknown omit the field', () => {
+  assert.equal(thinkingConfigFor('gemini-3.1-pro-preview'), null);
+  assert.equal(thinkingConfigFor('gemini-1.5-pro'), null);
+  assert.equal(thinkingConfigFor('gemini-1.5-flash'), null);
+  assert.equal(thinkingConfigFor('gemini-2.0-flash'), null);
+});
+
+test('geminiComplete: thinking defaults off even for flash-lite', async () => {
+  let receivedBody = null;
+  await withFakeFetch(
+    async (_url, opts) => {
+      receivedBody = JSON.parse(opts.body);
+      return jsonResponse(200, {
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      });
+    },
+    async () => {
+      await geminiComplete({
+        model: 'gemini-3.1-flash-lite-preview',
+        messages: [{ role: 'user', content: 'hi' }],
+      });
+      assert.equal(receivedBody.generationConfig.thinkingConfig, undefined);
+    },
+  );
+});
+
+test('geminiComplete: thinking true on flash-lite sends thinkingLevel low', async () => {
+  resetThinkingConfigState();
+  let receivedBody = null;
+  await withFakeFetch(
+    async (_url, opts) => {
+      receivedBody = JSON.parse(opts.body);
+      return jsonResponse(200, {
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      });
+    },
+    async () => {
+      await geminiComplete({
+        model: 'gemini-3.1-flash-lite-preview',
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: true,
+      });
+      assert.deepEqual(receivedBody.generationConfig.thinkingConfig, {
+        thinkingLevel: 'low',
+      });
+    },
+  );
+});
+
+test('geminiComplete: 400 on thinkingConfig retries without it and remembers', async () => {
+  resetThinkingConfigState();
+  const bodies = [];
+  let calls = 0;
+  await withFakeFetch(
+    async (_url, opts) => {
+      calls++;
+      bodies.push(JSON.parse(opts.body));
+      if (calls === 1) {
+        return jsonResponse(400, {
+          error: { message: 'Unknown name thinkingConfig', code: 400 },
+        });
+      }
+      return jsonResponse(200, {
+        candidates: [{ content: { parts: [{ text: 'ok' }] }, finishReason: 'STOP' }],
+      });
+    },
+    async () => {
+      const r = await geminiComplete({
+        model: 'gemini-3.1-flash-lite-preview',
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: true,
+      });
+      assert.equal(r.content, 'ok');
+      assert.ok(bodies[0].generationConfig.thinkingConfig);
+      assert.equal(bodies[1].generationConfig.thinkingConfig, undefined);
+
+      // Follow-up call must not send thinkingConfig (24h backoff).
+      await geminiComplete({
+        model: 'gemini-3.1-flash-lite-preview',
+        messages: [{ role: 'user', content: 'hi' }],
+        thinking: true,
+      });
+      assert.equal(bodies[2].generationConfig.thinkingConfig, undefined);
     },
   );
 });

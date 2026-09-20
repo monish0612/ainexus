@@ -45,3 +45,18 @@ test('listen-complete does not delete audio; ensure can recover leftover tombsto
   assert.match(PROXY, /article_dropped/);
   assert.match(PROXY, /rec\.status === 'deleted'/);
 });
+
+test('mark-all-read keeps saved audio; nuke deletes every row including saved', () => {
+  const mark = INDEX.slice(
+    INDEX.indexOf("newsRouter.post('/mark-all-read'"),
+    INDEX.indexOf("newsRouter.post('/nuke'"),
+  );
+  const nuke = INDEX.slice(
+    INDEX.indexOf("newsRouter.post('/nuke'"),
+    INDEX.indexOf("newsRouter.delete('/cleanup-mock'"),
+  );
+  assert.match(mark, /AND saved = FALSE/);
+  assert.match(mark, /dropArticles\(result\.rows\.map/);
+  assert.match(nuke, /DELETE FROM news_articles RETURNING id/);
+  assert.match(nuke, /dropArticles\(result\.rows\.map/);
+});
