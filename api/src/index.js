@@ -191,10 +191,12 @@ function authenticate(req, res, next) {
 //  Groq/* models always last. Re-discovers every 5 minutes.
 // ═══════════════════════════════════════════════════════════════
 
+const { noteDiscoveryResult } = require('./litellm-discovery-policy');
+
 let modelPriorityList = [];
-let _discoveryAttempts = 0;
+let _discoveryState = { attempts: 0, alerted: false, downSince: 0 };
+let _discoveryInFlight = false;
 const _REDISCOVERY_MS = 5 * 60 * 1000;
-const _MAX_DISCOVERY_RETRIES = 5;
 const _CALL_TIMEOUT_MS = 30_000;
 const _MAX_RETRIES_PER_MODEL = 2;
 const _MAX_RETRIES_LAST_MODEL = 3;
@@ -238,6 +240,10 @@ async function getLiteLLM(path) {
 // ── Discovery ──────────────────────────────────────────────────
 
 async function discoverLiteLLMModels() {
+  // One in-flight call. The 5-minute interval is the only retry — stacking
+  // setTimeout on top of it is what produced "attempt 892/5" in Telegram.
+  if (_discoveryInFlight) return;
+  _discoveryInFlight = true;
   try {
     const data = await getLiteLLM('/v1/models');
     const models = (data?.data || []).map(m => m.id).filter(Boolean);
@@ -251,7 +257,8 @@ async function discoverLiteLLMModels() {
 
     modelPriorityList = _sortModelPriority(models);
     process.env._LITELLM_MODEL_PRIORITY = JSON.stringify(modelPriorityList);
-    _discoveryAttempts = 0;
+    const note = noteDiscoveryResult(_discoveryState, { ok: true, now: Date.now() });
+    _discoveryState = note.state;
 
     updateGroundingModels(models);
 
@@ -261,19 +268,22 @@ async function discoverLiteLLMModels() {
       (fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : '');
 
     console.log(`[LiteLLM] Discovered ${summary}`);
-    tg.i('LiteLLM', `Discovered ${summary}`);
-  } catch (e) {
-    _discoveryAttempts++;
-    const msg = `Discovery failed (attempt ${_discoveryAttempts}/${_MAX_DISCOVERY_RETRIES}): ${e.message}`;
-    console.warn(`[LiteLLM] ${msg}`);
-
-    if (_discoveryAttempts >= _MAX_DISCOVERY_RETRIES) {
-      tg.e('LiteLLM', msg, e);
+    if (note.telegram === 'recovered') {
+      tg.i('LiteLLM', `Discovery recovered. ${summary}`);
     } else {
-      tg.w('LiteLLM', msg, e);
-      const delay = Math.min(1000 * Math.pow(2, _discoveryAttempts), 30_000);
-      setTimeout(discoverLiteLLMModels, delay);
+      tg.i('LiteLLM', `Discovered ${summary}`);
     }
+  } catch (e) {
+    const note = noteDiscoveryResult(_discoveryState, { ok: false, now: Date.now() });
+    _discoveryState = note.state;
+    // Keep modelPriorityList. A blip must not drop the last good catalog.
+    const msg = `Discovery failed (attempt ${note.state.attempts}): ${e.message}`;
+    console.warn(`[LiteLLM] ${msg}`);
+    if (note.telegram === 'down') {
+      tg.e('LiteLLM', `${msg}. Further failures stay quiet until it recovers.`, e);
+    }
+  } finally {
+    _discoveryInFlight = false;
   }
 }
 
