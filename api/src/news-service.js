@@ -764,7 +764,7 @@ function _isRetryable(msg) {
 async function callLiteLLM(model, messages, opts = {}) {
   const t0 = Date.now();
 
-  // The caller's Gemini model goes first; GROUNDING_MODELS are the
+  // The caller's Gemini model goes first; GEMINI_FALLBACK_MODELS are the
   // fallbacks so a bad model name in Settings degrades instead of
   // producing the "# title / ## Article Preview" fallback marker.
   // No caller model means no call: there is deliberately no default.

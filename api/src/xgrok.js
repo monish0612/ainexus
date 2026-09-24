@@ -10,6 +10,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const { tg } = require('./telegram');
+const { readXaiApiKey } = require('./llm-config');
 
 const XGROK_API_BASE = 'https://api.x.ai/v1';
 
@@ -31,13 +32,13 @@ class XGrokError extends Error {
 }
 
 function getApiKey() {
-  const key = process.env.XGROK_API_KEY;
-  if (!key) throw new XGrokError('XGROK_API_KEY not configured', 'CONFIG', 503);
+  const key = readXaiApiKey();
+  if (!key) throw new XGrokError('XAI_API_KEY not configured', 'CONFIG', 503);
   return key;
 }
 
 function isXGrokAvailable() {
-  return Boolean(process.env.XGROK_API_KEY);
+  return Boolean(readXaiApiKey());
 }
 
 function _isRetryableStatus(status) {

@@ -74,7 +74,7 @@ const {
   ERROR_CODES: GEMINI_ERROR_CODES,
   mapErrorToHttp: mapGeminiErrorToHttp,
 } = require('./gemini-direct');
-const { geminiModels, llmConfigProblem } = require('./llm-config');
+const { geminiModels, llmConfigProblem, readTavilyApiKey, readZyteApiKey } = require('./llm-config');
 const { tg } = require('./telegram');
 const {
   buildExpenseInsightPrompt,
@@ -189,7 +189,7 @@ function authenticate(req, res, next) {
 // ═══════════════════════════════════════════════════════════════
 //  LLM — direct Gemini REST (gemini-direct.js)
 //
-//  The caller's model is tried first, then GROUNDING_MODELS as
+//  The caller's model is tried first, then GEMINI_FALLBACK_MODELS as
 //  fallbacks so a typo in Settings degrades instead of failing.
 //  A call that names no model, or a non-Gemini model, is rejected
 //  with INVALID_MODEL: there is deliberately no default model.
@@ -1949,7 +1949,7 @@ async function deepExtractContent(url, { logTag = 'DeepExtract' } = {}) {
   }
 
   // ── Stage 3: Zyte headless browser extraction (1× retry on 429/5xx) ──
-  const zyteKey = process.env.ZYTE_API_KEY;
+  const zyteKey = readZyteApiKey();
   if (isBlocked && zyteKey) {
     const _s3 = Date.now();
     const _zyteOnce = () => fetch('https://api.zyte.com/v1/extract', {
@@ -2013,7 +2013,7 @@ async function deepExtractContent(url, { logTag = 'DeepExtract' } = {}) {
 
     const runners = [];
 
-    const tavilyKey = process.env.TAVILY_API_KEY;
+    const tavilyKey = readTavilyApiKey();
     if (tavilyKey) {
       runners.push(
         (async () => {
@@ -2131,7 +2131,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
     const useXGrokSummarize = wantXGrok && hasXGrok;
 
     if (wantXGrok && !hasXGrok) {
-      tg.w('AI/summarize', `Client requested xGrok but XGROK_API_KEY missing — falling back to LiteLLM`);
+      tg.w('AI/summarize', `Client requested xGrok but XAI_API_KEY missing — falling back to LiteLLM`);
     }
 
     tg.d('AI/summarize', `Stage5 ▶ provider=${useXGrokSummarize ? 'xgrok' : 'litellm'} model=${xgrokSummarizeModel || 'default'} content=${content.length}ch method=${extractionMethod}`);
@@ -2225,7 +2225,7 @@ aiRouter.post('/summarize', async (req, res, next) => {
 //  Batch quick-summary for the News > For You "catch up" feature. Caller
 //  sends N already-extracted articles (title + condensed body) and we
 //  return a 1-2 sentence summary per id using the Settings Gemini Lite
-//  model (GROUNDING_MODELS are the fallbacks, handled by callLiteLLM).
+//  model (GEMINI_FALLBACK_MODELS are the fallbacks, handled by callLiteLLM).
 //
 //  The Flutter client batches client-side (10 per request, 4 concurrent)
 //  so this endpoint stays simple and fast: one LLM round-trip per request.
@@ -2530,7 +2530,7 @@ aiRouter.post('/smart-parse-image', async (req, res, next) => {
     if (!val.ok) return res.status(400).json({ error: val.error });
 
     if (!isGroundingAvailable()) {
-      tg.w('AI/smart-parse-image', 'No GOOGLE_API_KEY — vision receipt parse unavailable');
+      tg.w('AI/smart-parse-image', 'No GEMINI_API_KEY — vision receipt parse unavailable');
       return res.status(503).json({ error: 'Vision parsing is not configured on the server' });
     }
 
@@ -2612,7 +2612,7 @@ aiRouter.post('/search', async (req, res, next) => {
       return res.status(400).json({ error: 'query is required (min 2 chars)' });
     }
 
-    const apiKey = process.env.TAVILY_API_KEY;
+    const apiKey = readTavilyApiKey();
     if (!apiKey) {
       return res.status(503).json({ error: 'TAVILY_API_KEY not configured' });
     }
@@ -2841,7 +2841,7 @@ aiRouter.post('/search-followup', async (req, res, next) => {
     const useXGrok = provider === 'xgrok' && isXGrokAvailable();
 
     if (!useXGrok && !isGroundingAvailable()) {
-      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+      return res.status(503).json({ error: 'GEMINI_API_KEY not configured' });
     }
 
     const resolvedModel = useXGrok
@@ -3036,7 +3036,7 @@ aiRouter.post('/deep-research', async (req, res, next) => {
     const useXGrok = provider === 'xgrok' && isXGrokAvailable();
 
     if (!useXGrok && !isGroundingAvailable()) {
-      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+      return res.status(503).json({ error: 'GEMINI_API_KEY not configured' });
     }
 
     const resolvedModel = useXGrok
@@ -3177,7 +3177,7 @@ aiRouter.post('/article-followup', async (req, res, next) => {
     const useXGrok = provider === 'xgrok' && isXGrokAvailable();
 
     if (!useXGrok && !isGroundingAvailable()) {
-      return res.status(503).json({ error: 'GOOGLE_API_KEY not configured' });
+      return res.status(503).json({ error: 'GEMINI_API_KEY not configured' });
     }
 
     const resolvedModel = useXGrok
@@ -6581,7 +6581,7 @@ async function _initTablesWithRetry(maxRetries = 3) {
   try {
     await _initTablesWithRetry(3);
 
-    // ── Startup sanity check: confirm GOOGLE_API_KEY works ──
+    // ── Startup sanity check: confirm GEMINI_API_KEY works ──
     //
     // The key's presence is enforced at boot (llmConfigProblem).
     // This live probe only warns: a Google outage must not take
@@ -6589,11 +6589,11 @@ async function _initTablesWithRetry(maxRetries = 3) {
     // xGrok routes keep working without Gemini.
     try {
       const probe = await listGeminiModels({ force: true });
-      console.log(`[Gemini] ✓ Direct API usable — ${probe.models.length} models accessible to GOOGLE_API_KEY`);
+      console.log(`[Gemini] ✓ Direct API usable — ${probe.models.length} models accessible to GEMINI_API_KEY`);
       tg.i('Gemini', `Direct API ✓ ${probe.models.length} models, primary=${probe.primary || 'none'}`);
     } catch (e) {
       const msg = e?.code === 'CONFIG'
-        ? '⚠️  GOOGLE_API_KEY missing or unsubstituted — Gemini direct path WILL FAIL on every request. Set a valid key in backend/.env and restart.'
+        ? '⚠️  GEMINI_API_KEY missing or unsubstituted — Gemini direct path WILL FAIL on every request. Set the Coolify team variable and restart.'
         : `⚠️  Gemini /models probe failed (${e?.code || 'unknown'}): ${String(e?.message || e).slice(0, 200)}`;
       console.warn(msg);
       tg.e('Gemini', msg, e);

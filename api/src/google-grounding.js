@@ -10,7 +10,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const { tg } = require('./telegram');
-const { readGoogleApiKey, geminiModels, geminiProModel } = require('./llm-config');
+const { readGeminiApiKey, geminiModels, geminiProModel } = require('./llm-config');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
@@ -26,8 +26,8 @@ const DEFAULTS = {
 // ── Helpers ────────────────────────────────────────────────────
 
 function getApiKey() {
-  const key = readGoogleApiKey();
-  if (!key) throw new GroundingError('GOOGLE_API_KEY not configured', 'CONFIG');
+  const key = readGeminiApiKey();
+  if (!key) throw new GroundingError('GEMINI_API_KEY not configured', 'CONFIG');
   return key;
 }
 
@@ -634,7 +634,7 @@ async function groundedConverseVision(history, systemInstruction, imageB64, medi
  * Check if Google Search Grounding is available (key configured).
  */
 function isGroundingAvailable() {
-  return Boolean(readGoogleApiKey());
+  return Boolean(readGeminiApiKey());
 }
 
 /**

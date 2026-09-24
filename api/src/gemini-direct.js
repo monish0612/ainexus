@@ -16,7 +16,7 @@
 //  This module bypasses the proxy entirely for Gemini ids. Whatever
 //  bare model name the user types into Settings is forwarded to
 //  `generativelanguage.googleapis.com/v1beta/models/<id>:generateContent`
-//  using GOOGLE_API_KEY. Google's API is the source of truth: a
+//  using GEMINI_API_KEY. Google's API is the source of truth: a
 //  brand-new model the day it launches works without redeploying
 //  the proxy config.
 //
@@ -42,7 +42,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const { tg } = require('./telegram');
-const { readGoogleApiKey } = require('./llm-config');
+const { readGeminiApiKey } = require('./llm-config');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -125,7 +125,7 @@ function thinkingConfigFor(modelId) {
 // ── Typed error class (HTTP-status-aware) ──────────────────────
 
 const ERROR_CODES = Object.freeze({
-  CONFIG: 'CONFIG', // GOOGLE_API_KEY missing
+  CONFIG: 'CONFIG', // GEMINI_API_KEY missing
   INVALID_MODEL: 'INVALID_MODEL', // empty / non-string model id
   MODEL_NOT_FOUND: 'MODEL_NOT_FOUND', // Google returned 404 for this model
   RATE_LIMIT: 'RATE_LIMIT', // 429
@@ -362,10 +362,10 @@ async function _contentToParts(content) {
 // ── Single-shot call ───────────────────────────────────────────
 
 async function _callGeminiOnce({ modelId, body, timeoutMs }) {
-  const apiKey = readGoogleApiKey();
+  const apiKey = readGeminiApiKey();
   if (!apiKey) {
     throw new GeminiDirectError(
-      'GOOGLE_API_KEY is not configured on the server. Set it in backend/.env and restart.',
+      'GEMINI_API_KEY is not configured on the server. Set the Coolify team variable and restart.',
       ERROR_CODES.CONFIG,
       503,
       modelId,
@@ -624,7 +624,7 @@ function _isThinkingConfigRejection(err) {
 let _modelListCache = { value: null, expiresAt: 0, lastError: null };
 
 /**
- * Fetch the list of Gemini models the configured GOOGLE_API_KEY can
+ * Fetch the list of Gemini models the configured GEMINI_API_KEY can
  * actually invoke. Cached for [MODEL_LIST_TTL_MS]. Returns
  * `{models: string[], primary: string|null, cachedAt: ISO}`.
  *
@@ -644,10 +644,10 @@ async function listAvailableModels({ force = false } = {}) {
     return _modelListCache.value;
   }
 
-  const apiKey = readGoogleApiKey();
+  const apiKey = readGeminiApiKey();
   if (!apiKey) {
     const err = new GeminiDirectError(
-      'GOOGLE_API_KEY is not configured on the server. Set it in backend/.env and restart.',
+      'GEMINI_API_KEY is not configured on the server. Set the Coolify team variable and restart.',
       ERROR_CODES.CONFIG,
       503,
     );

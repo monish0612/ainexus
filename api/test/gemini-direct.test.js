@@ -54,10 +54,10 @@ function jsonResponse(status, body, headers = {}) {
 }
 
 // Ensure the module sees a valid-LOOKING key even in CI — the real
-// network path is faked, but `readGoogleApiKey()` requires ≥30
+// network path is faked, but `readGeminiApiKey()` requires ≥30
 // chars so it can detect unsubstituted env placeholders in
 // production. Use a 40-char fake that mimics the real shape.
-process.env.GOOGLE_API_KEY = 'AIzaTEST_CI_FAKE_KEY_4444444444444444444';
+process.env.GEMINI_API_KEY = 'AIzaTEST_CI_FAKE_KEY_4444444444444444444';
 
 // ── Model id helpers ───────────────────────────────────────────
 
@@ -122,42 +122,42 @@ test('mapErrorToHttp: non-GeminiDirectError returns 500', () => {
 
 // ── API key sanity (unsubstituted placeholder detection) ────────
 
-test('geminiComplete: CONFIG error when GOOGLE_API_KEY is missing', async () => {
-  const originalKey = process.env.GOOGLE_API_KEY;
-  delete process.env.GOOGLE_API_KEY;
+test('geminiComplete: CONFIG error when GEMINI_API_KEY is missing', async () => {
+  const originalKey = process.env.GEMINI_API_KEY;
+  delete process.env.GEMINI_API_KEY;
   try {
     await assert.rejects(
       () => geminiComplete({ model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'hi' }] }),
       (err) => err instanceof GeminiDirectError && err.code === ERROR_CODES.CONFIG,
     );
   } finally {
-    process.env.GOOGLE_API_KEY = originalKey;
+    process.env.GEMINI_API_KEY = originalKey;
   }
 });
 
 test('geminiComplete: CONFIG error when key is the unsubstituted ${...} placeholder', async () => {
-  const originalKey = process.env.GOOGLE_API_KEY;
-  process.env.GOOGLE_API_KEY = '${GOOGLE_API_KEY}';
+  const originalKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = '${GEMINI_API_KEY}';
   try {
     await assert.rejects(
       () => geminiComplete({ model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'hi' }] }),
       (err) => err instanceof GeminiDirectError && err.code === ERROR_CODES.CONFIG,
     );
   } finally {
-    process.env.GOOGLE_API_KEY = originalKey;
+    process.env.GEMINI_API_KEY = originalKey;
   }
 });
 
 test('geminiComplete: CONFIG error when key is suspiciously short', async () => {
-  const originalKey = process.env.GOOGLE_API_KEY;
-  process.env.GOOGLE_API_KEY = 'too-short';
+  const originalKey = process.env.GEMINI_API_KEY;
+  process.env.GEMINI_API_KEY = 'too-short';
   try {
     await assert.rejects(
       () => geminiComplete({ model: 'gemini-2.5-flash', messages: [{ role: 'user', content: 'hi' }] }),
       (err) => err instanceof GeminiDirectError && err.code === ERROR_CODES.CONFIG,
     );
   } finally {
-    process.env.GOOGLE_API_KEY = originalKey;
+    process.env.GEMINI_API_KEY = originalKey;
   }
 });
 

@@ -17,6 +17,7 @@ const {
   isXGrokAvailable,
   resolveXGrokModel,
 } = require('./xgrok');
+const { readXaiApiKey } = require('./llm-config');
 
 // ── Constants ───────────────────────────────────────────────────────────
 
@@ -436,8 +437,8 @@ async function fetchPostsSince(handle, sinceLabel, untilLabel, { modelOverride }
 
   tg.d('X-FEED/fetch', `▶ Fetching posts: ${logLabel} (model=${model})`);
 
-  const apiKey = process.env.XGROK_API_KEY;
-  if (!apiKey) throw new Error('XGROK_API_KEY not configured');
+  const apiKey = readXaiApiKey();
+  if (!apiKey) throw new Error('XAI_API_KEY not configured');
 
   const { system, user } = buildFetchPrompt(handle, sinceLabel, untilLabel);
 
@@ -533,8 +534,8 @@ function collectImageTasks(posts) {
 }
 
 async function analyzeOneImage(task, model) {
-  const apiKey = process.env.XGROK_API_KEY;
-  if (!apiKey) throw new Error('XGROK_API_KEY not configured');
+  const apiKey = readXaiApiKey();
+  if (!apiKey) throw new Error('XAI_API_KEY not configured');
 
   const prompt = [
     'You are a financial chart/image analyst. Analyze this image from a finance-focused X post.',
@@ -1015,7 +1016,7 @@ async function runDailySync({ reason = 'scheduled' } = {}) {
     }
 
     if (!isXGrokAvailable()) {
-      const msg = 'xGrok unavailable — XGROK_API_KEY not set';
+      const msg = 'xGrok unavailable — XAI_API_KEY not set';
       tg.e('X-FEED/sync', msg);
       _lastRunResult = { success: false, error: msg, reason, timestamp: new Date().toISOString() };
       return _lastRunResult;
