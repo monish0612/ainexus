@@ -25,8 +25,7 @@
 //  • No grounded-search (that's `google-grounding.js` — it uses the
 //    same REST API but with the `google_search` tool enabled and
 //    parses `groundingMetadata` for citations).
-//  • No xGrok / Groq / non-Google providers — see `xgrok.js` and
-//    the LiteLLM fallback path in `index.js`.
+//  • No xGrok / non-Google providers — see `xgrok.js`.
 //  • No multi-turn conversation memory — the caller is expected to
 //    pass the full message history in OpenAI chat format
 //    (`{role, content}[]`).
@@ -43,6 +42,7 @@
 // ═══════════════════════════════════════════════════════════════
 
 const { tg } = require('./telegram');
+const { readGoogleApiKey } = require('./llm-config');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 const DEFAULT_TIMEOUT_MS = 30_000;
@@ -362,29 +362,8 @@ async function _contentToParts(content) {
 
 // ── Single-shot call ───────────────────────────────────────────
 
-// Detects a missing OR unsubstituted env placeholder (e.g. when
-// `backend/.env` has `GOOGLE_API_KEY=${GOOGLE_API_KEY}` and the
-// shell never expanded it — a real-world deploy gotcha on bare
-// `node` startup vs. `docker-compose up` where the substitution
-// happens at runtime). Both shapes produce the same user-facing
-// CONFIG error, so the toast layer can say "Server isn't configured
-// for Gemini yet" instead of "API key not valid".
-function _readGoogleApiKey() {
-  const raw = process.env.GOOGLE_API_KEY;
-  if (!raw) return null;
-  const trimmed = String(raw).trim();
-  if (!trimmed) return null;
-  // Common "env-var not expanded" sentinels.
-  if (trimmed.startsWith('${') || trimmed === '<unset>' || trimmed === 'null') return null;
-  // Real Google API keys are 39+ chars and start with `AIza`. We
-  // accept anything ≥ 30 chars to allow for future formats while
-  // still catching obvious mistakes.
-  if (trimmed.length < 30) return null;
-  return trimmed;
-}
-
 async function _callGeminiOnce({ modelId, body, timeoutMs }) {
-  const apiKey = _readGoogleApiKey();
+  const apiKey = readGoogleApiKey();
   if (!apiKey) {
     throw new GeminiDirectError(
       'GOOGLE_API_KEY is not configured on the server. Set it in backend/.env and restart.',
@@ -666,7 +645,7 @@ async function listAvailableModels({ force = false } = {}) {
     return _modelListCache.value;
   }
 
-  const apiKey = _readGoogleApiKey();
+  const apiKey = readGoogleApiKey();
   if (!apiKey) {
     const err = new GeminiDirectError(
       'GOOGLE_API_KEY is not configured on the server. Set it in backend/.env and restart.',

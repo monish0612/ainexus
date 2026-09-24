@@ -54,7 +54,7 @@ function jsonResponse(status, body, headers = {}) {
 }
 
 // Ensure the module sees a valid-LOOKING key even in CI — the real
-// network path is faked, but `_readGoogleApiKey()` requires ≥30
+// network path is faked, but `readGoogleApiKey()` requires ≥30
 // chars so it can detect unsubstituted env placeholders in
 // production. Use a 40-char fake that mimics the real shape.
 process.env.GOOGLE_API_KEY = 'AIzaTEST_CI_FAKE_KEY_4444444444444444444';

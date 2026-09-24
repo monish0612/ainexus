@@ -10,60 +10,12 @@
 // ═══════════════════════════════════════════════════════════════
 
 const { tg } = require('./telegram');
+const { readGoogleApiKey, geminiModels, geminiProModel } = require('./llm-config');
 
 const GEMINI_API_BASE = 'https://generativelanguage.googleapis.com/v1beta';
 
-// Mutable model list — populated dynamically from LiteLLM discovery.
-// Falls back to GROUNDING_MODELS env var only until discovery completes.
-let _groundingModels = (process.env.GROUNDING_MODELS || '')
-  .split(',')
-  .map(m => m.trim())
-  .filter(Boolean);
-
-let _proModel = process.env.GEMINI_PRO_MODEL || '';
-
-if (_groundingModels.length === 0) {
-  console.warn('[Grounding] ⚠️  No grounding models yet — waiting for LiteLLM discovery');
-}
-
-/**
- * Update grounding models dynamically (called from LiteLLM discovery).
- * Extracts Gemini models from the LiteLLM model list, strips the "gemini/"
- * prefix so they work with the direct Gemini REST API.
- *
- * @param {string[]} litellmModels - Full model IDs from LiteLLM /v1/models
- */
-function updateGroundingModels(litellmModels) {
-  const geminiModels = litellmModels
-    .filter(m => m.toLowerCase().startsWith('gemini/'))
-    .map(m => m.replace(/^gemini\//i, ''));
-
-  if (geminiModels.length === 0) return;
-
-  // Sort: prefer non-lite models first (better reasoning for grounding),
-  // then by version descending
-  geminiModels.sort((a, b) => {
-    const aLite = a.includes('lite') ? 1 : 0;
-    const bLite = b.includes('lite') ? 1 : 0;
-    if (aLite !== bLite) return aLite - bLite;
-    const verA = parseFloat((a.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]);
-    const verB = parseFloat((b.match(/(\d+(?:\.\d+)?)/) || [0, 0])[1]);
-    return verB - verA;
-  });
-
-  const changed = JSON.stringify(geminiModels) !== JSON.stringify(_groundingModels);
-  _groundingModels = geminiModels;
-
-  // Auto-detect a "pro" model if one is available
-  const proCandidate = geminiModels.find(m => m.includes('pro'));
-  if (proCandidate) _proModel = proCandidate;
-
-  if (changed) {
-    console.log(`[Grounding] Models updated from LiteLLM: [${_groundingModels.join(', ')}]` +
-      (_proModel ? ` | pro=${_proModel}` : ''));
-    tg.i('Grounding', `Models from LiteLLM: [${_groundingModels.join(', ')}]${_proModel ? ` pro=${_proModel}` : ''}`);
-  }
-}
+const _groundingModels = geminiModels();
+const _proModel = geminiProModel();
 
 const DEFAULTS = {
   temperature: 0.3,
@@ -74,7 +26,7 @@ const DEFAULTS = {
 // ── Helpers ────────────────────────────────────────────────────
 
 function getApiKey() {
-  const key = process.env.GOOGLE_API_KEY;
+  const key = readGoogleApiKey();
   if (!key) throw new GroundingError('GOOGLE_API_KEY not configured', 'CONFIG');
   return key;
 }
@@ -682,12 +634,12 @@ async function groundedConverseVision(history, systemInstruction, imageB64, medi
  * Check if Google Search Grounding is available (key configured).
  */
 function isGroundingAvailable() {
-  return Boolean(process.env.GOOGLE_API_KEY);
+  return Boolean(readGoogleApiKey());
 }
 
 /**
- * Strip a "gemini/" prefix that LiteLLM uses but the direct Gemini REST API
- * does not expect. Returns null if the cleaned value is empty.
+ * Strip a legacy "gemini/" prefix the direct Gemini REST API does not
+ * expect. Returns null if the cleaned value is empty.
  */
 function _stripGeminiPrefix(value) {
   if (typeof value !== 'string') return null;
@@ -736,7 +688,6 @@ module.exports = {
   groundedSearchVision,
   groundedConverseVision,
   buildGroundingSystemInstruction,
-  updateGroundingModels,
   isGroundingAvailable,
   resolveGroundingMode,
   getGroundingConfig,
