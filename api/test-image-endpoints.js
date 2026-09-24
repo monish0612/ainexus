@@ -121,7 +121,8 @@ require.cache[require.resolve(telegramPath)] = {
 process.env.DATABASE_URL = 'postgres://test';
 process.env.JWT_SECRET = 'test-secret';
 process.env.PORT = '0';
-process.env.GOOGLE_API_KEY = 'AIzaTest_mock_gemini_key';
+process.env.GOOGLE_API_KEY = 'AIzaTest_mock_gemini_key_0000000000000';
+process.env.GROUNDING_MODELS = 'gemini-2.5-flash-lite';
 process.env.XGROK_API_KEY = 'xai-test-mock-grok-key';
 // Use generous defaults so resolveXGrokModel returns predictable strings.
 process.env.XGROK_LITE_MODEL = 'grok-4-1-fast-non-reasoning';
@@ -164,7 +165,6 @@ require.cache[require.resolve(groundingPath)] = {
     groundedSearch: async () => { throw new Error('text path not under test here'); },
     groundedConverse: async () => { throw new Error('text path not under test here'); },
     groundedExtract: async () => { throw new Error('not under test'); },
-    updateGroundingModels: () => {},
     getGroundingConfig: () => ({}),
     GroundingError: class GroundingError extends Error {
       constructor(message, code = 'UNKNOWN', status = 500) {

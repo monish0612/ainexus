@@ -12,6 +12,7 @@ const {
   GeminiDirectError,
   ERROR_CODES: GEMINI_ERROR_CODES,
 } = require('./gemini-direct');
+const { geminiModels } = require('./llm-config');
 // Trafilatura-grade clean extraction for `extraction_strategy: 'clean'`
 // feeds (Movies / General) and the Gizbot listing scraper. Imported
 // directly — no DI — because `news-extract.js` has no upstream deps on
@@ -756,67 +757,29 @@ function isFallbackSummary(md) {
   return md.includes(SUMMARY_UNAVAILABLE_MARKER);
 }
 
-let _modelPriorityCache = null;
-
-function _getModelPriority() {
-  if (_modelPriorityCache) return _modelPriorityCache;
-  const raw = process.env._LITELLM_MODEL_PRIORITY;
-  if (raw) {
-    try { _modelPriorityCache = JSON.parse(raw); return _modelPriorityCache; } catch {}
-  }
-  return null;
-}
-
 function _isRetryable(msg) {
   return /429|500|502|503|504|timeout|ETIMEDOUT|ECONNRESET/i.test(msg);
 }
 
-async function _callLiteLLMOnce(model, messages, opts) {
-  const baseUrl = String(process.env.LITELLM_URL || '').replace(/\/$/, '');
-  if (!baseUrl) throw new Error('LITELLM_URL env var not set');
-
-  const key = process.env.LITELLM_VIRTUAL_KEY || process.env.LITELLM_API_KEY;
-  const headers = { 'Content-Type': 'application/json' };
-  if (key) headers.Authorization = `Bearer ${key.trim()}`;
-
-  const res = await fetch(`${baseUrl}/v1/chat/completions`, {
-    method: 'POST',
-    headers,
-    body: JSON.stringify({ model, messages, ...opts }),
-    signal: AbortSignal.timeout(30_000),
-  });
-
-  const text = await res.text();
-  let data;
-  try { data = JSON.parse(text); } catch { throw new Error(`LiteLLM non-JSON (${res.status}): ${text.slice(0, 200)}`); }
-  if (!res.ok) throw new Error(data?.error?.message || `LiteLLM ${res.status} [${model}]: ${text.slice(0, 300)}`);
-  return data?.choices?.[0]?.message?.content || '';
-}
-
 async function callLiteLLM(model, messages, opts = {}) {
   const t0 = Date.now();
-  const priority = _getModelPriority();
 
-  // Build the candidate list. If the caller specified a Gemini model,
-  // try that one first and use any other Gemini ids from the priority
-  // list as automatic fallbacks (handles "user typed a bad model name"
-  // gracefully so news summaries never silently degrade to the
-  // "# title / ## Article Preview" fallback marker).
+  // The caller's Gemini model goes first; GROUNDING_MODELS are the
+  // fallbacks so a bad model name in Settings degrades instead of
+  // producing the "# title / ## Article Preview" fallback marker.
+  // No caller model means no call: there is deliberately no default.
   const callerModel = typeof model === 'string' ? model.trim() : '';
-  let modelsToTry;
-  if (callerModel) {
-    const fallbacks = (priority || []).filter((m) => m && m !== callerModel);
-    modelsToTry = [callerModel, ...fallbacks];
-  } else if (priority && priority.length > 0) {
-    modelsToTry = [...priority];
-  } else {
-    modelsToTry = [];
+  if (!callerModel) {
+    tg.e('NEWS-LLM', 'No model — user_preferences.lite_model is unset');
+    throw new GeminiDirectError(
+      'No model supplied — set a model in Settings → Gemini Lite model',
+      GEMINI_ERROR_CODES.INVALID_MODEL,
+      400,
+    );
   }
-
-  if (modelsToTry.length === 0) {
-    tg.e('NEWS-LLM', 'No models available — caller did not pass a model and _LITELLM_MODEL_PRIORITY is empty');
-    throw new Error('No LLM models available — set a Gemini model in Settings or wait for LiteLLM discovery to complete');
-  }
+  const bareCaller = stripGeminiPrefix(callerModel);
+  const fallbacks = geminiModels().filter((m) => stripGeminiPrefix(m) !== bareCaller);
+  const modelsToTry = [callerModel, ...fallbacks];
 
   tg.d('NEWS-LLM', `Calling models=[${modelsToTry.join(',')}]`);
 
@@ -862,24 +825,24 @@ async function callLiteLLM(model, messages, opts = {}) {
   throw lastError;
 }
 
-// Single-call dispatcher: Gemini ids go direct to Google's REST API,
-// everything else falls back to the legacy LiteLLM proxy. This keeps
-// xGrok / Groq routing intact while letting a freshly-released Gemini
-// model work without redeploying the proxy.
 async function _callOne(modelId, messages, opts) {
-  const bare = stripGeminiPrefix(modelId);
-  if (isGeminiModel(modelId)) {
-    const result = await geminiComplete({
-      model: bare,
-      messages,
-      temperature: opts.temperature ?? 0.35,
-      maxTokens: opts.max_tokens ?? opts.maxTokens ?? 2500,
-      jsonOutput: !!opts.jsonOutput,
-      timeoutMs: opts.timeoutMs ?? 30_000,
-    });
-    return result.content || '';
+  if (!isGeminiModel(modelId)) {
+    throw new GeminiDirectError(
+      `Model "${modelId}" is not a Gemini model — only Gemini is supported`,
+      GEMINI_ERROR_CODES.INVALID_MODEL,
+      400,
+      modelId,
+    );
   }
-  return _callLiteLLMOnce(modelId, messages, opts);
+  const result = await geminiComplete({
+    model: stripGeminiPrefix(modelId),
+    messages,
+    temperature: opts.temperature ?? 0.35,
+    maxTokens: opts.max_tokens ?? opts.maxTokens ?? 2500,
+    jsonOutput: !!opts.jsonOutput,
+    timeoutMs: opts.timeoutMs ?? 30_000,
+  });
+  return result.content || '';
 }
 
 function _isRetryableInThisLayer(err) {
@@ -892,11 +855,6 @@ function _isRetryableInThisLayer(err) {
     );
   }
   return _isRetryable(err.message);
-}
-
-function preferredModel() {
-  const priority = _getModelPriority();
-  return priority?.[0] || null;
 }
 
 // Compact, user-facing error reason for the `summary-unavailable`
@@ -934,7 +892,7 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
   // Falls back to the discovered priority list only when the setting is unset
   // (e.g. on a fresh server before any client has synced their preferences).
   const _litellmComplete = (msgs, opts) =>
-    callLiteLLM(liteModel || preferredModel(), msgs, opts);
+    callLiteLLM(liteModel, msgs, opts);
   // For external providers (xGrok), prefer the user's configured xgrokLiteModel
   // so xGrok-routed news summaries also match what the Settings page shows.
   const _externalComplete = completeFn
@@ -967,7 +925,7 @@ async function generateSummary({ title, content, imageUrl, promptKey, settings, 
 
   const t0 = Date.now();
   const providerTag = completeFn ? 'external' : 'litellm';
-  const modelName = completeFn ? providerTag : (preferredModel() || 'auto');
+  const modelName = completeFn ? providerTag : (liteModel || 'unset');
   tg.d('NEWS/summary', `provider=${providerTag} model=${modelName} title="${title.slice(0, 60)}"`);
 
   // Strategy 1: Image analysis via LiteLLM (multimodal only — external providers skip this)
@@ -1606,7 +1564,7 @@ async function syncNewsFeeds(pool, { reason = 'manual', getProviderFn, getLiteMo
           providerName = provider.name || 'external';
           // When using an external provider, litellm is the automatic fallback.
           // The fallback also uses the user's settings.liteModel.
-          fallbackCompleteFn = (msgs, opts) => callLiteLLM(liteModel || preferredModel(), msgs, opts);
+          fallbackCompleteFn = (msgs, opts) => callLiteLLM(liteModel, msgs, opts);
           console.log(`[NEWS] Using LLM provider: ${providerName} (with litellm fallback)`);
           tg.i('NEWS/sync', `Provider resolved: ${providerName} (litellm fallback ready, liteModel=${liteModel || '(priority)'}) for reason=${reason}`);
         }

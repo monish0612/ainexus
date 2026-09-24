@@ -33,7 +33,6 @@ const {
   groundedConverse,
   groundedSearchVision,
   groundedConverseVision,
-  updateGroundingModels,
   isGroundingAvailable,
   resolveGroundingMode,
   getGroundingConfig,
@@ -75,6 +74,7 @@ const {
   ERROR_CODES: GEMINI_ERROR_CODES,
   mapErrorToHttp: mapGeminiErrorToHttp,
 } = require('./gemini-direct');
+const { geminiModels, llmConfigProblem } = require('./llm-config');
 const { tg } = require('./telegram');
 const {
   buildExpenseInsightPrompt,
@@ -100,6 +100,11 @@ for (const key of _REQUIRED_ENV) {
     console.error(`[FATAL] Missing required env var: ${key}`);
     process.exit(1);
   }
+}
+const _llmConfigProblem = llmConfigProblem();
+if (_llmConfigProblem) {
+  console.error(`[FATAL] ${_llmConfigProblem}`);
+  process.exit(1);
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -182,315 +187,83 @@ function authenticate(req, res, next) {
 }
 
 // ═══════════════════════════════════════════════════════════════
-//  LITELLM — FULLY DYNAMIC MODEL DISCOVERY + SMART ROUTING
+//  LLM — direct Gemini REST (gemini-direct.js)
 //
-//  Zero hardcoded model names. All models are discovered at
-//  runtime from LiteLLM's /v1/models endpoint.
+//  The caller's model is tried first, then GROUNDING_MODELS as
+//  fallbacks so a typo in Settings degrades instead of failing.
+//  A call that names no model, or a non-Gemini model, is rejected
+//  with INVALID_MODEL: there is deliberately no default model.
 //
-//  Priority: non-Groq models first (sorted by version desc),
-//  Groq/* models always last. Re-discovers every 5 minutes.
+//  Always throws a `GeminiDirectError`, so the global error handler
+//  emits a rich `{error: {code, message, model}}` envelope.
 // ═══════════════════════════════════════════════════════════════
 
-const { noteDiscoveryResult } = require('./litellm-discovery-policy');
-
-let modelPriorityList = [];
-let _discoveryState = { attempts: 0, alerted: false, downSince: 0 };
-let _discoveryInFlight = false;
-const _REDISCOVERY_MS = 5 * 60 * 1000;
-const _CALL_TIMEOUT_MS = 30_000;
-const _MAX_RETRIES_PER_MODEL = 2;
-const _MAX_RETRIES_LAST_MODEL = 3;
-
-function _extractVersion(modelId) {
-  const match = modelId.match(/(\d+(?:\.\d+)?)/);
-  return match ? parseFloat(match[1]) : 0;
-}
-
-function _isGroqModel(id) {
-  const lower = id.toLowerCase();
-  return lower.startsWith('groq/') || lower.includes('llama');
-}
-
-function _isRetryableError(msg) {
-  return /429|500|502|503|504|timeout|ETIMEDOUT|ECONNRESET|socket hang up/i.test(msg);
-}
-
-function _sortModelPriority(models) {
-  const preferred = models.filter(m => !_isGroqModel(m));
-  const groq = models.filter(m => _isGroqModel(m));
-  preferred.sort((a, b) => _extractVersion(b) - _extractVersion(a));
-  groq.sort((a, b) => _extractVersion(b) - _extractVersion(a));
-  return [...preferred, ...groq];
-}
-
-// ── GET helper ─────────────────────────────────────────────────
-
-async function getLiteLLM(path) {
-  const response = await fetch(process.env.LITELLM_URL + path, {
-    headers: { 'Authorization': 'Bearer ' + process.env.LITELLM_VIRTUAL_KEY },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (!response.ok) {
-    const text = await response.text();
-    throw new Error(`LiteLLM GET ${response.status}: ${text.slice(0, 300)}`);
-  }
-  return response.json();
-}
-
-// ── Discovery ──────────────────────────────────────────────────
-
-async function discoverLiteLLMModels() {
-  // One in-flight call. The 5-minute interval is the only retry — stacking
-  // setTimeout on top of it is what produced "attempt 892/5" in Telegram.
-  if (_discoveryInFlight) return;
-  _discoveryInFlight = true;
-  try {
-    const data = await getLiteLLM('/v1/models');
-    const models = (data?.data || []).map(m => m.id).filter(Boolean);
-
-    if (models.length === 0) {
-      const msg = 'No models returned from /v1/models — check LiteLLM config';
-      console.warn(`[LiteLLM] ${msg}`);
-      tg.w('LiteLLM', msg);
-      return;
-    }
-
-    modelPriorityList = _sortModelPriority(models);
-    process.env._LITELLM_MODEL_PRIORITY = JSON.stringify(modelPriorityList);
-    const note = noteDiscoveryResult(_discoveryState, { ok: true, now: Date.now() });
-    _discoveryState = note.state;
-
-    updateGroundingModels(models);
-
-    const primary = modelPriorityList[0];
-    const fallbacks = modelPriorityList.slice(1);
-    const summary = `${models.length} models — Primary: ${primary}` +
-      (fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : '');
-
-    console.log(`[LiteLLM] Discovered ${summary}`);
-    if (note.telegram === 'recovered') {
-      tg.i('LiteLLM', `Discovery recovered. ${summary}`);
-    } else {
-      tg.i('LiteLLM', `Discovered ${summary}`);
-    }
-  } catch (e) {
-    const note = noteDiscoveryResult(_discoveryState, { ok: false, now: Date.now() });
-    _discoveryState = note.state;
-    // Keep modelPriorityList. A blip must not drop the last good catalog.
-    const msg = `Discovery failed (attempt ${note.state.attempts}): ${e.message}`;
-    console.warn(`[LiteLLM] ${msg}`);
-    if (note.telegram === 'down') {
-      tg.e('LiteLLM', `${msg}. Further failures stay quiet until it recovers.`, e);
-    }
-  } finally {
-    _discoveryInFlight = false;
-  }
-}
-
-setInterval(discoverLiteLLMModels, _REDISCOVERY_MS).unref();
-
-// ── Single completion call ─────────────────────────────────────
-
-async function _callLiteLLMOnce(model, messages, { temperature, maxTokens }) {
-  const response = await fetch(process.env.LITELLM_URL + '/v1/chat/completions', {
-    method: 'POST',
-    headers: {
-      'Content-Type': 'application/json',
-      'Authorization': 'Bearer ' + process.env.LITELLM_VIRTUAL_KEY,
-    },
-    body: JSON.stringify({
-      model,
-      messages,
-      max_tokens: maxTokens,
-      temperature,
-    }),
-    signal: AbortSignal.timeout(_CALL_TIMEOUT_MS),
-  });
-
-  if (!response.ok) {
-    const text = await response.text();
-    const err = new Error(`LiteLLM ${response.status} [${model}]: ${text.slice(0, 300)}`);
-    err.status = response.status;
-    throw err;
-  }
-
-  const data = await response.json();
-  return {
-    content: data.choices?.[0]?.message?.content || '',
-    model_used: data.model || model,
-    usage: data.usage || null,
-  };
-}
-
-// ── Smart caller with retry + fallback ─────────────────────────
-//
-// Routing matrix (in order):
-//   1. Caller-supplied Gemini model       → direct Google REST API
-//      (no proxy hop, the model id from Settings is sent verbatim
-//      to generativelanguage.googleapis.com so a brand-new model
-//      works the day Google ships it).
-//   2. If the direct call fails for a recoverable reason
-//      (model-not-found / rate-limit / server / network) AND
-//      `modelPriorityList` has other Gemini candidates discovered
-//      from LiteLLM, retry against those — this is the
-//      "self-healing" path so a typo in Settings degrades to the
-//      next best Gemini model instead of a hard failure.
-//   3. Non-Gemini model id (e.g. `groq/llama-…`) or no model
-//      supplied → fall back to the legacy LiteLLM proxy. This keeps
-//      the Llama fallback alive for the edge case where every
-//      Gemini call is rejected (e.g. paid-tier outage).
-//
-// The function always throws a `GeminiDirectError` when the entire
-// chain fails on the Gemini path, so the global error handler can
-// emit a rich `{error: {code, message, model}}` envelope to the
-// client.
-
 async function callLiteLLM({ messages, model, temperature = 0.7, maxTokens = 2048, jsonOutput = false, thinking = false }) {
-  // ── Path 1: direct Gemini ──────────────────────────────────
-  //
-  // Triggered when:
-  //   a) The caller explicitly passes a Gemini-shaped id
-  //      (`gemini-…` or `gemini/…`) — typically the user's
-  //      settings.liteModel from app preferences.
-  //   b) No model is supplied and the discovered LiteLLM priority
-  //      list contains at least one Gemini id — i.e. the
-  //      auto-pick path. We pick the first Gemini id from the list
-  //      and route DIRECT to Google (not back through the proxy)
-  //      so the "we don't depend on LiteLLM" invariant holds for
-  //      every Gemini code path, not just user-customised ones.
-  const explicitGemini = isGeminiModel(model);
-  const autoPickGemini = !model && modelPriorityList.some((m) => isGeminiModel(m));
-
-  if (explicitGemini || autoPickGemini) {
-    const userModel = explicitGemini ? stripGeminiPrefix(model) : null;
-    const fallbacks = modelPriorityList
-      .filter((m) => isGeminiModel(m))
-      .map((m) => stripGeminiPrefix(m))
-      .filter((m) => m && m !== userModel);
-    const modelsToTry = userModel ? [userModel, ...fallbacks] : fallbacks;
-
-    if (modelsToTry.length === 0) {
-      throw new GeminiDirectError(
-        'No Gemini models available — set a model in Settings → Gemini Lite model',
-        GEMINI_ERROR_CODES.INVALID_MODEL,
-        400,
-      );
-    }
-
-    let lastError;
-    for (let i = 0; i < modelsToTry.length; i++) {
-      const m = modelsToTry[i];
-      try {
-        const result = await geminiComplete({
-          model: m,
-          messages,
-          temperature,
-          maxTokens,
-          jsonOutput,
-          thinking,
-        });
-        if (i > 0) {
-          tg.w(
-            'GeminiDirect',
-            `Fallback ${m} succeeded after ${modelsToTry[0]} failed (${lastError?.code || 'unknown'})`,
-          );
-        }
-        return result;
-      } catch (e) {
-        lastError = e;
-        const recoverable =
-          e instanceof GeminiDirectError &&
-          (
-            e.code === GEMINI_ERROR_CODES.MODEL_NOT_FOUND ||
-            e.code === GEMINI_ERROR_CODES.RATE_LIMIT ||
-            e.code === GEMINI_ERROR_CODES.SERVER ||
-            e.code === GEMINI_ERROR_CODES.NETWORK ||
-            e.code === GEMINI_ERROR_CODES.TIMEOUT ||
-            e.code === GEMINI_ERROR_CODES.EMPTY
-          );
-        if (!recoverable) break;
-      }
-    }
-
-    tg.e(
-      'GeminiDirect',
-      `All Gemini models exhausted (${modelsToTry.join(', ')}): ${lastError?.code || lastError?.message}`,
-      lastError,
+  if (!isGeminiModel(model)) {
+    throw new GeminiDirectError(
+      model
+        ? `Model "${model}" is not a Gemini model — only Gemini is supported`
+        : 'No model supplied — set a model in Settings → Gemini Lite model',
+      GEMINI_ERROR_CODES.INVALID_MODEL,
+      400,
+      model || null,
     );
-    throw lastError;
   }
 
-  // ── Path 2: legacy LiteLLM proxy (non-Gemini, e.g. Groq llama) ─
-  //
-  // Only used when the caller explicitly passes a non-Gemini id
-  // (e.g. `groq/llama-3.3-70b-versatile`) OR the priority list has
-  // no Gemini ids at all (degenerate case — proxy mis-configured).
-  // The proxy is still the path of least resistance for Groq today;
-  // a future PR can swap this to a `groq-direct.js` module the same
-  // way Gemini was migrated.
-  if (modelPriorityList.length === 0 && !model) {
-    await discoverLiteLLMModels();
-    if (modelPriorityList.length === 0) {
-      const err = new Error('No LiteLLM models available — /v1/models returned empty');
-      tg.e('LiteLLM', err.message);
-      throw err;
-    }
-  }
+  const userModel = stripGeminiPrefix(model);
+  const fallbacks = geminiModels()
+    .map((m) => stripGeminiPrefix(m))
+    .filter((m) => m && m !== userModel);
+  const modelsToTry = [userModel, ...fallbacks];
 
-  const modelsToTry = model ? [model] : [...modelPriorityList];
   let lastError;
-
   for (let i = 0; i < modelsToTry.length; i++) {
     const m = modelsToTry[i];
-    const isLast = i === modelsToTry.length - 1;
-    const maxRetries = isLast ? _MAX_RETRIES_LAST_MODEL : _MAX_RETRIES_PER_MODEL;
-
-    for (let attempt = 0; attempt < maxRetries; attempt++) {
-      try {
-        if (attempt > 0) {
-          const delay = Math.min(500 * Math.pow(2, attempt), 4000);
-          await new Promise(r => setTimeout(r, delay));
-        }
-        const result = await _callLiteLLMOnce(m, messages, { temperature, maxTokens });
-        if (i > 0) {
-          tg.w('LiteLLM', `Fallback to ${m} succeeded (primary ${modelsToTry[0]} was down)`);
-        }
-        return result;
-      } catch (e) {
-        lastError = e;
-        const retryable = _isRetryableError(e.message);
-
-        if (!retryable || attempt >= maxRetries - 1) {
-          if (modelsToTry.length > 1) {
-            console.warn(`[LLM] ${m} exhausted after ${attempt + 1} attempts: ${e.message.slice(0, 120)}`);
-          }
-          break;
-        }
-        console.warn(`[LLM] ${m} retry ${attempt + 1}/${maxRetries}: ${e.message.slice(0, 80)}`);
+    try {
+      const result = await geminiComplete({
+        model: m,
+        messages,
+        temperature,
+        maxTokens,
+        jsonOutput,
+        thinking,
+      });
+      if (i > 0) {
+        tg.w(
+          'GeminiDirect',
+          `Fallback ${m} succeeded after ${modelsToTry[0]} failed (${lastError?.code || 'unknown'})`,
+        );
       }
+      return result;
+    } catch (e) {
+      lastError = e;
+      const recoverable =
+        e instanceof GeminiDirectError &&
+        (
+          e.code === GEMINI_ERROR_CODES.MODEL_NOT_FOUND ||
+          e.code === GEMINI_ERROR_CODES.RATE_LIMIT ||
+          e.code === GEMINI_ERROR_CODES.SERVER ||
+          e.code === GEMINI_ERROR_CODES.NETWORK ||
+          e.code === GEMINI_ERROR_CODES.TIMEOUT ||
+          e.code === GEMINI_ERROR_CODES.EMPTY
+        );
+      if (!recoverable) break;
     }
   }
 
-  tg.e('LiteLLM', `All ${modelsToTry.length} models exhausted: ${modelsToTry.join(', ')}`, lastError);
+  tg.e(
+    'GeminiDirect',
+    `All Gemini models exhausted (${modelsToTry.join(', ')}): ${lastError?.code || lastError?.message}`,
+    lastError,
+  );
   throw lastError;
 }
 
 // ── Model id normalisation ─────────────────────────────────────
 // Clients send a bare Gemini model id (e.g. "gemini-3.1-flash-lite-preview")
-// because that's what they store in app settings. The direct-Google path
-// in `gemini-direct.js` consumes the bare id verbatim, while the legacy
-// LiteLLM proxy path expects the provider-prefixed form
-// ("gemini/gemini-3.1-flash-lite-preview").
-//
-// We keep both formats valid downstream:
-//   • The direct path's `isGeminiModel` accepts both prefixed and bare ids
-//     and strips the prefix before sending to Google.
-//   • `_callLiteLLMOnce` (proxy path) sends whatever it gets; the proxy is
-//     happy with `gemini/<id>`.
-//
-// Therefore we DO NOT prefix here any more — passing the bare id keeps
-// the caller's intent intact and lets the routing layer decide which
-// transport to use based on `isGeminiModel`.
+// because that's what they store in app settings. `isGeminiModel` accepts
+// both bare and legacy `gemini/`-prefixed ids and the prefix is stripped
+// before the id is sent to Google, so the id is passed through untouched.
 function _normalizeLiteLLMGeminiId(id) {
   if (typeof id !== 'string') return null;
   const trimmed = id.trim();
@@ -510,25 +283,10 @@ function _pickLiteLLMModel(liteModel, legacyModel) {
   return null;
 }
 
-// ── Public accessors ───────────────────────────────────────────
-
-function getPrimaryModel() {
-  return modelPriorityList[0] || null;
-}
-
-function getFallbackModels() {
-  return modelPriorityList.slice(1);
-}
-
-function getModelPriorityList() {
-  return [...modelPriorityList];
-}
-
-// ── LLM error notifier for grounding outages ─────────────────
-// When Gemini grounding is completely down (all models × retries
-// exhausted), use Llama/Groq via LiteLLM to generate a friendly
-// error message for the user. Does NOT answer the question —
-// just explains the outage.
+// ── Grounding outage notice ───────────────────────────────────
+// Shown when Gemini grounding is completely down (all models ×
+// retries exhausted). Gemini is the only provider, so the notice
+// is static rather than generated.
 
 const _HARDCODED_ERROR_MSG =
   '⚠️ **Temporarily Unavailable**\n\n' +
@@ -536,48 +294,14 @@ const _HARDCODED_ERROR_MSG =
   'and I\'m unable to process your request right now.\n\n' +
   'Please try again in a moment — this is usually resolved quickly.';
 
-async function _notifyGroundingError(groundingError) {
-  const errMsg = groundingError instanceof Error
-    ? groundingError.message
-    : String(groundingError);
-
-  try {
-    const result = await callLiteLLM({
-      messages: [
-        {
-          role: 'system',
-          content:
-            'You are Nexus AI assistant. The primary AI model (Google Gemini) is temporarily down. '
-            + 'Write a brief, empathetic 2-3 sentence message to the user: '
-            + '(1) Acknowledge the issue, (2) include the short technical reason, '
-            + '(3) suggest trying again in a moment. Use markdown. Do NOT answer any question.',
-        },
-        {
-          role: 'user',
-          content: `Gemini API error: ${errMsg.slice(0, 400)}`,
-        },
-      ],
-      maxTokens: 250,
-      temperature: 0.2,
-    });
-
-    tg.i('LLM/error-notify', `✓ model=${result.model_used} — delivered Gemini outage notice`);
-    return {
-      text: result.content,
-      model: `${result.model_used} (error-notice)`,
-      sources: [],
-      searchQueries: [],
-      fallback: true,
-    };
-  } catch {
-    return {
-      text: _HARDCODED_ERROR_MSG,
-      model: 'error-fallback',
-      sources: [],
-      searchQueries: [],
-      fallback: true,
-    };
-  }
+async function _notifyGroundingError() {
+  return {
+    text: _HARDCODED_ERROR_MSG,
+    model: 'error-fallback',
+    sources: [],
+    searchQueries: [],
+    fallback: true,
+  };
 }
 
 // ═══════════════════════════════════════════════════════════════
@@ -2500,9 +2224,8 @@ aiRouter.post('/summarize', async (req, res, next) => {
 //
 //  Batch quick-summary for the News > For You "catch up" feature. Caller
 //  sends N already-extracted articles (title + condensed body) and we
-//  return a 1-2 sentence summary per id using Gemini 2.5 Flash Lite via
-//  LiteLLM (with automatic cascading fallback to other models if Lite is
-//  down — handled by callLiteLLM's model-priority list).
+//  return a 1-2 sentence summary per id using the Settings Gemini Lite
+//  model (GROUNDING_MODELS are the fallbacks, handled by callLiteLLM).
 //
 //  The Flutter client batches client-side (10 per request, 4 concurrent)
 //  so this endpoint stays simple and fast: one LLM round-trip per request.
@@ -2526,7 +2249,7 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
         tg.w('AI/summarize-batch', `Client omitted liteModel — using server-cached settings model ${dbModel}`);
         requestedModel = dbModel;
       } else {
-        tg.w('AI/summarize-batch', 'No liteModel set anywhere — falling back to LiteLLM priority list');
+        tg.w('AI/summarize-batch', 'No liteModel set anywhere — request will be rejected with INVALID_MODEL');
       }
     }
 
@@ -2616,25 +2339,12 @@ aiRouter.post('/summarize-articles-batch', async (req, res, next) => {
     //     comfortably below Flash Lite's 8K output ceiling.
     //   • Lower temperature (0.2) keeps output deterministic and
     //     discourages the model from padding paragraphs with filler.
-    let llmResult;
-    try {
-      llmResult = await callLiteLLM({
-        model: requestedModel || undefined,
-        messages,
-        maxTokens: 6500,
-        temperature: 0.2,
-      });
-    } catch (firstErr) {
-      // Settings-model failed (likely transient or temporarily missing on
-      // LiteLLM). Retry once with the discovered priority list so the user
-      // still gets a response — but logged loudly so we can investigate.
-      tg.w('AI/summarize-batch', `Settings model ${requestedModel || '(none)'} failed: ${firstErr.message?.slice(0, 120)} — trying priority list`);
-      llmResult = await callLiteLLM({
-        messages,
-        maxTokens: 6500,
-        temperature: 0.2,
-      });
-    }
+    const llmResult = await callLiteLLM({
+      model: requestedModel || undefined,
+      messages,
+      maxTokens: 6500,
+      temperature: 0.2,
+    });
 
     let parsed;
     try {
@@ -4430,8 +4140,8 @@ llmRouter.use(authenticate);
 
 llmRouter.get('/health', async (_req, res, next) => {
   try {
-    const data = await getLiteLLM('/health');
-    res.json(data);
+    const data = await listGeminiModels();
+    res.json({ status: 'ok', provider: 'gemini', models: data.models.length, primary: data.primary });
   } catch (err) {
     next(err);
   }
@@ -4449,10 +4159,8 @@ llmRouter.get('/config', async (_req, res) => {
   } catch {}
 
   res.json({
-    litellm: {
-      primary: getPrimaryModel(),
-      fallbacks: getFallbackModels(),
-      all: getModelPriorityList(),
+    gemini: {
+      fallbacks: geminiModels(),
     },
     grounding,
     xgrok,
@@ -4462,10 +4170,10 @@ llmRouter.get('/config', async (_req, res) => {
   });
 });
 
-llmRouter.get('/models', async (_req, res, next) => {
+llmRouter.get('/models', async (req, res, next) => {
   try {
-    const data = await getLiteLLM('/v1/models');
-    res.json(data);
+    const force = req.query.refresh === '1' || req.query.refresh === 'true';
+    res.json(await listGeminiModels({ force }));
   } catch (err) {
     next(err);
   }
@@ -6872,18 +6580,13 @@ async function _initTablesWithRetry(maxRetries = 3) {
 (async () => {
   try {
     await _initTablesWithRetry(3);
-    await discoverLiteLLMModels();
 
-    // ── Startup sanity check: confirm GOOGLE_API_KEY is usable ──
+    // ── Startup sanity check: confirm GOOGLE_API_KEY works ──
     //
-    // The direct-Gemini transport is the primary path for every AI
-    // feature now (rephrase, coach, news summarize, dictionary,
-    // smart-parse, …). If the key is missing or unsubstituted
-    // (`${GOOGLE_API_KEY}` placeholder, common with bare-node
-    // startups), we surface ONE loud warning here so the operator
-    // sees it instead of waiting for the first user complaint.
-    // We do NOT crash — the legacy LiteLLM/xGrok path can still
-    // service requests for non-Gemini models.
+    // The key's presence is enforced at boot (llmConfigProblem).
+    // This live probe only warns: a Google outage must not take
+    // down the non-AI routes (expenses, cloud, NAS), and the
+    // xGrok routes keep working without Gemini.
     try {
       const probe = await listGeminiModels({ force: true });
       console.log(`[Gemini] ✓ Direct API usable — ${probe.models.length} models accessible to GOOGLE_API_KEY`);
@@ -6955,21 +6658,19 @@ async function _initTablesWithRetry(maxRetries = 3) {
   }
 
   app.listen(PORT, () => {
-    const primary = getPrimaryModel();
-    const fallbacks = getFallbackModels();
+    const fallbacks = geminiModels();
     const grounding = getGroundingConfig();
     const xgrok = getXGrokConfig();
 
     console.log(`Nexus AI API running on port ${PORT}`);
-    console.log(`LiteLLM: ${process.env.LITELLM_URL}`);
-    console.log(`LiteLLM Primary: ${primary || 'none detected'}${fallbacks.length ? ` | Fallback: ${fallbacks.join(', ')}` : ''}`);
+    console.log(`Gemini fallbacks: ${fallbacks.join(', ')}`);
     console.log(`Grounding Lite: ${grounding.liteModel || 'none'} | Pro: ${grounding.proModel || 'none'}`);
     console.log(`xGrok: ${xgrok.available ? `Lite=${xgrok.liteModel} Deep=${xgrok.deepModel} Thinking=${xgrok.thinkingModel}` : 'not configured'}`);
     const xFeedInfo = getXFeedStatus();
     console.log(`X-Feed: ${xFeedInfo.schedulerActive ? `active (next in ${xFeedInfo.schedule.nextRunHours}h)` : 'disabled'}`);
     console.log(`Database: ${process.env.DATABASE_URL?.replace(/:[^:@]+@/, ':***@')}`);
 
-    tg.i('Startup', `API running on :${PORT} — LLM: ${primary || 'none'} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available} | X-Feed: ${xFeedInfo.schedulerActive}`);
+    tg.i('Startup', `API running on :${PORT} — Gemini fallbacks: ${fallbacks.join(', ')} | Grounding: ${grounding.liteModel || 'none'} | xGrok: ${xgrok.available} | X-Feed: ${xFeedInfo.schedulerActive}`);
   });
 })();
 
