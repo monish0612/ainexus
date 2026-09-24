@@ -13,8 +13,6 @@ const {
   isModelRefusal,
   buildRephraseSystemPrompt,
   looksLikeReplyInsteadOfRephrase,
-  rephrasePieces,
-  rephraseOutputBudget,
 } = require('../src/prompts');
 
 const NEW_IDS = [
@@ -52,7 +50,7 @@ test('AI_REPHRASE_PLATFORM_META in index.js registers every new id', () => {
 });
 
 test('rephrase route wraps user text, enables thinking + json, and checks refusal', () => {
-  assert.match(INDEX_SRC, /wrapUserText\(piece\)/);
+  assert.match(INDEX_SRC, /wrapUserText\(sourceText\)/);
   assert.match(INDEX_SRC, /thinking:\s*true/);
   assert.match(INDEX_SRC, /jsonOutput:\s*true/);
   assert.match(INDEX_SRC, /isModelRefusal\(rephrasedText\)/);
@@ -131,18 +129,6 @@ test('isModelRefusal matches qualified phrases only in the head', () => {
   assert.equal(isModelRefusal('I can\u2019t help with that.'), true);
   assert.equal(isModelRefusal(`${'x'.repeat(200)}I cannot help with that.`), false);
   assert.equal(isModelRefusal(''), false);
-});
-
-test('long rewrites split and short or capped tones stay one piece', () => {
-  assert.deepEqual(rephrasePieces('formal', 'Send the file today.'), ['Send the file today.']);
-  const long = `${'Alpha sentence about the file. '.repeat(40)}`;
-  const pieces = rephrasePieces('formal', long);
-  assert.ok(pieces.length > 1);
-  assert.equal(pieces.join(''), long);
-  assert.equal(rephrasePieces('reply', long).length, 1);
-  assert.equal(rephrasePieces('slack', long).length, 1);
-  const budget = rephraseOutputBudget(long.slice(0, 700), 'formal');
-  assert.ok(budget > 192 && budget <= 1024);
 });
 
 test('thinking: true is only on /rephrase, not /correct', () => {

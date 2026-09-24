@@ -15,8 +15,6 @@ const {
   isModelRefusal,
   buildRephraseSystemPrompt,
   looksLikeReplyInsteadOfRephrase,
-  rephrasePieces,
-  rephraseOutputBudget,
   REPHRASE_RETRY_NUDGE,
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,
@@ -356,7 +354,7 @@ const LLMCorrectSchema = z.object({
 });
 
 const AIRephraseSchema = z.object({
-  text: z.string().min(1).max(20000),
+  text: z.string().min(1).max(5000),
   platform: z.string().min(1),
   intent: z.string().max(500).optional(),
   model: z.string().optional(),
@@ -1567,21 +1565,6 @@ app.use('/api/v1/narration', requireApp, buildNarrationRouter(express, pool));
 
 const aiRouter = express.Router();
 
-async function _mapPool(items, limit, fn) {
-  const out = new Array(items.length);
-  let next = 0;
-  const workers = Math.min(limit, items.length);
-  async function worker() {
-    while (next < items.length) {
-      const i = next;
-      next += 1;
-      out[i] = await fn(items[i], i);
-    }
-  }
-  await Promise.all(Array.from({ length: workers }, () => worker()));
-  return out;
-}
-
 aiRouter.post('/rephrase', async (req, res, next) => {
   const _t0 = Date.now();
   try {
@@ -1593,62 +1576,28 @@ aiRouter.post('/rephrase', async (req, res, next) => {
     const sourceText = asString(val.data.text || '');
     const systemPrompt = buildRephraseSystemPrompt(platformId, intent);
     const pickedModel = _pickLiteLLMModel(val.data.liteModel, val.data.model);
-    const pieces = rephrasePieces(platformId, sourceText);
-    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${sourceText.length}, pieces=${pieces.length}, model=${pickedModel || '(default)'}`);
+    tg.d('AI/rephrase', `platform=${platformId}${intent ? ` intent="${intent.slice(0, 60)}"` : ''}, textLen=${sourceText.length}, model=${pickedModel || '(default)'}`);
 
-    const skipReplyDetect = REPHRASE_ANSWER_PLATFORMS.has(platformId);
-    const rewritePiece = async (piece) => {
-      const runOnce = (extraSystem) => callLiteLLM({
-        model: pickedModel || undefined,
-        messages: [
-          { role: 'system', content: extraSystem ? `${systemPrompt}\n\n${extraSystem}` : systemPrompt },
-          { role: 'user', content: wrapUserText(piece) },
-        ],
-        maxTokens: rephraseOutputBudget(piece, platformId),
-        // Lower temp → more faithful rewrites, fewer conversational replies.
-        temperature: 0.35,
-        jsonOutput: true,
-        thinking: true,
-      });
+    const runOnce = (extraSystem) => callLiteLLM({
+      model: pickedModel || undefined,
+      messages: [
+        { role: 'system', content: extraSystem ? `${systemPrompt}\n\n${extraSystem}` : systemPrompt },
+        { role: 'user', content: wrapUserText(sourceText) },
+      ],
+      maxTokens: 800,
+      // Lower temp → more faithful rewrites, fewer conversational replies.
+      temperature: 0.35,
+      jsonOutput: true,
+      thinking: true,
+    });
 
-      let result = await runOnce(null);
-      let parsed = parseJsonContent(result.content);
-      let rephrasedText = asString(
-        parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
-      );
+    let result = await runOnce(null);
+    let parsed = parseJsonContent(result.content);
+    let rephrasedText = asString(
+      parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
+    );
 
-      if (rephrasedText && isModelRefusal(rephrasedText)) {
-        return { refusal: true, result, text: rephrasedText };
-      }
-
-      // One-shot retry when the model answers instead of rephrasing.
-      // reply/define are supposed to answer, so skip the detector there.
-      if (!skipReplyDetect && rephrasedText && looksLikeReplyInsteadOfRephrase(piece, rephrasedText)) {
-        tg.w('AI/rephrase', `reply-shaped output detected — retrying once (platform=${platformId})`);
-        result = await runOnce(REPHRASE_RETRY_NUDGE);
-        parsed = parseJsonContent(result.content);
-        const retryText = asString(
-          parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
-        );
-        if (retryText && !looksLikeReplyInsteadOfRephrase(piece, retryText)) {
-          rephrasedText = retryText;
-        } else if (retryText && looksLikeReplyInsteadOfRephrase(piece, retryText)) {
-          tg.w('AI/rephrase', 'retry still reply-shaped — falling back to source text');
-          rephrasedText = piece;
-        } else {
-          rephrasedText = retryText || piece;
-        }
-      }
-
-      if (rephrasedText && isModelRefusal(rephrasedText)) {
-        return { refusal: true, result, text: rephrasedText };
-      }
-
-      return { refusal: false, result, text: rephrasedText || piece };
-    };
-
-    const rewritten = await _mapPool(pieces, 6, rewritePiece);
-    if (rewritten.some((piece) => piece.refusal)) {
+    if (rephrasedText && isModelRefusal(rephrasedText)) {
       tg.w('AI/rephrase', `refusal detected — not returning model text (platform=${platformId})`);
       return res.status(422).json({
         error: {
@@ -1658,9 +1607,37 @@ aiRouter.post('/rephrase', async (req, res, next) => {
       });
     }
 
-    const rephrasedText = rewritten.map((piece) => piece.text).join('');
-    const result = rewritten[rewritten.length - 1].result;
-    tg.i('AI/rephrase', `✓ model=${result.model_used} ${Date.now() - _t0}ms, platform=${platformId}, pieces=${pieces.length}`);
+    // One-shot retry when the model answers instead of rephrasing.
+    // reply/define are supposed to answer, so skip the detector there.
+    const skipReplyDetect = REPHRASE_ANSWER_PLATFORMS.has(platformId);
+    if (!skipReplyDetect && rephrasedText && looksLikeReplyInsteadOfRephrase(sourceText, rephrasedText)) {
+      tg.w('AI/rephrase', `reply-shaped output detected — retrying once (platform=${platformId})`);
+      result = await runOnce(REPHRASE_RETRY_NUDGE);
+      parsed = parseJsonContent(result.content);
+      const retryText = asString(
+        parsed?.rephrasedText || parsed?.rephrased_text || parsed?.text || '',
+      );
+      if (retryText && !looksLikeReplyInsteadOfRephrase(sourceText, retryText)) {
+        rephrasedText = retryText;
+      } else if (retryText && looksLikeReplyInsteadOfRephrase(sourceText, retryText)) {
+        tg.w('AI/rephrase', 'retry still reply-shaped — falling back to source text');
+        rephrasedText = sourceText;
+      } else {
+        rephrasedText = retryText || sourceText;
+      }
+    }
+
+    if (rephrasedText && isModelRefusal(rephrasedText)) {
+      tg.w('AI/rephrase', `refusal after retry — not returning model text (platform=${platformId})`);
+      return res.status(422).json({
+        error: {
+          code: 'REFUSAL',
+          message: 'Blocked — try another tone',
+        },
+      });
+    }
+
+    tg.i('AI/rephrase', `✓ model=${result.model_used} ${Date.now() - _t0}ms, platform=${platformId}`);
     res.json({
       platform: platformId,
       rephrasedText: rephrasedText || sourceText,

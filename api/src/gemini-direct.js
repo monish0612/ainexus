@@ -93,9 +93,8 @@ function _markThinkingUnsupported(modelId) {
 /**
  * Pick the fastest thinking config for a Gemini model.
  *
- * Flash-Lite already defaults to minimal. Forcing "low" makes every
- * rephrase wait on extra reasoning, and a long paragraph waits longer.
- * Flash (not lite) defaults to medium or high, so minimal is the fast path.
+ * Gemini 3+ Flash defaults to medium thinking (~4–5s). The latency win is
+ * `thinkingLevel: "low"` on any flash-lite / `"minimal"` on flash.
  * Gemini 2.5 uses `thinkingBudget: 0`. 1.x, pro, and unknown ids omit it.
  *
  * @param {string} modelId
@@ -112,10 +111,10 @@ function thinkingConfigFor(modelId) {
   if (/gemini-1\./.test(id) || /gemini-2\./.test(id)) {
     return null;
   }
-  // Gemini 3+ flash-lite: minimal is the fastest level the model accepts.
-  // Unknown names omit the field; a 400 still retries bare.
+  // Gemini 3+ (and later flash-lite ids such as 3.5 / 4.x): low on lite,
+  // minimal on flash. Unknown names omit the field; a 400 still retries bare.
   if (/flash-lite/.test(id)) {
-    return { thinkingConfig: { thinkingLevel: 'minimal' } };
+    return { thinkingConfig: { thinkingLevel: 'low' } };
   }
   if (/flash/.test(id) && !/pro/.test(id)) {
     return { thinkingConfig: { thinkingLevel: 'minimal' } };
