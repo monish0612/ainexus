@@ -279,6 +279,62 @@ const REPHRASE_RETRY_NUDGE = [
   'Remember: source "hey can we get the lunch from starbucks?" → rephrase like "hey, fancy grabbing lunch from Starbucks?" — NEVER "Hey sure, which Starbucks…".',
 ].join(' ');
 
+const REPHRASE_SPLIT_AT = 900;
+const REPHRASE_CHUNK_CHARS = 700;
+
+/**
+ * Break a long rewrite into pieces that can run at once.
+ * Short text stays one piece. Cuts land on a paragraph, line, or sentence
+ * and every character is kept, so the pieces join back to the source.
+ */
+function splitRephraseSource(text) {
+  const src = String(text || '');
+  if (src.length <= REPHRASE_SPLIT_AT) return [src];
+  const chunks = [];
+  let i = 0;
+  while (i < src.length) {
+    if (src.length - i <= REPHRASE_CHUNK_CHARS) {
+      chunks.push(src.slice(i));
+      break;
+    }
+    const window = src.slice(i, i + REPHRASE_CHUNK_CHARS);
+    const breaks = ['\n\n', '\n', '. ', '? ', '! ', ' '];
+    let cut = -1;
+    for (const b of breaks) {
+      const at = window.lastIndexOf(b);
+      if (at >= Math.floor(REPHRASE_CHUNK_CHARS * 0.45)) {
+        cut = at + b.length;
+        break;
+      }
+    }
+    if (cut < 1) cut = REPHRASE_CHUNK_CHARS;
+    chunks.push(src.slice(i, i + cut));
+    i += cut;
+  }
+  return chunks;
+}
+
+/**
+ * Reply, define, and the short-format tones stay one call.
+ * A long rewrite is split so the model is not generating the whole page serially.
+ */
+function rephrasePieces(platformId, text) {
+  const spec = REPHRASE_PLATFORMS[platformId];
+  if (REPHRASE_ANSWER_PLATFORMS.has(platformId)) return [String(text || '')];
+  if (spec && spec.charLimit) return [String(text || '')];
+  return splitRephraseSource(text);
+}
+
+/** Output cap sized to the piece, so a long rewrite is not chopped at 800 tokens. */
+function rephraseOutputBudget(text, platformId) {
+  const grow = platformId === 'expand'
+    || platformId === 'email-long'
+    || platformId === 'linkedin'
+    || platformId === 'forum';
+  const tokens = Math.ceil(String(text || '').length * (grow ? 0.55 : 0.4)) + 96;
+  return Math.max(192, Math.min(grow ? 1600 : 1024, tokens));
+}
+
 /**
  * Detects reply-shaped model output that should be rejected and retried.
  * Returns true when [output] looks like a conversational answer while [source]
@@ -1110,6 +1166,8 @@ module.exports = {
   isModelRefusal,
   buildRephraseSystemPrompt,
   looksLikeReplyInsteadOfRephrase,
+  rephrasePieces,
+  rephraseOutputBudget,
   REPHRASE_RETRY_NUDGE,
   COACH_SYSTEM_PROMPT,
   buildDictionarySystemPrompt,

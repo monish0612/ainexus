@@ -441,29 +441,29 @@ test('geminiComplete: inline data:base64 image is forwarded as inline_data', asy
 
 // ── Thinking config (rephrase fast-path) ─────────────────────
 
-test('thinkingConfigFor: gemini 3 flash-lite → low', () => {
+test('thinkingConfigFor: gemini 3 flash-lite → minimal', () => {
   assert.deepEqual(
     thinkingConfigFor('gemini-3.1-flash-lite-preview')?.thinkingConfig,
-    { thinkingLevel: 'low' },
+    { thinkingLevel: 'minimal' },
   );
   assert.deepEqual(
     thinkingConfigFor('gemini-3.5-flash-lite')?.thinkingConfig,
-    { thinkingLevel: 'low' },
+    { thinkingLevel: 'minimal' },
   );
   assert.deepEqual(
     thinkingConfigFor('gemini/gemini-3.1-flash-lite-preview')?.thinkingConfig,
-    { thinkingLevel: 'low' },
+    { thinkingLevel: 'minimal' },
   );
 });
 
-test('thinkingConfigFor: a later flash-lite generation still gets low', () => {
+test('thinkingConfigFor: a later flash-lite generation still gets minimal', () => {
   assert.deepEqual(
     thinkingConfigFor('gemini-4.0-flash-lite')?.thinkingConfig,
-    { thinkingLevel: 'low' },
+    { thinkingLevel: 'minimal' },
   );
   assert.deepEqual(
     thinkingConfigFor('gemini-3.6-flash-lite-preview')?.thinkingConfig,
-    { thinkingLevel: 'low' },
+    { thinkingLevel: 'minimal' },
   );
 });
 
@@ -511,7 +511,7 @@ test('geminiComplete: thinking defaults off even for flash-lite', async () => {
   );
 });
 
-test('geminiComplete: thinking true on flash-lite sends thinkingLevel low', async () => {
+test('geminiComplete: thinking true on flash-lite sends thinkingLevel minimal', async () => {
   resetThinkingConfigState();
   let receivedBody = null;
   await withFakeFetch(
@@ -528,7 +528,7 @@ test('geminiComplete: thinking true on flash-lite sends thinkingLevel low', asyn
         thinking: true,
       });
       assert.deepEqual(receivedBody.generationConfig.thinkingConfig, {
-        thinkingLevel: 'low',
+        thinkingLevel: 'minimal',
       });
     },
   );
