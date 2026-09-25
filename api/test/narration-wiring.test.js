@@ -11,7 +11,7 @@ const GEMINI = fs.readFileSync(path.join(__dirname, '..', 'src', 'gemini-direct.
 const CLIENT = fs.readFileSync(path.join(__dirname, '..', 'src', 'narration-client.js'), 'utf8');
 
 test('narration ingest is fire-and-forget and does not await the orchestrator', () => {
-  assert.match(SRC, /enqueueFromIngest/);
+  assert.doesNotMatch(SRC, /enqueueFromIngest/);
   assert.match(CLIENT, /setImmediate/);
   assert.doesNotMatch(CLIENT, /geminiComplete/);
   assert.doesNotMatch(CLIENT, /summarize-articles-batch/);
@@ -31,7 +31,7 @@ test('clear-all and delete drop narrator audio, ingest still enqueues immediatel
   assert.match(INDEX, /dropArticles\(result\.rows\.map/);
   assert.match(INDEX, /dropArticles\(\[id\]\)/);
   assert.match(SRC, /dropArticles/);
-  assert.match(SRC, /enqueueFromIngest/);
+  assert.doesNotMatch(SRC, /enqueueFromIngest/);
   assert.doesNotMatch(CLIENT, /geminiComplete/);
 });
 

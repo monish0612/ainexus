@@ -64,6 +64,19 @@ async function getJson(path, { timeoutMs = 4000 } = {}) {
 }
 
 const DEFAULT_NARRATION_MODEL = 'gemini-2.5-flash-lite';
+const DEFAULT_TTS_MODEL = 'chirp3-hd';
+const DEFAULT_TTS_VOICE = 'en-US-Chirp3-HD-Charon';
+
+async function pref(pool, key, fallback) {
+  if (!pool) return fallback;
+  try {
+    const r = await pool.query('SELECT value FROM user_preferences WHERE key = $1', [key]);
+    const value = String(r.rows[0]?.value || '').trim();
+    return value || fallback;
+  } catch {
+    return fallback;
+  }
+}
 
 async function narrationModel(pool) {
   if (!pool) return DEFAULT_NARRATION_MODEL;
@@ -157,6 +170,7 @@ async function proxyAudio(req, res, cacheKey, { hd = false, chunk = null } = {})
 module.exports = {
   enabled,
   narrationModel,
+  pref,
   enqueueFromIngest,
   ensureJob,
   jobStatus,

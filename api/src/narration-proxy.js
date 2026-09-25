@@ -47,6 +47,8 @@ function buildNarrationRouter(express, pool) {
         text: text.slice(0, 120000),
         hd: !!req.body?.hd,
         model: await require('./narration-client').narrationModel(pool),
+        tts_model: await require('./narration-client').pref(pool, 'narration_tts_model', 'chirp3-hd'),
+        voice: await require('./narration-client').pref(pool, 'narration_voice', 'en-US-Chirp3-HD-Charon'),
       });
       res.json({ articleId: id, ...rec, configured: enabled() });
     } catch (err) {
