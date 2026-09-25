@@ -6,7 +6,6 @@ const {
   readGeminiApiKey,
   readTavilyApiKey,
   readXaiApiKey,
-  readZyteApiKey,
   geminiModels,
   geminiProModel,
   llmConfigProblem,
@@ -16,7 +15,6 @@ const VALID_KEY = 'AIzaTEST_CI_FAKE_KEY_4444444444444444444';
 const OTHER_KEYS = {
   TAVILY_API_KEY: 'tvly-TEST_CI_FAKE_KEY_000000000',
   XAI_API_KEY: 'xai-TEST_CI_FAKE_KEY_0000000000000',
-  ZYTE_API_KEY: 'TEST_CI_FAKE_ZYTE_KEY_00000000',
 };
 const KEYS = ['GEMINI_API_KEY', 'GEMINI_FALLBACK_MODELS', 'GEMINI_PRO_MODEL', 'GOOGLE_API_KEY', 'GROUNDING_MODELS', 'XGROK_API_KEY', ...Object.keys(OTHER_KEYS)];
 const BASE = { GEMINI_API_KEY: VALID_KEY, GEMINI_FALLBACK_MODELS: 'gemini-3.1-flash-lite-preview', ...OTHER_KEYS };
@@ -41,7 +39,6 @@ test('all standard keys and a Gemini model list pass', () => {
     assert.equal(readGeminiApiKey(), VALID_KEY);
     assert.equal(readTavilyApiKey(), OTHER_KEYS.TAVILY_API_KEY);
     assert.equal(readXaiApiKey(), OTHER_KEYS.XAI_API_KEY);
-    assert.equal(readZyteApiKey(), OTHER_KEYS.ZYTE_API_KEY);
   });
 });
 

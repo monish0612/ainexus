@@ -74,7 +74,7 @@ const {
   ERROR_CODES: GEMINI_ERROR_CODES,
   mapErrorToHttp: mapGeminiErrorToHttp,
 } = require('./gemini-direct');
-const { geminiModels, llmConfigProblem, readTavilyApiKey, readZyteApiKey } = require('./llm-config');
+const { geminiModels, llmConfigProblem, readTavilyApiKey } = require('./llm-config');
 const { tg } = require('./telegram');
 const {
   buildExpenseInsightPrompt,
@@ -1948,61 +1948,7 @@ async function deepExtractContent(url, { logTag = 'DeepExtract' } = {}) {
     tg.d(logTag, `Stage2 → BLOCKED (content=${content.length}ch paywall=${paywallSource}) — entering deep extraction`);
   }
 
-  // ── Stage 3: Zyte headless browser extraction (1× retry on 429/5xx) ──
-  const zyteKey = readZyteApiKey();
-  if (isBlocked && zyteKey) {
-    const _s3 = Date.now();
-    const _zyteOnce = () => fetch('https://api.zyte.com/v1/extract', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Basic ' + Buffer.from(zyteKey + ':').toString('base64'),
-      },
-      body: JSON.stringify({ url, browserHtml: true, article: true }),
-      signal: AbortSignal.timeout(45000),
-    });
-
-    for (let _a3 = 0; _a3 < 2; _a3++) {
-      try {
-        if (_a3 > 0) await new Promise(r => setTimeout(r, 2000));
-        const zyteRes = await _zyteOnce();
-
-        if (zyteRes.ok) {
-          const zyteData = await zyteRes.json();
-          const articleBody = zyteData?.article?.articleBody || '';
-          const headline = zyteData?.article?.headline || '';
-          const browserHtmlText = zyteData?.browserHtml
-            ? stripHtmlToText(zyteData.browserHtml)
-            : '';
-
-          if (browserHtmlText.length > articleBody.length && browserHtmlText.length > 300) {
-            content = browserHtmlText.slice(0, 12000);
-            if (!title) title = extractTitleFromHtml(zyteData.browserHtml);
-            if (headline) title = headline;
-            extractionMethod = 'zyte-html';
-            tg.d(logTag, `Stage3 ✓ zyte-html ${Date.now() - _s3}ms ${content.length}ch (browser=${browserHtmlText.length} > article=${articleBody.length})${_a3 ? ' (retry)' : ''}`);
-          } else if (articleBody.length > 200) {
-            content = articleBody.slice(0, 12000);
-            title = headline || title;
-            extractionMethod = 'zyte-article';
-            tg.d(logTag, `Stage3 ✓ zyte-article ${Date.now() - _s3}ms ${content.length}ch (article=${articleBody.length} >= browser=${browserHtmlText.length})${_a3 ? ' (retry)' : ''}`);
-          } else {
-            tg.d(logTag, `Stage3 zyte insufficient ${Date.now() - _s3}ms article=${articleBody.length}ch browser=${browserHtmlText.length}ch`);
-          }
-          break;
-        } else {
-          const retryable = zyteRes.status === 429 || zyteRes.status >= 500;
-          tg.w(logTag, `Stage3 Zyte HTTP ${zyteRes.status} ${Date.now() - _s3}ms${_a3 ? ' (retry)' : ''}${retryable && _a3 < 1 ? ' — will retry' : ''}`);
-          if (!retryable || _a3 >= 1) break;
-        }
-      } catch (zyteErr) {
-        tg.w(logTag, `Stage3 Zyte error ${Date.now() - _s3}ms: ${zyteErr.message?.slice(0, 80)}${_a3 ? ' (retry)' : ''}`);
-        if (_a3 >= 1) break;
-      }
-    }
-  }
-
-  // ── Stage 4: Parallel fallback — Tavily ∥ Gemini Grounding ───────────
+  // ── Stage 3: Parallel fallback — Tavily ∥ Gemini Grounding ───────────
   const stillBlocked = content.length < 500 || (paywallDetected && extractionMethod === 'direct-fetch');
   if (stillBlocked) {
     const _s4 = Date.now();

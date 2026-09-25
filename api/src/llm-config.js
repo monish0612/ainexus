@@ -12,7 +12,6 @@
 //    GEMINI_PRO_MODEL        optional. Deep grounded research model.
 //    TAVILY_API_KEY          required. Tavily web search.
 //    XAI_API_KEY             required. xAI Grok.
-//    ZYTE_API_KEY            required. Zyte article extraction.
 //
 //  Values are read live on every call so tests can toggle them.
 // ═══════════════════════════════════════════════════════════════
@@ -40,10 +39,6 @@ function readXaiApiKey() {
   return readKey('XAI_API_KEY', 20);
 }
 
-function readZyteApiKey() {
-  return readKey('ZYTE_API_KEY', 20);
-}
-
 function geminiModels() {
   return (process.env.GEMINI_FALLBACK_MODELS || '')
     .split(',')
@@ -68,7 +63,7 @@ function llmConfigProblem() {
   if (bad.length > 0) {
     return `GEMINI_FALLBACK_MODELS must list Gemini ids only; got: ${bad.join(', ')}`;
   }
-  for (const [name, read] of [['TAVILY_API_KEY', readTavilyApiKey], ['XAI_API_KEY', readXaiApiKey], ['ZYTE_API_KEY', readZyteApiKey]]) {
+  for (const [name, read] of [['TAVILY_API_KEY', readTavilyApiKey], ['XAI_API_KEY', readXaiApiKey]]) {
     if (!read()) return `${name} is missing, an unexpanded placeholder, or shorter than 20 chars`;
   }
   return null;
@@ -78,7 +73,6 @@ module.exports = {
   readGeminiApiKey,
   readTavilyApiKey,
   readXaiApiKey,
-  readZyteApiKey,
   geminiModels,
   geminiProModel,
   llmConfigProblem,
