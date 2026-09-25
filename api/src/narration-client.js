@@ -70,7 +70,7 @@ async function narrationModel(pool) {
   try {
     const r = await pool.query("SELECT value FROM user_preferences WHERE key = 'narration_model'");
     const value = String(r.rows[0]?.value || '').trim();
-    if (/^gemini-[\w.]*flash/i.test(value)) return value;
+    if (/^gemini-[\w.-]*flash/i.test(value)) return value;
   } catch { /* preference missing is fine */ }
   return DEFAULT_NARRATION_MODEL;
 }
