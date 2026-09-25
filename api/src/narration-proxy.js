@@ -66,6 +66,21 @@ function buildNarrationRouter(express, pool) {
     }
   });
 
+  router.get('/:id/chunks/:index', async (req, res, next) => {
+    try {
+      const rec = await jobStatus(req.params.id);
+      const cacheKey = rec?.cache_key || rec?.cacheKey;
+      const index = Number(req.params.index);
+      const ready = Array.isArray(rec?.chunks) ? rec.chunks : [];
+      if (!cacheKey || !ready.includes(index)) {
+        return res.status(404).json({ error: 'chunk not ready' });
+      }
+      await proxyAudio(req, res, cacheKey, { chunk: index });
+    } catch (err) {
+      next(err);
+    }
+  });
+
   router.get('/:id/audio', async (req, res, next) => {
     try {
       const rec = await jobStatus(req.params.id);

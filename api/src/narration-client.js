@@ -121,13 +121,15 @@ function dropArticles(ids) {
   });
 }
 
-async function proxyAudio(req, res, cacheKey, { hd = false } = {}) {
+async function proxyAudio(req, res, cacheKey, { hd = false, chunk = null } = {}) {
   const root = baseUrl();
   if (!root) {
     res.status(503).json({ error: 'narration unconfigured' });
     return;
   }
-  const url = `${root}/v1/audio/${encodeURIComponent(cacheKey)}.opus${hd ? '?hd=1' : ''}`;
+  const url = chunk == null
+    ? `${root}/v1/audio/${encodeURIComponent(cacheKey)}.opus${hd ? '?hd=1' : ''}`
+    : `${root}/v1/audio/${encodeURIComponent(cacheKey)}/chunks/${chunk}.opus`;
   const headers = { 'X-API-Key': apiKey() };
   if (req.headers.range) headers.Range = req.headers.range;
   const ctrl = new AbortController();
