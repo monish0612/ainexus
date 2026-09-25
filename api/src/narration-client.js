@@ -63,7 +63,19 @@ async function getJson(path, { timeoutMs = 4000 } = {}) {
   }
 }
 
-function enqueueFromIngest({ articleId, title, category, source, text }) {
+const DEFAULT_NARRATION_MODEL = 'gemini-2.5-flash-lite';
+
+async function narrationModel(pool) {
+  if (!pool) return DEFAULT_NARRATION_MODEL;
+  try {
+    const r = await pool.query("SELECT value FROM user_preferences WHERE key = 'narration_model'");
+    const value = String(r.rows[0]?.value || '').trim();
+    if (/^gemini-[\w.]*flash/i.test(value)) return value;
+  } catch { /* preference missing is fine */ }
+  return DEFAULT_NARRATION_MODEL;
+}
+
+function enqueueFromIngest({ articleId, title, category, source, text, pool }) {
   if (!enabled()) return;
   const payload = {
     article_id: articleId,
@@ -74,7 +86,7 @@ function enqueueFromIngest({ articleId, title, category, source, text }) {
   };
   if (!payload.text.trim()) return;
   setImmediate(() => {
-    postJson('/v1/jobs', payload).catch((err) => {
+    narrationModel(pool).then((model) => postJson('/v1/jobs', { ...payload, model })).catch((err) => {
       tg.w('NARRATION/ingest', `enqueue failed ${articleId}: ${err.message}`.slice(0, 180));
     });
   });
@@ -142,6 +154,7 @@ async function proxyAudio(req, res, cacheKey, { hd = false } = {}) {
 
 module.exports = {
   enabled,
+  narrationModel,
   enqueueFromIngest,
   ensureJob,
   jobStatus,

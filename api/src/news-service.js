@@ -1267,6 +1267,7 @@ async function processItem({ pool, item, feed, config, settings, summaryLimiter,
       category: feed.app_category || 'Technology',
       source,
       text: contentText,
+      pool,
     });
   } catch (narErr) {
     tg.w('NARRATION/ingest', `hook failed: ${narErr.message}`);

@@ -334,6 +334,7 @@ async function insertDigestArticle({ handle, dateStr, slot, title, excerpt, cate
       category,
       source,
       text: summaryMarkdown || excerpt,
+      pool: _pool,
     });
   } catch (narErr) {
     tg.w('NARRATION/ingest', `x-feed hook failed: ${narErr.message}`);

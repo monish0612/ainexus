@@ -46,6 +46,7 @@ function buildNarrationRouter(express, pool) {
         source,
         text: text.slice(0, 120000),
         hd: !!req.body?.hd,
+        model: await require('./narration-client').narrationModel(pool),
       });
       res.json({ articleId: id, ...rec, configured: enabled() });
     } catch (err) {
